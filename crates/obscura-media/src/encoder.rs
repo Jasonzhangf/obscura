@@ -61,6 +61,7 @@ pub struct EncodedSample {
     pub coded_width: u32,
     pub coded_height: u32,
     pub vt_pts_us: i64,
+    pub duration_us: u64,
     pub bytes: Vec<u8>,
 }
 
@@ -225,6 +226,9 @@ impl ResidentEncoder {
         if self.terminated {
             return Err(EncoderError::Terminated("incarnation already terminated".into()));
         }
+        if self.observe_callback_overflow() {
+            return Err(EncoderError::Terminated("callback event queue overflow".into()));
+        }
         crate::validate_pixels(info.width, info.height, rgba.len() as u64)
             .map_err(|e| EncoderError::InvalidFrame(e.to_string()))?;
         if info.stride != info.width * 4 {
@@ -251,6 +255,9 @@ impl ResidentEncoder {
         }
         self.raw.push_back(RawSubmission { buffer, context });
         self.pump();
+        if self.terminated {
+            return Err(EncoderError::Terminated("incarnation terminated during submit".into()));
+        }
         Ok(())
     }
 
@@ -265,38 +272,68 @@ impl ResidentEncoder {
         if self.terminated {
             return ApplyOutcome::Rejected(ApplyRejection::Terminated);
         }
+        if self.observe_callback_overflow() {
+            return ApplyOutcome::Rejected(ApplyRejection::Terminated);
+        }
         if generation <= self.generation {
             return ApplyOutcome::Rejected(ApplyRejection::StaleGeneration);
         }
         if let Err(message) = settings.validate() {
             return ApplyOutcome::Failed(message);
         }
-        let Some(vt) = &self.vt else {
-            return ApplyOutcome::Failed("encoder incarnation missing".into());
-        };
-        let mut failures = Vec::new();
-        if settings.bitrate_bps != self.settings.bitrate_bps {
-            if let Err(e) = vt.apply_bitrate(settings.bitrate_bps) {
-                failures.push(e.to_string());
-            }
-        }
-        if settings.fps != self.settings.fps {
-            if let Err(e) = vt.apply_fps(settings.fps) {
-                failures.push(e.to_string());
-            }
-        }
-        if settings.keyframe_interval != self.settings.keyframe_interval {
-            if let Err(e) = vt.apply_keyframe_interval(settings.keyframe_interval) {
-                failures.push(e.to_string());
-            }
-        }
-        if !failures.is_empty() {
-            let message = failures.join("; ");
+        if let Err(message) = self.settle_settings_boundary() {
             self.terminate(message.clone());
             return ApplyOutcome::Failed(message);
         }
+        if settings.keyframe_interval != self.settings.keyframe_interval {
+            // VideoToolbox can accept and read back a new interval while the
+            // current GOP continues under the old cadence. Establish a real
+            // new incarnation so the confirmed interval starts from frame 0.
+            self.vt = None;
+            let (tx, rx) = std::sync::mpsc::sync_channel(MAX_IN_FLIGHT + MAX_COMPLETED);
+            match VtSession::create(
+                self.width,
+                self.height,
+                settings.fps,
+                settings.bitrate_bps,
+                settings.keyframe_interval,
+                tx,
+            ) {
+                Ok(vt) => {
+                    self.vt = Some(vt);
+                    self.rx = rx;
+                    self.incarnation += 1;
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.terminate(message.clone());
+                    return ApplyOutcome::Failed(message);
+                }
+            }
+        } else {
+            let Some(vt) = &self.vt else {
+                return ApplyOutcome::Failed("encoder incarnation missing".into());
+            };
+            let mut failures = Vec::new();
+            if settings.bitrate_bps != self.settings.bitrate_bps {
+                if let Err(e) = vt.apply_bitrate(settings.bitrate_bps) {
+                    failures.push(e.to_string());
+                }
+            }
+            if settings.fps != self.settings.fps {
+                if let Err(e) = vt.apply_fps(settings.fps) {
+                    failures.push(e.to_string());
+                }
+            }
+            if !failures.is_empty() {
+                let message = failures.join("; ");
+                self.terminate(message.clone());
+                return ApplyOutcome::Failed(message);
+            }
+        }
         self.settings = settings;
         self.generation = generation;
+        self.force_idr_pending = true;
         ApplyOutcome::Applied { generation, settings }
     }
 
@@ -332,6 +369,7 @@ impl ResidentEncoder {
         while let Some(sample) = self.next_sample(Duration::from_secs(5)) {
             samples.push(sample);
         }
+        self.observe_callback_overflow();
         if let Some(vt) = &self.vt {
             if vt.live() != 0 {
                 self.events.push(EncoderEvent::DependencyBreak {
@@ -396,12 +434,74 @@ impl ResidentEncoder {
         }
     }
 
+    fn observe_callback_overflow(&mut self) -> bool {
+        let dropped = self
+            .vt
+            .as_ref()
+            .map(|vt| vt.take_callback_overflows())
+            .unwrap_or(0);
+        if dropped == 0 {
+            return false;
+        }
+        self.events.push(EncoderEvent::SampleQueueOverflow { dropped });
+        self.terminate("callback event queue overflow".into());
+        true
+    }
+
+    /// Wait until no generation-N raw frame or callback remains before the
+    /// session properties are changed for generation N+1.
+    fn settle_settings_boundary(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            self.pump();
+            if self.terminated {
+                return Err("encoder terminated while draining settings boundary".into());
+            }
+            let pending = !self.raw.is_empty()
+                || self.vt.as_ref().map(|vt| vt.live() > 0).unwrap_or(false);
+            if !pending {
+                let mut sink = Vec::new();
+                while let Ok(event) = self.rx.try_recv() {
+                    self.process_event(event, &mut sink);
+                }
+                self.completed.extend(sink);
+                if self.terminated {
+                    return Err("encoder terminated while draining settings boundary".into());
+                }
+                return Ok(());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("timed out draining old settings generation".into());
+            }
+            match self.rx.recv_timeout(remaining) {
+                Ok(event) => {
+                    let mut sink = Vec::new();
+                    self.process_event(event, &mut sink);
+                    self.completed.extend(sink);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err("timed out draining old settings generation".into());
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("callback channel disconnected during settings boundary".into());
+                }
+            }
+        }
+    }
+
     /// Move queued raw frames into the encoder while in-flight capacity remains.
     fn pump(&mut self) {
+        if self.observe_callback_overflow() {
+            return;
+        }
         if self.terminated {
             return;
         }
         loop {
+            if self.observe_callback_overflow() {
+                return;
+            }
             let Some(vt) = self.vt.as_ref() else {
                 return;
             };

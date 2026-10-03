@@ -10,7 +10,7 @@
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::SyncSender;
 
 use crate::encoder::{CallbackEvent, EncodedSample, SubmissionContext};
@@ -119,6 +119,7 @@ extern "C" {
 extern "C" {
     fn CMTimeMake(value: i64, timescale: i32) -> CMTime;
     fn CMSampleBufferGetPresentationTimeStamp(sample_buffer: CMSampleBufferRef) -> CMTime;
+    fn CMSampleBufferGetDuration(sample_buffer: CMSampleBufferRef) -> CMTime;
     fn CMSampleBufferGetSampleAttachmentsArray(
         sample_buffer: CMSampleBufferRef,
         create_if_necessary: u8,
@@ -390,11 +391,20 @@ fn sample_is_sync(sample: CMSampleBufferRef) -> bool {
     value != unsafe { kCFBooleanTrue }
 }
 
+fn cmtime_to_us(time: CMTime) -> Option<u64> {
+    if time.timescale <= 0 {
+        return None;
+    }
+    let value = i128::from(time.value) * 1_000_000i128 / i128::from(time.timescale);
+    u64::try_from(value).ok()
+}
+
 /// Shared callback context. Lives as long as the VT session; the callback never
 /// blocks and never touches the owner's queues directly.
 pub struct CallbackCtx {
     tx: SyncSender<CallbackEvent>,
     live: AtomicUsize,
+    overflowed: AtomicUsize,
     coded_width: u32,
     coded_height: u32,
 }
@@ -415,26 +425,24 @@ extern "C" fn output_callback(
         let format = unsafe { CMSampleBufferGetFormatDescription(sample) };
         let bytes = annex_b_from_sample(format, sample, sync);
         let pts = unsafe { CMSampleBufferGetPresentationTimeStamp(sample) };
-        let vt_pts_us = if pts.timescale != 0 {
-            (pts.value as i128 * 1_000_000i128 / pts.timescale as i128) as i64
-        } else {
-            submission.pts_us as i64
-        };
+        let vt_pts_us = cmtime_to_us(pts).map(|v| v as i64).unwrap_or(submission.pts_us as i64);
+        let duration = unsafe { CMSampleBufferGetDuration(sample) };
         CallbackEvent::Sample(EncodedSample {
             context: submission,
             keyframe: sync,
             coded_width: ctx.coded_width,
             coded_height: ctx.coded_height,
             vt_pts_us,
+            duration_us: cmtime_to_us(duration).unwrap_or(0),
             bytes,
         })
     } else {
         CallbackEvent::Failed { context: submission, status }
     };
     if ctx.tx.try_send(event).is_err() {
-        // Completed queue full: mark terminal so the owner stops treating the
-        // reference chain as continuous and recovers with a real IDR.
-        ctx.live.fetch_add(1, Ordering::AcqRel);
+        // The actor observes this separate signal and terminates the
+        // incarnation. Never fabricate an in-flight callback reservation.
+        ctx.overflowed.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -443,7 +451,7 @@ pub struct VtSession {
     session: VTCompressionSessionRef,
     coded_width: u32,
     coded_height: u32,
-    fps: u32,
+    fps: AtomicU32,
     ctx: Box<CallbackCtx>,
 }
 
@@ -461,6 +469,7 @@ impl VtSession {
         let ctx = Box::new(CallbackCtx {
             tx,
             live: AtomicUsize::new(0),
+            overflowed: AtomicUsize::new(0),
             coded_width,
             coded_height,
         });
@@ -482,7 +491,7 @@ impl VtSession {
         if status != 0 || session.is_null() {
             return Err(VtError::new(status, "VTCompressionSessionCreate"));
         }
-        let this = Self { session, coded_width, coded_height, fps, ctx };
+        let this = Self { session, coded_width, coded_height, fps: AtomicU32::new(fps), ctx };
         this.configure(bitrate_bps, keyframe_interval)?;
         Ok(this)
     }
@@ -531,12 +540,38 @@ impl VtSession {
             unsafe { kVTCompressionPropertyKey_AllowFrameReordering },
             unsafe { kCFBooleanFalse },
         )?;
-        self.set_i32(unsafe { kVTCompressionPropertyKey_ExpectedFrameRate }, self.fps as i32)?;
+        let fps = self.fps.load(Ordering::Acquire);
+        self.set_i32(unsafe { kVTCompressionPropertyKey_ExpectedFrameRate }, fps as i32)?;
+        let fps_readback = self.read_i32(unsafe { kVTCompressionPropertyKey_ExpectedFrameRate })?;
+        if fps_readback != fps as i32 {
+            return Err(VtError::new(
+                -1,
+                format!("ExpectedFrameRate readback {fps_readback} != requested {fps}"),
+            ));
+        }
         self.set_i32(
             unsafe { kVTCompressionPropertyKey_MaxKeyFrameInterval },
             keyframe_interval as i32,
         )?;
+        let interval_readback =
+            self.read_i32(unsafe { kVTCompressionPropertyKey_MaxKeyFrameInterval })?;
+        if interval_readback != keyframe_interval as i32 {
+            return Err(VtError::new(
+                -1,
+                format!(
+                    "MaxKeyFrameInterval readback {interval_readback} != requested {keyframe_interval}"
+                ),
+            ));
+        }
         self.set_i32(unsafe { kVTCompressionPropertyKey_AverageBitRate }, bitrate_bps as i32)?;
+        let bitrate_readback =
+            self.read_i32(unsafe { kVTCompressionPropertyKey_AverageBitRate })?;
+        if bitrate_readback != bitrate_bps as i32 {
+            return Err(VtError::new(
+                -1,
+                format!("AverageBitRate readback {bitrate_readback} != requested {bitrate_bps}"),
+            ));
+        }
         let status = unsafe {
             VTSessionSetProperty(
                 self.session,
@@ -589,14 +624,16 @@ impl VtSession {
     }
 
     pub fn apply_fps(&self, fps: u32) -> Result<(), VtError> {
-        self.set_i32(unsafe { kVTCompressionPropertyKey_ExpectedFrameRate }, fps as i32)
-    }
-
-    pub fn apply_keyframe_interval(&self, interval: u32) -> Result<(), VtError> {
-        self.set_i32(
-            unsafe { kVTCompressionPropertyKey_MaxKeyFrameInterval },
-            interval as i32,
-        )
+        self.set_i32(unsafe { kVTCompressionPropertyKey_ExpectedFrameRate }, fps as i32)?;
+        let readback = self.read_i32(unsafe { kVTCompressionPropertyKey_ExpectedFrameRate })?;
+        if readback != fps as i32 {
+            return Err(VtError::new(
+                -1,
+                format!("ExpectedFrameRate readback {readback} != requested {fps}"),
+            ));
+        }
+        self.fps.store(fps, Ordering::Release);
+        Ok(())
     }
 
     pub fn encode(
@@ -607,7 +644,8 @@ impl VtSession {
         context: Box<SubmissionContext>,
     ) -> Result<(), VtError> {
         let pts = unsafe { CMTimeMake(pts_us as i64, 1_000_000) };
-        let duration = unsafe { CMTimeMake(1, self.fps as i32) };
+        let fps = self.fps.load(Ordering::Acquire);
+        let duration = unsafe { CMTimeMake(1, fps as i32) };
         let (key_cb, value_cb) = dict_callbacks();
         let props = if force_keyframe {
             let dict = unsafe { CFDictionaryCreateMutable(ptr::null(), 0, key_cb, value_cb) };
@@ -654,6 +692,10 @@ impl VtSession {
 
     pub fn live(&self) -> usize {
         self.ctx.live.load(Ordering::Acquire)
+    }
+
+    pub fn take_callback_overflows(&self) -> usize {
+        self.ctx.overflowed.swap(0, Ordering::AcqRel)
     }
 
     pub fn coded_dimensions(&self) -> (u32, u32) {

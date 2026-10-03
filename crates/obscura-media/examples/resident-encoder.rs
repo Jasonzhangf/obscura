@@ -14,7 +14,10 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use obscura_host_protocol::{FrameInfo, PixelFormat};
-use obscura_media::encoder::{ApplyOutcome, EncoderEvent, EncoderSettings, ResidentEncoder};
+use obscura_media::encoder::{
+    ApplyOutcome, EncoderEvent, EncoderSettings, ResidentEncoder, MAX_COMPLETED, MAX_IN_FLIGHT,
+    MAX_RAW_QUEUE,
+};
 use tokio::runtime::Runtime;
 
 fn frame_info(width: u32, height: u32, sequence: u64) -> FrameInfo {
@@ -130,6 +133,12 @@ fn noise_scene(width: u32, height: u32, sequence: u64) -> Vec<u8> {
         pixel[3] = 255;
     }
     rgba
+}
+
+fn precomputed_noise_frames(width: u32, height: u32, count: usize) -> Vec<Vec<u8>> {
+    (0..count as u64)
+        .map(|sequence| noise_scene(width, height, sequence))
+        .collect()
 }
 
 fn nal_types(stream: &[u8]) -> Vec<u8> {
@@ -251,6 +260,7 @@ impl Harness {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn main() {
     let outdir = std::env::args()
         .nth(1)
@@ -263,10 +273,19 @@ fn main() {
     resident_odd(&outdir, &mut h);
     resident_alpha_color(&outdir, &mut h);
     resident_quality_apply(&outdir, &mut h);
+    resident_pending_apply_boundary(&outdir, &mut h);
+    resident_fps_keyframe_apply(&outdir, &mut h);
+    resident_callback_saturation(&outdir, &mut h);
     resident_dependency_recovery(&outdir, &mut h);
     resident_close_lifecycle(&outdir, &mut h);
     resident_rejections(&outdir, &mut h);
     std::process::exit(h.summary());
+}
+
+#[cfg(not(target_os = "macos"))]
+fn main() {
+    eprintln!("resident H.264 encoder is macOS-only");
+    std::process::exit(2);
 }
 
 fn drain_samples(
@@ -283,6 +302,60 @@ fn drain_samples(
         };
         samples.push(sample);
     }
+    samples
+}
+
+fn control_old_burst(
+    width: u32,
+    height: u32,
+    settings: EncoderSettings,
+    frames: &[Vec<u8>],
+    count: usize,
+) -> Vec<obscura_media::encoder::EncodedSample> {
+    let mut encoder = ResidentEncoder::create(width, height, settings).expect("old control create");
+    let mut pts = 0u64;
+    for sequence in 0..count {
+        encoder
+            .submit(
+                frame_info(width, height, sequence as u64 + 1),
+                &frames[sequence % frames.len()],
+                pts,
+            )
+            .expect("old control submit");
+        pts += 33_333;
+    }
+    let samples = drain_samples(&mut encoder, count, Duration::from_secs(30));
+    let _ = encoder.close();
+    samples
+}
+
+fn control_after_apply(
+    width: u32,
+    height: u32,
+    old: EncoderSettings,
+    new: EncoderSettings,
+    frames: &[Vec<u8>],
+    count: usize,
+) -> Vec<obscura_media::encoder::EncodedSample> {
+    let mut encoder = ResidentEncoder::create(width, height, old).expect("new control create");
+    let outcome = encoder.apply(1, new);
+    assert!(matches!(outcome, ApplyOutcome::Applied { generation: 1, .. }), "{outcome:?}");
+    let mut samples = Vec::new();
+    let mut pts = 0u64;
+    for sequence in 0..count {
+        encoder
+            .submit(
+                frame_info(width, height, sequence as u64 + 1),
+                &frames[sequence % frames.len()],
+                pts,
+            )
+            .expect("new control submit");
+        if let Some(sample) = encoder.next_sample(Duration::from_secs(10)) {
+            samples.push(sample);
+        }
+        pts += 33_333;
+    }
+    let _ = encoder.close();
     samples
 }
 
@@ -374,6 +447,7 @@ fn resident_even(outdir: &Path, h: &mut Harness) {
                 "keyframe": s.keyframe,
                 "coded_width": s.coded_width,
                 "coded_height": s.coded_height,
+                "duration_us": s.duration_us,
                 "bytes": s.bytes.len(),
             })
         }).collect::<Vec<_>>()).expect("manifest json");
@@ -402,6 +476,346 @@ fn resident_even(outdir: &Path, h: &mut Harness) {
         outcome.samples.len() + samples.len() == count,
         format!("close drained {}", outcome.samples.len()),
     );
+}
+
+/// Keep raw and in-flight work pending across a bitrate-only change. The old
+/// generation must be encoded with the old bitrate before apply returns; only
+/// subsequent frames may use the new bitrate.
+fn resident_pending_apply_boundary(outdir: &Path, h: &mut Harness) {
+    let width = 640u32;
+    let height = 480u32;
+    let old = EncoderSettings { bitrate_bps: 300_000, fps: 30, keyframe_interval: 300 };
+    let new = EncoderSettings { bitrate_bps: 3_000_000, ..old };
+    let pending = MAX_IN_FLIGHT + MAX_RAW_QUEUE;
+    let new_count = 24usize;
+    let frames = precomputed_noise_frames(width, height, 16);
+    let mut encoder = ResidentEncoder::create(width, height, old).expect("pending apply create");
+    let mut pts = 0u64;
+    for sequence in 0..pending {
+        encoder
+            .submit(
+                frame_info(width, height, sequence as u64 + 1),
+                &frames[sequence % frames.len()],
+                pts,
+            )
+            .expect("pending apply submit");
+        pts += 33_333;
+    }
+    let outcome = encoder.apply(1, new);
+    h.check(
+        "pending_apply_ack",
+        matches!(outcome, ApplyOutcome::Applied { generation: 1, .. }),
+        format!("{outcome:?}"),
+    );
+    let old_samples = drain_samples(&mut encoder, pending, Duration::from_secs(30));
+    let old_generation = old_samples.len() == pending
+        && old_samples.iter().all(|s| s.context.settings_generation == 0);
+    let old_keyframes = old_samples.iter().filter(|s| s.keyframe).count();
+    h.check(
+        "pending_apply_old_count",
+        old_samples.len() == pending,
+        format!("old samples={} pending={pending}", old_samples.len()),
+    );
+    h.check(
+        "pending_apply_old_generation",
+        old_generation,
+        format!("old samples={} keyframes={old_keyframes}", old_samples.len()),
+    );
+    h.check(
+        "pending_apply_old_gop_boundary",
+        old_keyframes <= 1,
+        format!("old samples={} keyframes={old_keyframes}", old_samples.len()),
+    );
+
+    let mut new_samples = Vec::new();
+    for sequence in 0..new_count {
+        encoder
+            .submit(
+                frame_info(width, height, pending as u64 + sequence as u64 + 1),
+                &frames[sequence % frames.len()],
+                pts,
+            )
+            .expect("pending apply new submit");
+        if let Some(sample) = encoder.next_sample(Duration::from_secs(10)) {
+            new_samples.push(sample);
+        }
+        pts += 33_333;
+    }
+    let new_generation = new_samples.len() == new_count
+        && new_samples.iter().all(|s| s.context.settings_generation == 1);
+    let new_keyframes = new_samples.iter().filter(|s| s.keyframe).count();
+    h.check(
+        "pending_apply_new_count",
+        new_samples.len() == new_count,
+        format!("new samples={} expected={new_count}", new_samples.len()),
+    );
+    h.check(
+        "pending_apply_new_generation",
+        new_generation,
+        format!("new samples={} keyframes={new_keyframes}", new_samples.len()),
+    );
+    h.check(
+        "pending_apply_new_gop_boundary",
+        !new_samples.is_empty() && new_keyframes <= 1,
+        format!("new samples={} keyframes={new_keyframes}", new_samples.len()),
+    );
+    if old_samples.len() == pending {
+        let path = outdir.join("pending-boundary-old.h264");
+        write_stream(&path, &old_samples).expect("write pending old stream");
+        match decode_all_frames(&path, width, height) {
+            Ok(count) => h.check(
+                "pending_apply_old_decode",
+                count == old_samples.len(),
+                format!("decoded {count} of {} AUs", old_samples.len()),
+            ),
+            Err(error) => h.check("pending_apply_old_decode", false, format!("decode failed: {error}")),
+        }
+    }
+    if new_samples.len() == new_count {
+        let path = outdir.join("pending-boundary-new.h264");
+        write_stream(&path, &new_samples).expect("write pending new stream");
+        match decode_all_frames(&path, width, height) {
+            Ok(count) => h.check(
+                "pending_apply_new_decode",
+                count == new_samples.len(),
+                format!("decoded {count} of {} AUs", new_samples.len()),
+            ),
+            Err(error) => h.check("pending_apply_new_decode", false, format!("decode failed: {error}")),
+        }
+    }
+    let old_control = control_old_burst(width, height, old, &frames, pending);
+    let new_control = control_after_apply(width, height, old, new, &frames, new_count);
+    let old_matches_control = old_samples.len() == pending
+        && old_control.len() == pending
+        && old_samples
+            .iter()
+            .zip(&old_control)
+            .all(|(actual, control)| actual.bytes.len() == control.bytes.len());
+    let old_control_bytes: usize = old_control.iter().map(|s| s.bytes.len()).sum();
+    let new_control_bytes: usize = new_control.iter().map(|s| s.bytes.len()).sum();
+    h.check(
+        "pending_apply_old_matches_control",
+        old_matches_control,
+        format!(
+            "old_samples={} old_control={} actual_lengths={:?} control_lengths={:?}",
+            old_samples.len(),
+            old_control.len(),
+            old_samples.iter().map(|s| s.bytes.len()).collect::<Vec<_>>(),
+            old_control.iter().map(|s| s.bytes.len()).collect::<Vec<_>>()
+        ),
+    );
+    let new_tail_avg = new_samples
+        .iter()
+        .skip(4)
+        .map(|s| s.bytes.len())
+        .sum::<usize>() as f64
+        / new_samples.len().saturating_sub(4).max(1) as f64;
+    let new_control_tail_avg = new_control
+        .iter()
+        .skip(8)
+        .map(|s| s.bytes.len())
+        .sum::<usize>() as f64
+        / new_control.len().saturating_sub(8).max(1) as f64;
+    let new_tail_ratio = new_tail_avg / new_control_tail_avg.max(1.0);
+    h.check(
+        "pending_apply_new_control_tail",
+        new_samples.len() == new_count
+            && new_control.len() == new_count
+            && (new_tail_ratio - 1.0).abs() <= 0.15,
+        format!(
+            "new_samples={} new_control={} tail_avg={new_tail_avg:.1} control_tail_avg={new_control_tail_avg:.1} ratio={new_tail_ratio:.3}",
+            new_samples.len(),
+            new_control.len(),
+        ),
+    );
+    h.check(
+        "pending_apply_controls_differ",
+        old_control_bytes != new_control_bytes,
+        format!(
+            "old_control_bytes={old_control_bytes} new_control_bytes={new_control_bytes}"
+        ),
+    );
+    let close = encoder.close();
+    h.check(
+        "pending_apply_close",
+        close.samples.is_empty() && close.cancelled_raw == 0,
+        format!("close samples={} cancelled={}", close.samples.len(), close.cancelled_raw),
+    );
+}
+
+/// Applied FPS and keyframe interval must be confirmed by the SDK and used by
+/// subsequent samples. A failed apply must not report Applied.
+fn resident_fps_keyframe_apply(outdir: &Path, h: &mut Harness) {
+    let width = 320u32;
+    let height = 240u32;
+    let initial = EncoderSettings { bitrate_bps: 1_000_000, fps: 30, keyframe_interval: 30 };
+    let requested = EncoderSettings { fps: 10, keyframe_interval: 1, ..initial };
+    let mut encoder = ResidentEncoder::create(width, height, initial).expect("fps create");
+    let mut baseline = Vec::new();
+    for sequence in 0..6u64 {
+        encoder
+            .submit(
+                frame_info(width, height, sequence + 1),
+                &noise_scene(width, height, sequence),
+                sequence * 33_333,
+            )
+            .expect("fps baseline submit");
+        if let Some(sample) = encoder.next_sample(Duration::from_secs(5)) {
+            baseline.push(sample);
+        }
+    }
+    let outcome = encoder.apply(1, requested);
+    h.check(
+        "fps_keyframe_apply_ack",
+        matches!(outcome, ApplyOutcome::Applied { generation: 1, .. }),
+        format!("{outcome:?}"),
+    );
+    let mut samples = Vec::new();
+    for sequence in 0..6u64 {
+        encoder
+            .submit(
+                frame_info(width, height, sequence + 100),
+                &noise_scene(width, height, sequence),
+                6 * 33_333 + sequence * 100_000,
+            )
+            .expect("fps submit");
+        if let Some(sample) = encoder.next_sample(Duration::from_secs(5)) {
+            samples.push(sample);
+        }
+    }
+    let duration_ok = !samples.is_empty()
+        && samples.iter().all(|s| s.duration_us.abs_diff(100_000) <= 1_000);
+    let baseline_duration_ok = baseline.len() == 6
+        && baseline.iter().all(|s| s.duration_us.abs_diff(33_333) <= 1_500);
+    let keyframes = samples.iter().filter(|s| s.keyframe).count();
+    h.check(
+        "fps_baseline_duration",
+        baseline_duration_ok,
+        format!(
+            "baseline durations={:?}",
+            baseline.iter().map(|s| s.duration_us).collect::<Vec<_>>()
+        ),
+    );
+    h.check(
+        "fps_effective_sample_duration",
+        samples.len() == 6 && duration_ok,
+        format!(
+            "durations={:?}",
+            samples.iter().map(|s| s.duration_us).collect::<Vec<_>>()
+        ),
+    );
+    h.check(
+        "keyframe_interval_effective",
+        samples.len() == 6 && keyframes == samples.len(),
+        format!("samples={} keyframes={keyframes}", samples.len()),
+    );
+    h.check(
+        "fps_settings_readback",
+        encoder.settings() == requested && encoder.generation() == 1,
+        format!("settings={:?} generation={}", encoder.settings(), encoder.generation()),
+    );
+    h.check(
+        "fps_baseline_present",
+        baseline.len() == 6,
+        format!("baseline={}", baseline.len()),
+    );
+    if !samples.is_empty() {
+        let path = outdir.join("fps-keyframe.h264");
+        write_stream(&path, &samples).expect("write fps stream");
+        match decode_all_frames(&path, width, height) {
+            Ok(count) => h.check(
+                "fps_keyframe_decode",
+                count == samples.len(),
+                format!("decoded {count} of {} AUs", samples.len()),
+            ),
+            Err(error) => h.check("fps_keyframe_decode", false, format!("decode failed: {error}")),
+        }
+    }
+    let bad_fps = encoder.apply(2, EncoderSettings { fps: 0, ..requested });
+    h.check(
+        "fps_invalid_not_applied",
+        matches!(bad_fps, ApplyOutcome::Failed(_)),
+        format!("{bad_fps:?}"),
+    );
+    let bad_interval = encoder.apply(3, EncoderSettings { keyframe_interval: 0, ..requested });
+    h.check(
+        "keyframe_invalid_not_applied",
+        matches!(bad_interval, ApplyOutcome::Failed(_)),
+        format!("{bad_interval:?}"),
+    );
+    let _ = encoder.close();
+}
+
+/// Fill the bounded callback channel without consuming it. Overflow must become
+/// a typed terminal outcome, not a fabricated in-flight reservation.
+fn resident_callback_saturation(outdir: &Path, h: &mut Harness) {
+    let width = 320u32;
+    let height = 240u32;
+    let settings = EncoderSettings { bitrate_bps: 1_000_000, fps: 30, keyframe_interval: 300 };
+    let mut encoder = ResidentEncoder::create(width, height, settings).expect("saturation create");
+    let burst = MAX_IN_FLIGHT + MAX_COMPLETED + 16;
+    let mut accepted = 0usize;
+    let mut submit_errors = 0usize;
+    for sequence in 0..burst as u64 {
+        match encoder.submit(
+            frame_info(width, height, sequence + 1),
+            &noise_scene(width, height, sequence),
+            sequence * 33_333,
+        ) {
+            Ok(()) => accepted += 1,
+            Err(error) => {
+                submit_errors += 1;
+                println!("SATURATION_SUBMIT_ERROR {error}");
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let mut drained = Vec::new();
+    while let Some(sample) = encoder.next_sample(Duration::from_millis(200)) {
+        drained.push(sample);
+    }
+    let terminal = encoder.is_terminated();
+    let events = encoder.take_events();
+    let typed_overflow = events.iter().any(|event| {
+        matches!(
+            event,
+            EncoderEvent::SampleQueueOverflow { .. } | EncoderEvent::EncoderTerminated { .. }
+        )
+    });
+    h.check(
+        "saturation_typed_terminal",
+        terminal && typed_overflow,
+        format!("accepted={accepted} submit_errors={submit_errors} drained={} terminal={terminal} events={events:?}", drained.len()),
+    );
+    h.check(
+        "saturation_stops_success",
+        submit_errors > 0,
+        format!("accepted={accepted} submit_errors={submit_errors}"),
+    );
+    h.check(
+        "saturation_exceeds_capacity",
+        accepted > MAX_IN_FLIGHT + MAX_COMPLETED,
+        format!(
+            "accepted={accepted} capacity={}",
+            MAX_IN_FLIGHT + MAX_COMPLETED
+        ),
+    );
+    let close = encoder.close();
+    h.check(
+        "saturation_close_returns",
+        close.samples.len() + drained.len() <= accepted,
+        format!(
+            "accepted={accepted} drained={} close_samples={} events={:?}",
+            drained.len(),
+            close.samples.len(),
+            close.events
+        ),
+    );
+    if !drained.is_empty() {
+        write_stream(&outdir.join("saturation-drained.h264"), &drained)
+            .expect("write saturation stream");
+    }
 }
 
 fn resident_odd(outdir: &Path, h: &mut Harness) {
@@ -691,63 +1105,115 @@ fn resident_alpha_color(outdir: &Path, h: &mut Harness) {
 /// Bounded raw queue drop plus a real forced IDR that restarts a continuous
 /// reference chain on the live incarnation.
 fn resident_dependency_recovery(outdir: &Path, h: &mut Harness) {
-    let width = 320u32;
-    let height = 240u32;
+    let width = 1280u32;
+    let height = 720u32;
     let settings = EncoderSettings { bitrate_bps: 1_000_000, fps: 30, keyframe_interval: 300 };
+    let frames = precomputed_noise_frames(width, height, 16);
     let mut encoder = ResidentEncoder::create(width, height, settings).expect("recovery create");
-    // Burst far more frames than the bounded raw queue without draining so
-    // latest-wins drops are forced before encoding.
-    let burst = 40u64;
+    // Burst far more frames than the bounded raw queue while occupying the
+    // in-flight slots, so latest-wins drops are forced before encoding.
+    let burst = 64u64;
     let mut pts = 0u64;
-    for sequence in 0..burst {
-        let rgba = noise_scene(width, height, sequence);
-        encoder
-            .submit(frame_info(width, height, sequence + 1), &rgba, pts)
-            .expect("recovery submit");
-        pts += 33_333;
+    let mut submitted = 0u64;
+    let mut events = Vec::new();
+    let mut submit_error = None;
+    while submitted < burst {
+        let frame = &frames[(submitted as usize) % frames.len()];
+        match encoder.submit(
+            frame_info(width, height, submitted + 1),
+            frame,
+            pts,
+        ) {
+            Ok(()) => {
+                submitted += 1;
+                pts += 33_333;
+            }
+            Err(error) => {
+                println!("RECOVERY_SUBMIT_ERROR {error}");
+                submit_error = Some(error.to_string());
+                break;
+            }
+        }
+        events.extend(encoder.take_events());
     }
+    events.extend(encoder.take_events());
+    let drops: usize = events
+        .iter()
+        .filter_map(|event| match event {
+            EncoderEvent::RawLatestWins { dropped } => Some(*dropped),
+            _ => None,
+        })
+        .sum();
     // Drain the surviving pre-encode chain to quiescence.
-    let mut samples = Vec::new();
-    while let Some(sample) = encoder.next_sample(Duration::from_millis(500)) {
-        samples.push(sample);
-    }
+    let expected = (submitted as usize).saturating_sub(drops);
+    let mut samples = drain_samples(&mut encoder, expected, Duration::from_secs(60));
+    let pre_forced_count = samples.len();
     // A real forced IDR fences the drop and restarts a continuous reference chain.
-    encoder.request_keyframe().expect("recovery request_keyframe");
+    let mut forced_ok = false;
     let forced_pts = pts;
-    encoder
-        .submit(frame_info(width, height, burst + 1), &noise_scene(width, height, 777), forced_pts)
-        .expect("recovery forced submit");
-    if let Some(sample) = encoder.next_sample(Duration::from_secs(10)) {
-        samples.push(sample);
+    match encoder.request_keyframe() {
+        Ok(()) => match encoder.submit(
+            frame_info(width, height, submitted + 1),
+            &frames[0],
+            forced_pts,
+        ) {
+            Ok(()) => {
+                if let Some(sample) = encoder.next_sample(Duration::from_secs(10)) {
+                    forced_ok = sample.keyframe && nal_types(&sample.bytes).contains(&5);
+                    samples.push(sample);
+                }
+            }
+            Err(error) => println!("RECOVERY_FORCED_SUBMIT_ERROR {error}"),
+        },
+        Err(error) => println!("RECOVERY_REQUEST_KEYFRAME_ERROR {error}"),
     }
     let outcome = encoder.close();
+    let close_samples = outcome.samples.len();
+    let close_cancelled = outcome.cancelled_raw;
     samples.extend(outcome.samples);
-    let drops: usize = outcome
-        .events
+    events.extend(outcome.events);
+    let drops: usize = events
         .iter()
         .filter_map(|e| match e {
             EncoderEvent::RawLatestWins { dropped } => Some(*dropped),
             _ => None,
         })
         .sum();
+    let terminal = events
+        .iter()
+        .any(|event| matches!(event, EncoderEvent::EncoderTerminated { .. }));
+    h.check(
+        "recovery_pre_forced_drain_complete",
+        pre_forced_count == expected,
+        format!("drained={pre_forced_count} expected={expected} drops={drops} submitted={submitted}"),
+    );
     h.check(
         "recovery_raw_latest_wins_dropped",
         drops >= 1,
-        format!("drops={drops} produced={} submitted={}", samples.len(), burst + 1),
+        format!("drops={drops} produced={} submitted={}", samples.len(), submitted + 1),
     );
     h.check(
         "recovery_bounded_produced_less_than_submitted",
-        samples.len() < (burst as usize + 1),
-        format!("produced={} submitted={}", samples.len(), burst + 1),
+        samples.len() < (submitted as usize + 1),
+        format!("produced={} submitted={}", samples.len(), submitted + 1),
     );
-    let forced_ok = samples
-        .last()
-        .map(|s| s.keyframe && nal_types(&s.bytes).contains(&5))
-        .unwrap_or(false);
+    h.check(
+        "recovery_no_terminal",
+        !terminal && submit_error.is_none(),
+        format!("terminal={terminal} submit_error={submit_error:?}"),
+    );
     h.check(
         "recovery_forced_idr_after_drop",
         forced_ok,
-        format!("last keyframe={:?}", samples.last().map(|s| s.keyframe)),
+        format!("forced keyframe={forced_ok}"),
+    );
+    h.check(
+        "recovery_close_clean",
+        close_samples == 0 && close_cancelled == 0,
+        format!(
+            "close samples={} cancelled={}",
+            close_samples, close_cancelled
+        ),
     );
     if !samples.is_empty() {
         write_stream(&outdir.join("recovery.h264"), &samples).expect("write recovery.h264");
