@@ -46,9 +46,27 @@ impl TestPageServer {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
-                        let mut request = [0u8; 2048];
-                        let _ = stream.read(&mut request);
+                        if thread_stop.load(Ordering::Acquire) {
+                            break;
+                        }
+                        stream
+                            .set_nonblocking(false)
+                            .expect("blocking local fixture stream");
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("local fixture read timeout");
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 2048];
+                        loop {
+                            let read = stream
+                                .read(&mut chunk)
+                                .expect("read local fixture request");
+                            assert!(read > 0, "local fixture request closed before headers");
+                            request.extend_from_slice(&chunk[..read]);
+                            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                             TEST_PAGE.len(),
@@ -312,6 +330,66 @@ fn test_navigate_and_snapshot() {
     let text = content_text(&snap);
     assert!(text.contains("Example Domain"), "unexpected snapshot: {text}");
     assert!(text.contains("URL:"), "snapshot missing URL line");
+}
+
+#[test]
+fn fixture_waits_for_delayed_request() {
+    let server = TestPageServer::spawn();
+    let mut stream = TcpStream::connect(server.addr).expect("connect local fixture");
+
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("set early read timeout");
+    std::thread::sleep(Duration::from_millis(100));
+    let mut early = [0_u8; 1];
+    let early_read = stream.read(&mut early);
+    assert!(
+        early_read.as_ref().is_err_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        }),
+        "fixture responded before request: {early_read:?}"
+    );
+
+    stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: local")
+        .expect("write partial request");
+    stream.flush().expect("flush partial request");
+
+    let mut partial = [0_u8; 1];
+    let partial_read = stream.read(&mut partial);
+    assert!(
+        partial_read.as_ref().is_err_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        }),
+        "fixture responded before request headers completed: {partial_read:?}"
+    );
+
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("set response read timeout");
+    stream
+        .write_all(b"host\r\nConnection: close\r\n\r\n")
+        .expect("write remaining request");
+    stream.flush().expect("flush remaining request");
+
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read fixture response");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK\r\n"),
+        "unexpected fixture response: {response}"
+    );
+    assert!(
+        response.contains("Example Domain"),
+        "fixture response missing page: {response}"
+    );
 }
 
 #[test]
