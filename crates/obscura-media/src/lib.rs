@@ -4,6 +4,10 @@ use anyhow::{ensure, Context, Result};
 use obscura_host_protocol::VideoPacket;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
+pub mod encoder;
+#[cfg(target_os = "macos")]
+pub(crate) mod videotoolbox;
+
 #[cfg(any(feature = "webrtc-probe", feature = "webrtc"))]
 pub mod webrtc;
 #[cfg(feature = "webrtc")]

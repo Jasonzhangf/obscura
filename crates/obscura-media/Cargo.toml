@@ -28,3 +28,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 name = "obscura-webrtc-receiver"
 path = "src/bin/webrtc_receiver.rs"
 required-features = ["webrtc"]
+
+[[example]]
+name = "resident-encoder"
+path = "examples/resident-encoder.rs"
