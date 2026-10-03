@@ -45,7 +45,8 @@ async fn exercise(missing_encoder: bool) {
     let mut timestamp = None;
     for (sequence, width, height) in [(1, 64, 48), (3, 65, 47)] {
         let pixels = [0, 128, 0, 255].repeat(width * height);
-        let info = FrameInfo { session_id: "live-session".into(), sequence, document_revision: 7,
+        let info = FrameInfo { session_id: "live-session".into(), tab_id: "live-tab".into(), sequence,
+            presentation_revision: 1, document_revision: 7,
             viewport_revision: sequence, width: width as u32, height: height as u32, stride: width as u32 * 4,
             byte_length: pixels.len() as u64, pixel_format: PixelFormat::PremultipliedRgba8 };
         write(&mut source, &FramePacket::Frame { info }, &pixels).await;
@@ -136,7 +137,8 @@ async fn public_adapter_recovers_after_host_unavailable() {
     }, &[]).await;
     assert!(matches!(read(&mut receiver).await.0, VideoPacket::Unavailable { .. }));
     let pixels = [0, 128, 0, 255].repeat(64 * 48);
-    let info = FrameInfo { session_id: "recoverable-session".into(), sequence: 1, document_revision: 1,
+    let info = FrameInfo { session_id: "recoverable-session".into(), tab_id: "recoverable-tab".into(),
+        sequence: 1, presentation_revision: 1, document_revision: 1,
         viewport_revision: 1, width: 64, height: 48, stride: 64 * 4,
         byte_length: pixels.len() as u64, pixel_format: PixelFormat::PremultipliedRgba8 };
     write(&mut source, &FramePacket::Frame { info }, &pixels).await;

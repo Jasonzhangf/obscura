@@ -398,7 +398,8 @@ mod tests {
         let waiting = VideoPacket::Waiting { session_id: "boundary-session".into() };
         let access_unit = VideoPacket::AccessUnit {
             source: obscura_host_protocol::FrameInfo {
-                session_id: "boundary-session".into(), sequence: 1, document_revision: 1,
+                session_id: "boundary-session".into(), tab_id: "boundary-tab".into(), sequence: 1,
+                presentation_revision: 1, document_revision: 1,
                 viewport_revision: 1, width: 2, height: 2, stride: 8, byte_length: 16,
                 pixel_format: obscura_host_protocol::PixelFormat::PremultipliedRgba8,
             },

@@ -147,6 +147,10 @@ pub async fn control(
 }
 
 fn permitted_remote_command(command: &Command) -> bool {
+    // Profile catalog/create/select are Host-level authorization decisions.
+    // A paired mTLS principal carries no profile scope here, so they are
+    // refused remotely; the local authenticated Host socket keeps them. Do not
+    // widen this allowlist without binding an explicit typed scope.
     matches!(command,
         Command::Attach { mode: Mode::Observe, .. }
             | Command::DeclareViewport { .. }
@@ -155,6 +159,12 @@ fn permitted_remote_command(command: &Command) -> bool {
             | Command::RequestTakeover { .. }
             | Command::ReleaseControl { .. }
             | Command::Navigate { .. }
+            | Command::Back
+            | Command::Forward
+            | Command::Reload
+            | Command::TabCreate {}
+            | Command::TabSelect { .. }
+            | Command::TabClose { .. }
             | Command::Click { .. }
             | Command::InputText { .. }
             | Command::Input { .. }

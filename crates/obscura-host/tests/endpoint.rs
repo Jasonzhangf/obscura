@@ -64,7 +64,7 @@ async fn exercise() {
     let (mut control, response) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await.unwrap();
     let token = response.headers()["x-obscura-media-token"].to_str().unwrap().to_string();
     let ready: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-    assert_eq!(ready["version"], 10);
+    assert_eq!(ready["version"], 11);
     if let Ok(serial) = std::env::var("OBSCURA_ENDPOINT_ADB_SERIAL") {
         assert!(!bind_ip.is_loopback(), "Device probe requires an explicit reachable bind IP");
         // Ephemeral test-only pairing, never installed into device/system trust.
@@ -92,6 +92,18 @@ async fn exercise() {
     control.send(Message::text(r#"{"id":9,"command":{"type":"resize","width":100,"height":100}}"#)).await.unwrap();
     let resize: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(resize["code"], "REMOTE_COMMAND_FORBIDDEN");
+    // Profile management is a Host-level authorization decision. A paired
+    // mTLS principal has no profile scope on this endpoint, so these commands
+    // must be refused instead of silently forwarded with implied authority.
+    for forbidden in [
+        r#"{"id":20,"command":{"type":"profile_catalog"}}"#,
+        r#"{"id":21,"command":{"type":"profile_create","display_name":"Remote","make_default":false}}"#,
+        r#"{"id":22,"command":{"type":"profile_select","profile_id":"default"}}"#,
+    ] {
+        control.send(Message::text(forbidden.to_string())).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(response["code"], "REMOTE_COMMAND_FORBIDDEN", "{forbidden} -> {response}");
+    }
     let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
     let mut invalid = format!("wss://localhost:{}/media", address.port()).into_client_request().unwrap();
     invalid.headers_mut().insert("authorization", "Bearer invalid".parse().unwrap());

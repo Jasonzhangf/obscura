@@ -11176,25 +11176,53 @@ Storage.prototype.clear = function() { const d = this._data; for (const k in d) 
 Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
 Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
 
-const _mkStore = () => {
+const _mkStore = (persistent) => {
   const target = Object.create(Storage.prototype);
-  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
+  const data = Object.create(null);
+  // Ops are bound into the live `Deno.core.ops` table only after the startup
+  // snapshot is restored, so a store created by the snapshot must resolve the
+  // backend lazily on every call instead of capturing a null at boot time.
+  const op = () => {
+    try { return persistent ? Deno.core.ops.op_local_storage : null; } catch (_) { return null; }
+  };
+  // localStorage is a live view over the profile's shared owner, so reads and
+  // enumerations refresh the local mirror from the owner before use. The Rust
+  // side sets the active origin before page scripts run.
+  const sync = () => {
+    const fn = op();
+    if (!fn) return;
+    try {
+      const raw = fn("load", "", "");
+      const parsed = raw ? JSON.parse(raw) : {};
+      for (const k in data) delete data[k];
+      for (const k of Object.keys(parsed)) data[k] = String(parsed[k]);
+    } catch (_) {}
+  };
+  Object.defineProperty(target, '_data', { value: data, writable: true, enumerable: false, configurable: true });
+  if (persistent) {
+    // Own methods take precedence over Storage.prototype so property writes and
+    // method calls both write through to the shared profile owner.
+    target.setItem = function(k, v) { const fn = op(); k = String(k); v = String(v); data[k] = v; try { fn("set", k, v); } catch (_) {} };
+    target.removeItem = function(k) { const fn = op(); k = String(k); delete data[k]; try { fn("remove", k, ""); } catch (_) {} };
+    target.clear = function() { const fn = op(); for (const k in data) delete data[k]; try { fn("clear", "", ""); } catch (_) {} };
+  }
   const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
   return new Proxy(target, {
-    get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
-    set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
-    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
+    get(t, p, recv) { if (persistent) sync(); if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
+    set(t, p, v, recv) { if (persistent) sync(); if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
+    has(t, p) { if (persistent) sync(); if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
     deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
-    ownKeys(t) { return Object.keys(t._data); },
+    ownKeys(t) { if (persistent) sync(); return Object.keys(t._data); },
     getOwnPropertyDescriptor(t, p) {
+      if (persistent) sync();
       if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
         return { value: t._data[p], writable: true, enumerable: true, configurable: true };
       return Reflect.getOwnPropertyDescriptor(t, p);
     },
   });
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+globalThis.localStorage = _mkStore(true);
+globalThis.sessionStorage = _mkStore(false);
 
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {

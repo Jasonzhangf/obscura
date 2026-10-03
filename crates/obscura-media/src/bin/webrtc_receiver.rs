@@ -178,6 +178,8 @@ async fn main() -> Result<()> {
                         event_sequence: 0,
                         frame: PresentedFrameIdentity {
                             session_id: session_id.clone(),
+                            tab_id: status.active_tab_id.clone(),
+                            presentation_revision: status.presentation_revision,
                             frame_sequence: 0,
                             document_revision: status.document_revision,
                             viewport_revision: status.viewport_revision,
@@ -255,6 +257,8 @@ async fn main() -> Result<()> {
                         event_sequence: 0,
                         frame: PresentedFrameIdentity {
                             session_id: status.session_id.clone(),
+                            tab_id: status.active_tab_id.clone(),
+                            presentation_revision: status.presentation_revision,
                             frame_sequence: 0,
                             document_revision: status.document_revision,
                             viewport_revision: status.viewport_revision,
@@ -280,6 +284,8 @@ async fn main() -> Result<()> {
                         event_sequence: 0,
                         frame: PresentedFrameIdentity {
                             session_id: status.session_id.clone(),
+                            tab_id: status.active_tab_id.clone(),
+                            presentation_revision: status.presentation_revision,
                             frame_sequence: 0,
                             document_revision: status.document_revision,
                             viewport_revision: status.viewport_revision,
@@ -757,7 +763,8 @@ mod association_tests {
     fn descriptor(rtp_timestamp: u32, sequence: u64) -> WebRtcVideoFrame {
         WebRtcVideoFrame {
             source: obscura_host_protocol::FrameInfo {
-                session_id: "session".into(), sequence, document_revision: 0, viewport_revision: 0,
+                session_id: "session".into(), tab_id: "tab".into(), sequence,
+                presentation_revision: 0, document_revision: 0, viewport_revision: 0,
                 width: 160, height: 120, stride: 640, byte_length: 160 * 120 * 4,
                 pixel_format: PixelFormat::PremultipliedRgba8,
             },

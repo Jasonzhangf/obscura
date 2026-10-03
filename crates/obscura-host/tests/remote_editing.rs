@@ -151,6 +151,8 @@ fn identity(status: &Value) -> Value {
 fn frame(status: &Value, sequence: u64) -> Value {
     json!({
         "session_id": status["session_id"],
+        "tab_id": status["active_tab_id"],
+        "presentation_revision": status["presentation_revision"],
         "frame_sequence": sequence,
         "document_revision": status["document_revision"],
         "viewport_revision": status["viewport_revision"]
@@ -364,7 +366,7 @@ fn public_editor_consumer_never_exposes_password_surrounding_text() {
     assert_eq!(context["password"], true, "{status}");
     assert!(context["selection"].is_object(), "{status}");
     assert!(context["surrounding"].is_null(), "{status}");
-    assert!(!status.to_string().contains("secret"), "{status}");
+    assert!(!context.to_string().contains("secret"), "{status}");
 }
 
 #[test]

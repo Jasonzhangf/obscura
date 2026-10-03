@@ -39,6 +39,40 @@ pub enum Command {
     ReleaseControl { epoch: u64 },
     ResumeAgent { epoch: u64 },
     Navigate { url: String },
+    /// History back on the active tab. Rejected with `NO_HISTORY` when the
+    /// active tab has no earlier entry; a later navigation truncates forward.
+    Back,
+    /// History forward on the active tab. Rejected with `NO_HISTORY` when the
+    /// active tab has no later entry.
+    Forward,
+    /// Reload the active tab's current document. Does not create a new history
+    /// entry for the same URL.
+    Reload,
+    /// Create and activate a new blank tab inside the bound profile session.
+    /// The new Page shares the profile's one BrowserContext.
+    TabCreate {},
+    /// Activate an existing tab by Host-assigned tab id. Does not reload it.
+    TabSelect { tab_id: String },
+    /// Close a tab by Host-assigned tab id. Rejected with `LAST_TAB` when it is
+    /// the only tab in the session.
+    TabClose { tab_id: String },
+    /// Read-only profile catalog query. Grants no control authority.
+    ProfileCatalog {},
+    /// Create an empty profile in the Host-configured profile root. Does not
+    /// clone any existing login state. `make_default` moves the default
+    /// identity when true.
+    ProfileCreate { display_name: String, make_default: bool },
+    /// Rebind this attachment to another profile's live session. The old
+    /// session keeps running for its other attachments; this caller is moved
+    /// to an observer binding on the target session.
+    ProfileSelect { profile_id: String },
+    /// Host-local maintenance drain. Stop accepting new browser work, let the
+    /// already-accepted local operation terminate, then flush every loaded
+    /// profile's cookie/localStorage store. A service may terminate the
+    /// process only after this reports `flushed: true`; a failure is a typed
+    /// error and never a false `saved`. Never carried across the remote
+    /// endpoint.
+    FlushProfiles {},
     /// Agent diagnostics only; not a human input operation or read-only API.
     Evaluate { expression: String },
     Resize { width: u32, height: u32 },
@@ -91,11 +125,66 @@ pub enum ControlPhase {
     Paused,
 }
 
+/// Host-owned projection of one tab. The UI mirrors this; it never becomes a
+/// second tab registry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TabSummary {
+    pub tab_id: String,
+    /// Actual Page URL after the last committed document change.
+    pub url: String,
+    /// Actual Page title after the last committed document change.
+    pub title: String,
+    pub active: bool,
+}
+
+/// Authoritative navigation state of the active tab, read from the Page after
+/// the operation, never from the request or an ACK.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct NavigationState {
+    pub url: String,
+    pub title: String,
+    pub can_go_back: bool,
+    pub can_go_forward: bool,
+}
+
+/// One persisted catalog record. Never carries cookie contents or a filesystem
+/// path.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileRecord {
+    pub profile_id: String,
+    pub display_name: String,
+    pub default: bool,
+}
+
+/// Persisted profile catalog projection. `root_configured` is false when the
+/// Host runs without an explicit profile root.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileCatalog {
+    pub profiles: Vec<ProfileRecord>,
+    pub default_profile_id: Option<String>,
+    pub root_configured: bool,
+}
+
+/// Result of an attachment profile rebind. `session_id` is the target session
+/// the caller is now bound to.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileBinding {
+    pub profile_id: String,
+    pub session_id: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SessionStatus {
     /// New on daemon restart; reconnect never recreates this identity.
     pub session_id: String,
+    /// Persisted profile this session belongs to.
+    pub profile_id: String,
     /// Connection-scoped identity, intentionally new after reconnect.
     pub attachment_id: Option<u64>,
     pub mode: Option<Mode>,
@@ -108,6 +197,15 @@ pub struct SessionStatus {
     pub next_sequence: u64,
     pub viewport_revision: u64,
     pub document_revision: u64,
+    /// Bumped whenever the active tab changes. A -> B -> A produces a distinct
+    /// value so a stale frame/editor binding for tab A is rejected after return.
+    pub presentation_revision: u64,
+    /// Host-assigned identity of the active tab.
+    pub active_tab_id: String,
+    /// Bounded active-tab projection. Host is the only tab registry.
+    pub tabs: Vec<TabSummary>,
+    /// Authoritative navigation state of the active tab.
+    pub navigation: NavigationState,
     pub viewport: Option<(f32, f32)>,
     /// Attachment whose declaration supplied the committed viewport; null when unmanaged.
     pub viewport_owner: Option<u64>,
@@ -131,6 +229,13 @@ pub struct EvaluationResult {
 #[serde(untagged)]
 pub enum ResultValue {
     Status(SessionStatus),
+    ProfileCatalog { catalog: ProfileCatalog },
+    ProfileCreated { profile: ProfileRecord, catalog: ProfileCatalog },
+    ProfileSelected { binding: ProfileBinding, status: SessionStatus },
+    /// Host-local maintenance receipt. `flushed` is true only when every
+    /// loaded profile store was written successfully; `profiles` is the count
+    /// of flushed profile sessions.
+    ProfileFlush { flushed: bool, profiles: u32 },
     Evaluation { result: EvaluationResult },
     Closed { closed: bool },
     Input { input: InputReceipt },
@@ -154,6 +259,10 @@ pub enum InputState { Pending, Succeeded, Cancelled }
 #[serde(deny_unknown_fields)]
 pub struct PresentedFrameIdentity {
     pub session_id: String,
+    /// Host-assigned tab the presented frame belongs to.
+    pub tab_id: String,
+    /// Active-tab presentation revision the client had presented.
+    pub presentation_revision: u64,
     pub frame_sequence: u64,
     pub document_revision: u64,
     pub viewport_revision: u64,
@@ -319,7 +428,11 @@ pub enum FramePacket {
 #[serde(deny_unknown_fields)]
 pub struct FrameInfo {
     pub session_id: String,
+    /// Host-assigned tab this frame was captured from.
+    pub tab_id: String,
     pub sequence: u64,
+    /// Active-tab presentation revision at capture time.
+    pub presentation_revision: u64,
     pub document_revision: u64,
     pub viewport_revision: u64,
     pub width: u32,
@@ -359,13 +472,14 @@ pub enum VideoPacket {
 #[serde(rename_all = "snake_case")]
 pub enum VideoCodec { H264AnnexB }
 
-/// Version 9 pairs with Host10: the typed browser request/response envelopes
-/// plus the target-bound EditorContext/EditingEvent/EditingReceipt ABI and the
-/// complete gesture/composition lease. Older peers are rejected during Hello.
-pub const WEBRTC_PROTOCOL_VERSION: u32 = 9;
-/// Host bootstrap wire version. Host10 adds operation identity plus typed
-/// remote editing to the existing attachment/control/revision fences.
-pub const HOST_PROTOCOL_VERSION: u32 = 10;
+/// Version 10 pairs with Host11: adds Host-owned tab identity and the active-tab
+/// presentation revision to the frame/editor fences, plus the profile catalog
+/// and attachment rebind results. Older peers are rejected during Hello.
+pub const WEBRTC_PROTOCOL_VERSION: u32 = 10;
+/// Host bootstrap wire version. Host11 adds navigation history, the tab
+/// registry, the profile catalog/rebind results and profile-root identity to
+/// the Host10 operation identity and typed remote editing fences.
+pub const HOST_PROTOCOL_VERSION: u32 = 11;
 pub const WEBRTC_CONTROL_LABEL: &str = "obscura.control.v1";
 pub const WEBRTC_H264_FMTP: &str = "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f";
 

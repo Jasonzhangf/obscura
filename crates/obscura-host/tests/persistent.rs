@@ -55,7 +55,13 @@ impl Client {
         serde_json::from_str(&line).unwrap()
     }
     fn send(&mut self, command: Value) -> Value {
-        let operation = if matches!(command["type"].as_str(), Some("evaluate" | "navigate" | "resize" | "close_session" | "click" | "input_text" | "scroll")) {
+        let mutation_types = [
+            "evaluate", "navigate", "back", "forward", "reload",
+            "tab_create", "tab_select", "tab_close",
+            "profile_create", "profile_select",
+            "resize", "close_session", "click", "input_text", "scroll",
+        ];
+        let operation = if mutation_types.iter().any(|name| command["type"].as_str() == Some(name)) {
             let status = self.ok(json!({"type":"status"}));
             Some(identity(&status))
         } else { None };

@@ -1849,6 +1849,10 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        // Seed this document's origin from the shared profile localStorage
+        // owner. All Pages in the context share one instance.
+        let storage_origin = self.url.as_ref().map(crate::context::storage_key).unwrap_or_default();
+        rt.set_local_storage(&storage_origin, self.context.local_storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -3124,6 +3128,48 @@ impl Page {
         if idx < self.history.len() {
             self.history_index = idx;
         }
+    }
+
+    /// Navigate to an existing history entry without pushing a new one. Used by
+    /// Host Back/Forward. A failed navigation leaves the cursor untouched so the
+    /// Page history stays consistent with the committed document.
+    pub async fn navigate_history_entry(&mut self, index: usize) -> Result<(), PageError> {
+        let Some(url) = self.history.get(index).cloned() else {
+            return Err(PageError::NetworkError("history entry out of range".into()));
+        };
+        let nav_timeout = self.navigation_timeout();
+        let nav_timeout_ms = duration_millis_u64(nav_timeout);
+        let result = match tokio::time::timeout(
+            nav_timeout,
+            self.navigate_with_wait_post_inner(
+                &url,
+                crate::lifecycle::WaitUntil::Load,
+                "GET",
+                "",
+                "",
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.lifecycle = crate::lifecycle::LifecycleState::Failed;
+                Err(PageError::NetworkError(format!(
+                    "history navigation exceeded {nav_timeout_ms}ms deadline"
+                )))
+            }
+        };
+        if result.is_ok() {
+            self.history_index = index;
+        }
+        result
+    }
+
+    /// Reload the current document. `push_history` de-duplicates consecutive
+    /// identical URLs, so this never adds a duplicate entry.
+    pub async fn reload(&mut self) -> Result<(), PageError> {
+        self.navigate_with_wait(&self.url_string(), crate::lifecycle::WaitUntil::Load)
+            .await
     }
 
     async fn navigate_with_wait_post_inner(

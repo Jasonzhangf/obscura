@@ -3,9 +3,10 @@ use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use anyhow::{Context, Result};
-use obscura_host_protocol::{Command, Control, ControlPhase, Device, EditorContext, FramePacket, InputBinding, InputEnvelope, InputEvent, InputLease, InputLeaseKind, Mode, Operation, Request, Response, ResultValue, SessionStatus, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
+use obscura_host_protocol::{Command, Control, ControlPhase, Device, EditorContext, FramePacket, InputBinding, InputEnvelope, InputEvent, InputLease, InputLeaseKind, Mode, NavigationState, Operation, ProfileBinding, Request, Response, ResultValue, SessionStatus, TabSummary, ViewportDeclaration, WebRtcCapability, WebRtcSessionBinding, WebRtcTransport, WebRtcVideoCodec, HOST_PROTOCOL_VERSION, WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use crate::media;
 use crate::worker::{self, Completion, Work, WorkKind};
+use crate::catalog::{self, ProfileCatalogStore};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -15,7 +16,10 @@ const MAX_FRAME: usize = 64 * 1024;
 enum Event {
     Request { connection: u64, request: Request, reply: oneshot::Sender<Response> },
     Gone(u64),
-    MediaGone,
+    MediaGone(String),
+    /// Detach one connection without retiring its identity, for a profile
+    /// rebind. Rejected when the caller still owns an open input lease.
+    Release { connection: u64, reply: oneshot::Sender<Result<(), &'static str>> },
 }
 
 // Created exclusively. Never unlink a pre-existing socket or directory.
@@ -75,6 +79,7 @@ async fn connection(stream: UnixStream, id: u64, session: String, events: mpsc::
 
 struct Session {
     id: String,
+    profile_id: String,
     viewport: Option<(f32, f32)>,
     attachments: HashMap<u64, Attachment>,
     agent: Option<u64>,
@@ -90,6 +95,11 @@ struct Session {
     editor_context: Option<EditorContext>,
     input_lease: Option<InputLease>,
     sequences: HashMap<u64, u64>,
+    presentation_revision: u64,
+    active_tab_id: String,
+    tabs: Vec<TabSummary>,
+    navigation: NavigationState,
+    profile: ProfileBinding,
 }
 struct Attachment { mode: Mode, viewport: Option<ViewportDeclaration>, webrtc: Option<WebRtcGrant> }
 struct WebRtcGrant { capability: WebRtcCapability, binding: WebRtcSessionBinding, consumed: bool }
@@ -221,6 +231,31 @@ impl Session {
             self.transition(ControlPhase::Paused);
         }
     }
+
+    /// Remove one connection's attachment without retiring its identity, for a
+    /// profile rebind. Refuses while the caller still owns an open input lease
+    /// so a composition is never aborted mid-flight. Other attachments, the
+    /// Agent and the document revision are untouched.
+    fn release_for_rebind(&mut self, connection: u64) -> Result<(), &'static str> {
+        if self.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection) {
+            return Err("REBIND_BUSY");
+        }
+        self.attachments.remove(&connection);
+        self.records.remove(&connection);
+        self.sequences.remove(&connection);
+        if self.viewport_owner == Some(connection) { self.viewport_owner = None; }
+        if let Some(update) = self.viewport_update.as_mut() {
+            if update.owner == Some(connection) {
+                update.cancelled = true;
+                update.cancel.store(true, Ordering::Release);
+            }
+        }
+        if self.agent == Some(connection) { self.agent = None; }
+        if matches!(self.control.phase, ControlPhase::Waiting { attachment_id } | ControlPhase::Human { attachment_id } if attachment_id == connection) {
+            self.transition(ControlPhase::Paused);
+        }
+        Ok(())
+    }
     fn transition(&mut self, phase: ControlPhase) {
         if let Some(epoch) = self.control.epoch.checked_add(1) {
             self.control = Control { epoch, phase };
@@ -277,10 +312,15 @@ impl Session {
     fn status(&self, connection: u64, busy: bool) -> ResultValue {
         ResultValue::Status(SessionStatus {
             session_id: self.id.clone(), attachments: self.attachments.len(),
+            profile_id: self.profile_id.clone(),
             attachment_id: self.attachments.contains_key(&connection).then_some(connection),
             mode: self.attachments.get(&connection).map(|attachment| attachment.mode),
             agent_attached: self.agent.is_some(), viewport_revision: self.viewport_revision,
             document_revision: self.document_revision,
+            presentation_revision: self.presentation_revision,
+            active_tab_id: self.active_tab_id.clone(),
+            tabs: self.tabs.clone(),
+            navigation: self.navigation.clone(),
             operation_running: busy || self.input_lease.is_some(),
             control: self.control.clone(),
             fault: self.fault.clone(),
@@ -294,7 +334,8 @@ impl Session {
     }
     fn request(&mut self, connection: u64, request: Request, busy: bool) -> Admission {
         let id = request.id;
-        let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::Navigate { .. } | Command::Input { .. });
+        let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::Navigate { .. } | Command::Input { .. }
+            | Command::Back | Command::Forward | Command::Reload | Command::TabCreate {} | Command::TabSelect { .. } | Command::TabClose { .. });
         let mutation = controlled || matches!(request.command, Command::Evaluate { .. } | Command::Resize { .. } | Command::CloseSession {});
         let mut operation: Option<Operation> = None;
         let mut fresh = true;
@@ -362,9 +403,17 @@ impl Session {
                 return Admission::Replied(error(id, "INVALID_SEQUENCE", "Lease events keep the operation sequence"));
             }
             if let Command::Input { envelope } = &request.command {
-                if envelope.frame.session_id != self.id
-                    || envelope.frame.document_revision != self.document_revision
-                    || envelope.frame.viewport_revision != self.viewport_revision {
+                let open_lease = self.continues_open_lease(connection, &normalized);
+                if envelope.frame.session_id != self.id {
+                    return Admission::Replied(error(id, "STALE_FRAME", "Presented frame identity does not match the current Host revisions"));
+                }
+                // An open gesture/composition lease continues on the tab it was
+                // admitted on, so its own terminal event is not fenced by the
+                // active-tab presentation revision.
+                if !open_lease && (envelope.frame.tab_id != self.active_tab_id || envelope.frame.presentation_revision != self.presentation_revision) {
+                    return Admission::Replied(error(id, "STALE_PRESENTATION", "Presented frame belongs to a different active tab"));
+                }
+                if envelope.frame.document_revision != self.document_revision || envelope.frame.viewport_revision != self.viewport_revision {
                     return Admission::Replied(error(id, "STALE_FRAME", "Presented frame identity does not match the current Host revisions"));
                 }
             }
@@ -498,6 +547,13 @@ impl Session {
                             return Admission::Replied(error(id, "INVALID_URL", "Unsupported navigation scheme"));
                         }
                     }
+                    Command::Back | Command::Forward | Command::Reload => {},
+                    Command::TabCreate {} => {},
+                    Command::TabSelect { tab_id } | Command::TabClose { tab_id } => {
+                        if tab_id.trim().is_empty() {
+                            return Admission::Replied(error(id, "INVALID_TAB", "Tab id must not be empty"));
+                        }
+                    }
                     Command::Evaluate { .. } => {},
                     Command::Click { x, y } | Command::Scroll { x, y, .. } => {
                         if !cfg!(feature = "render") { return Admission::Replied(error(id, "INPUT_UNAVAILABLE", "Coordinate input requires a render-enabled Host")); }
@@ -563,8 +619,21 @@ impl Session {
 }
 
 struct Pending {
+    session_id: String,
     operation: Option<PendingOperation>,
+    /// True only for a Host-local maintenance flush of this session's store.
+    /// Distinguishes a drain completion from the operation/viewport path.
+    flush: bool,
     result: oneshot::Receiver<Completion>,
+}
+/// Host-local maintenance drain: flush each loaded profile's store in turn.
+/// A failure stops the drain and is reported typed; `flushed` counts the
+/// profiles that were written before the failure.
+struct Maintenance {
+    id: u64,
+    reply: oneshot::Sender<Response>,
+    remaining: Vec<String>,
+    flushed: u32,
 }
 struct PendingOperation {
     id: u64,
@@ -575,19 +644,42 @@ struct PendingOperation {
     reply: oneshot::Sender<Response>,
 }
 
-pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<()> {
+/// One live profile session: its Host-side state, its dedicated worker and the
+/// latest frame buffer. One Session == one BrowserContext == one V8 thread.
+struct SessionRuntime {
+    session: Session,
+    work: mpsc::Sender<Work>,
+    frames: tokio::sync::watch::Receiver<media::SharedFrame>,
+    interest: tokio::sync::watch::Sender<usize>,
+    viewers: usize,
+    join: std::thread::JoinHandle<Result<()>>,
+}
+
+/// Start one profile's worker and Host session state. Profile directories are
+/// derived from the configured catalog root; the wire never supplies a path.
+async fn spawn_session(
+    profile_id: String,
+    profile_dir: Option<PathBuf>,
+    network: bool,
+    faults_out: mpsc::Sender<(String, worker::PageUpdate)>,
+) -> Result<SessionRuntime> {
     let id = uuid::Uuid::new_v4().to_string();
-    std::fs::DirBuilder::new().mode(0o700).create(&socket_dir).context("socket directory must be new")?;
-    let directory = SocketDir(socket_dir);
     let (work, incoming_work) = mpsc::channel(1);
     let (ready, initialized) = oneshot::channel();
     let (faults, mut fault_events) = mpsc::channel(1);
     let (frames, latest) = tokio::sync::watch::channel(media::state(FramePacket::Waiting { session_id: id.clone() }));
     let (interest, interested) = tokio::sync::watch::channel(0usize);
-    let worker = worker::start(id.clone(), allow_private_network, incoming_work, ready, faults, frames, interested)?;
+    let worker = worker::start(id.clone(), profile_dir, network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
-    let mut session = Session {
+    let forward_id = id.clone();
+    tokio::spawn(async move {
+        while let Some(update) = fault_events.recv().await {
+            if faults_out.send((forward_id.clone(), update)).await.is_err() { break; }
+        }
+    });
+    let session = Session {
         id: id.clone(),
+        profile_id: profile_id.clone(),
         viewport: Some(viewport),
         attachments: HashMap::new(),
         agent: None,
@@ -603,40 +695,91 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
         editor_context: None,
         input_lease: None,
         sequences: HashMap::new(),
+        presentation_revision: 0,
+        active_tab_id: String::new(),
+        tabs: Vec::new(),
+        navigation: NavigationState { url: "about:blank".into(), title: String::new(), can_go_back: false, can_go_forward: false },
+        profile: ProfileBinding { profile_id: profile_id.clone(), session_id: id.clone() },
     };
-    let listener = UnixListener::bind(directory.0.join("host.sock"))?;
-    std::fs::set_permissions(directory.0.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
-    let media_listener = UnixListener::bind(directory.0.join("frames.sock"))?;
-    std::fs::set_permissions(directory.0.join("frames.sock"), std::fs::Permissions::from_mode(0o600))?;
+    Ok(SessionRuntime { session, work, frames: latest, interest, viewers: 0, join: worker })
+}
+
+pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_private_network: bool) -> Result<()> {
+    std::fs::DirBuilder::new().mode(0o700).create(&socket_dir).context("socket directory must be new")?;
+    let directory = SocketDir(socket_dir.clone());
+    if let Some(root) = &profile_root { catalog::prepare_root(root).map_err(|cause| anyhow::anyhow!("{}: {}", cause.code, cause.message))?; }
+    let mut catalog = ProfileCatalogStore::load(profile_root).map_err(|cause| anyhow::anyhow!("{}: {}", cause.code, cause.message))?;
+    let default_profile = catalog.default_id().unwrap_or_else(|| "default".to_string());
+
+    let (fault_tx, mut fault_rx) = mpsc::channel::<(String, worker::PageUpdate)>(16);
+    let mut sessions: HashMap<String, SessionRuntime> = HashMap::new();
+    let default_runtime = spawn_session(default_profile.clone(), catalog.profile_dir(&default_profile), allow_private_network, fault_tx.clone()).await?;
+    let default_session_id = default_runtime.session.id.clone();
+    sessions.insert(default_profile.clone(), default_runtime);
+    let mut presented = default_profile.clone();
+    let mut conn_session: HashMap<u64, String> = HashMap::new();
+
+    let listener = UnixListener::bind(socket_dir.join("host.sock"))?;
+    std::fs::set_permissions(socket_dir.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
+    let media_listener = UnixListener::bind(socket_dir.join("frames.sock"))?;
+    std::fs::set_permissions(socket_dir.join("frames.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_permits = Arc::new(Semaphore::new(16));
-    let mut viewers = 0usize;
     let permits = Arc::new(Semaphore::new(16));
-    let (events, mut incoming) = mpsc::channel(16);
+    let (events, mut incoming) = mpsc::channel(64);
     let mut tasks = tokio::task::JoinSet::new();
     let mut counter = 0u64;
     let mut pending: Option<Pending> = None;
+    let mut maintenance: Option<Maintenance> = None;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         // Declarations remain responsive while atomic work completes. Schedule only
         // the latest elected pair, before admitting any subsequent browser mutation.
-        if pending.is_none() && session.fault.is_none() && session.viewport.is_some() {
-            let target = session.viewport_repair.take().map(|(width, height)| (None, width, height, true))
-                .or_else(|| session.selected_viewport().map(|(owner, viewport)| (Some(owner), viewport.css_width, viewport.css_height, false)));
-            match target {
-                Some((owner, width, height, force)) if force || session.viewport != Some((width as f32, height as f32)) => {
-                    match session.viewport_work(owner, width, height, None) {
-                        Ok(kind) => {
-                            let (reply, result) = oneshot::channel();
-                            if work.try_send(Work { kind, reply }).is_err() {
-                                session.viewport_update = None;
-                                session.fault = Some("Browser worker unavailable; recreate session explicitly".into());
-                            } else { pending = Some(Pending { operation: None, result }); }
+        if pending.is_none() {
+            // Flush one loaded profile per loop turn so a failure is bound to a
+            // single profile and never masks the others.
+            let next = maintenance.as_mut().and_then(|drain| drain.remaining.pop());
+            if let Some(next) = next {
+                match sessions.get_mut(&next) {
+                    Some(runtime) => {
+                        let (reply, result) = oneshot::channel();
+                        match runtime.work.try_send(Work { kind: WorkKind::Flush, reply }) {
+                            Ok(()) => pending = Some(Pending { session_id: next, operation: None, flush: true, result }),
+                            Err(_) => {
+                                let drain = maintenance.take().expect("maintenance owner");
+                                let _ = drain.reply.send(error(drain.id, "SESSION_FAULTED", "Browser worker unavailable for maintenance flush"));
+                            }
                         }
-                        Err(cause) => session.fault = Some(cause),
                     }
+                    None => {}
                 }
-                Some((owner, _, _, _)) => session.viewport_owner = owner,
-                None => session.viewport_owner = None,
+            } else if let Some(drain) = maintenance.take() {
+                let _ = drain.reply.send(Response::Result { id: drain.id, value: ResultValue::ProfileFlush { flushed: true, profiles: drain.flushed } });
+            }
+            let mut scheduled: Option<(String, WorkKind)> = None;
+            let scheduling = maintenance.is_none() && pending.is_none();
+            for (sid, runtime) in sessions.iter_mut().filter(|_| scheduling) {
+                let session = &mut runtime.session;
+                if session.fault.is_some() || session.viewport.is_none() { continue; }
+                let target = session.viewport_repair.take().map(|(width, height)| (None, width, height, true))
+                    .or_else(|| session.selected_viewport().map(|(owner, viewport)| (Some(owner), viewport.css_width, viewport.css_height, false)));
+                match target {
+                    Some((owner, width, height, force)) if force || session.viewport != Some((width as f32, height as f32)) => {
+                        match session.viewport_work(owner, width, height, None) {
+                            Ok(kind) => { scheduled = Some((sid.clone(), kind)); break; }
+                            Err(cause) => session.fault = Some(cause),
+                        }
+                    }
+                    Some((owner, _, _, _)) => session.viewport_owner = owner,
+                    None => session.viewport_owner = None,
+                }
+            }
+            if let Some((sid, kind)) = scheduled {
+                let runtime = sessions.get_mut(&sid).expect("scheduled session exists");
+                let (reply, result) = oneshot::channel();
+                if runtime.work.try_send(Work { kind, reply }).is_err() {
+                    runtime.session.viewport_update = None;
+                    runtime.session.fault = Some("Browser worker unavailable; recreate session explicitly".into());
+                } else { pending = Some(Pending { session_id: sid, operation: None, flush: false, result }); }
             }
         }
         tokio::select! {
@@ -645,14 +788,19 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
             accepted = media_listener.accept() => {
                 let (socket, _) = accepted?;
                 if let Ok(permit) = media_permits.clone().try_acquire_owned() {
-                    viewers += 1; interest.send_replace(viewers);
-                    let latest = latest.clone(); let events = events.clone();
-                    tasks.spawn(async move {
-                        let _permit = permit;
-                        let result = media::stream(socket, latest).await;
-                        let _ = events.send(Event::MediaGone).await;
-                        result
-                    });
+                    if let Some(runtime) = sessions.get_mut(&presented) {
+                        runtime.viewers += 1;
+                        runtime.interest.send_replace(runtime.viewers);
+                        let latest = runtime.frames.clone();
+                        let events = events.clone();
+                        let session = presented.clone();
+                        tasks.spawn(async move {
+                            let _permit = permit;
+                            let result = media::stream(socket, latest).await;
+                            let _ = events.send(Event::MediaGone(session)).await;
+                            result
+                        });
+                    }
                 }
             }
             accepted = listener.accept() => {
@@ -660,7 +808,8 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                 if let Ok(permit) = permits.clone().try_acquire_owned() {
                     counter = counter.checked_add(1).context("connection identity exhausted")?;
                     let connection_id = counter;
-                    let sender = events.clone(); let session_id = id.clone();
+                    let sender = events.clone();
+                    let session_id = sessions.get(&presented).map(|runtime| runtime.session.id.clone()).unwrap_or_else(|| default_session_id.clone());
                     tasks.spawn(async move {
                         let _permit = permit;
                         let result = connection(stream, connection_id, session_id, sender.clone()).await;
@@ -671,24 +820,149 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                 // At capacity, close the unaccepted socket; no queued unbounded tasks.
             }
             Some(event) = incoming.recv() => match event {
-                Event::MediaGone => {
-                    viewers = viewers.checked_sub(1).expect("media viewer ownership");
-                    interest.send_replace(viewers);
+                Event::MediaGone(session) => {
+                    if let Some(runtime) = sessions.get_mut(&session) {
+                        runtime.viewers = runtime.viewers.saturating_sub(1);
+                        runtime.interest.send_replace(runtime.viewers);
+                    }
                 }
                 Event::Gone(connection) => {
-                    if session.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection) {
-                        session.input_lease = None;
+                    if let Some(sid) = conn_session.remove(&connection) {
+                        if let Some(runtime) = sessions.get_mut(&sid) {
+                            let session = &mut runtime.session;
+                            if session.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection) {
+                                session.input_lease = None;
+                            }
+                            session.records.remove(&connection);
+                            session.detach(connection);
+                            session.retired.remove(&connection);
+                        }
                     }
-                    if session.records.contains_key(&connection) {
-                        session.records.remove(&connection);
-                    }
-                    session.detach(connection);
-                    session.retired.remove(&connection);
+                }
+                Event::Release { connection, reply } => {
+                    let result = match conn_session.get(&connection).and_then(|sid| sessions.get_mut(sid)) {
+                        Some(runtime) => runtime.session.release_for_rebind(connection),
+                        None => Ok(()),
+                    };
+                    let _ = reply.send(result);
                 }
                 Event::Request { connection, request, reply } => {
                     let id = request.id;
-                    match session.request(connection, request, pending.is_some()) {
-                        Admission::Replied(response) => { let _ = reply.send(response); }
+                    match &request.command {
+                        Command::ProfileCatalog {} => {
+                            let _ = reply.send(Response::Result { id, value: ResultValue::ProfileCatalog { catalog: catalog.catalog() } });
+                            continue;
+                        }
+                        Command::FlushProfiles {} => {
+                            if maintenance.is_some() || pending.is_some() {
+                                let _ = reply.send(error(id, "MAINTENANCE_BUSY", "Wait for the accepted operation and any drain to finish"));
+                                continue;
+                            }
+                            let mut remaining: Vec<String> = sessions.keys().cloned().collect();
+                            remaining.sort();
+                            maintenance = Some(Maintenance { id, reply, remaining, flushed: 0 });
+                            continue;
+                        }
+                        Command::ProfileCreate { display_name, make_default } => {
+                            if !conn_session.contains_key(&connection) {
+                                let _ = reply.send(error(id, "ATTACH_REQUIRED", "Attach before profile management"));
+                            } else {
+                                let mut valid_operation = true;
+                                if let Some(operation) = request.operation.as_ref() {
+                                    if operation.session_id != sessions.get(&conn_session[&connection]).map(|runtime| runtime.session.id.clone()).unwrap_or_default()
+                                        || operation.attachment_id != connection {
+                                        valid_operation = false;
+                                    }
+                                } else {
+                                    valid_operation = false;
+                                }
+                                if !valid_operation {
+                                    let _ = reply.send(error(id, "OPERATION_REQUIRED", "Profile mutations require an operation identity for the bound session"));
+                                } else {
+                                    match catalog.create(display_name, *make_default) {
+                                        Ok(profile) => { let _ = reply.send(Response::Result { id, value: ResultValue::ProfileCreated { profile, catalog: catalog.catalog() } }); }
+                                        Err(cause) => { let _ = reply.send(error(id, cause.code, cause.message)); }
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                        Command::ProfileSelect { profile_id } => {
+                            let profile_id = profile_id.clone();
+                            let Some(source) = conn_session.get(&connection).cloned() else {
+                                let _ = reply.send(error(id, "ATTACH_REQUIRED", "Attach before selecting a profile"));
+                                continue;
+                            };
+                            let session_id = sessions.get(&source).map(|runtime| runtime.session.id.clone()).unwrap_or_default();
+                            let valid_operation = request.operation.as_ref().is_some_and(|operation| operation.session_id == session_id && operation.attachment_id == connection);
+                            if !valid_operation {
+                                let _ = reply.send(error(id, "OPERATION_REQUIRED", "Profile selection requires an operation identity for the bound session"));
+                                continue;
+                            }
+                            if catalog.record(&profile_id).is_none() {
+                                let _ = reply.send(error(id, "PROFILE_NOT_FOUND", "Unknown profile id"));
+                                continue;
+                            }
+                            let source_busy = pending.as_ref().is_some_and(|pending| pending.session_id == source && pending.operation.as_ref().is_some_and(|operation| operation.connection == connection))
+                                || sessions.get(&source).is_some_and(|runtime| runtime.session.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection));
+                            if source_busy {
+                                let _ = reply.send(error(id, "REBIND_BUSY", "Finish the current operation or composition before selecting a profile"));
+                                continue;
+                            }
+                            if profile_id == source {
+                                let runtime = sessions.get_mut(&source).expect("source session exists");
+                                let status = match runtime.session.status(connection, false) { ResultValue::Status(status) => status, _ => unreachable!() };
+                                let session_id = runtime.session.id.clone();
+                                let _ = reply.send(Response::Result { id, value: ResultValue::ProfileSelected { binding: ProfileBinding { profile_id, session_id }, status } });
+                                continue;
+                            }
+                            if !sessions.contains_key(&profile_id) {
+                                match spawn_session(profile_id.clone(), catalog.profile_dir(&profile_id), allow_private_network, fault_tx.clone()).await {
+                                    Ok(runtime) => { sessions.insert(profile_id.clone(), runtime); }
+                                    Err(cause) => { let _ = reply.send(error(id, "SESSION_UNAVAILABLE", cause.to_string())); continue; }
+                                }
+                            }
+                            let released = sessions.get_mut(&source).expect("source session exists").session.release_for_rebind(connection);
+                            if let Err(code) = released {
+                                let _ = reply.send(error(id, code, "Finish the current operation before selecting a profile"));
+                                continue;
+                            }
+                            let attach = Request { id, command: Command::Attach { mode: Mode::Observe, viewport: None }, operation: None };
+                            let runtime = sessions.get_mut(&profile_id).expect("target session exists");
+                            let response = match runtime.session.request(connection, attach, pending.is_some()) {
+                                Admission::Replied(response) => response,
+                                Admission::Run(_) => error(id, "REBIND_FAILED", "Observer rebind was unexpectedly deferred"),
+                            };
+                            let status = match response {
+                                Response::Result { value: ResultValue::Status(status), .. } => status,
+                                other => { let _ = reply.send(other); continue; }
+                            };
+                            conn_session.insert(connection, profile_id.clone());
+                            presented = profile_id.clone();
+                            let session_id = runtime.session.id.clone();
+                            let _ = reply.send(Response::Result { id, value: ResultValue::ProfileSelected { binding: ProfileBinding { profile_id, session_id }, status } });
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    let target = conn_session.get(&connection).cloned().unwrap_or_else(|| presented.clone());
+                    let Some(runtime) = sessions.get_mut(&target) else {
+                        let _ = reply.send(error(id, "SESSION_UNAVAILABLE", "Session is unavailable"));
+                        continue;
+                    };
+                    let work = runtime.work.clone();
+                    let busy = pending.is_some();
+                    let is_attach = matches!(request.command, Command::Attach { .. });
+                    let is_detach = matches!(request.command, Command::Detach {});
+                    let session = &mut runtime.session;
+                    match session.request(connection, request, busy) {
+                        Admission::Replied(response) => {
+                            if is_attach && matches!(response, Response::Result { .. }) {
+                                conn_session.insert(connection, target.clone());
+                                presented = target.clone();
+                            } else if is_detach { conn_session.remove(&connection); }
+                            let _ = reply.send(response);
+                        }
                         Admission::Run(dispatch) => {
                             let previous_sequence = session.begin_dispatch(&dispatch);
                             let record_operation = dispatch.operation.clone();
@@ -718,14 +992,14 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                                 session.records.remove(&dispatch.connection);
                                 session.input_lease = None;
                             } else {
-                                pending = Some(Pending { operation: Some(PendingOperation {
+                                pending = Some(Pending { session_id: target.clone(), operation: Some(PendingOperation {
                                     id,
                                     connection,
                                     operation: record_operation,
                                     fresh: dispatch.fresh,
                                     previous_sequence,
                                     reply,
-                                }), result });
+                                }), flush: false, result });
                             }
                         }
                     }
@@ -733,13 +1007,43 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
             },
             completion = async { (&mut pending.as_mut().unwrap().result).await }, if pending.is_some() => {
                 let finished = pending.take().unwrap();
+                let sid = finished.session_id.clone();
+                let runtime = sessions.get_mut(&sid).expect("pending session exists");
+                let session = &mut runtime.session;
                 let viewport_update = session.viewport_update.take();
                 let outcome = match completion {
                     Ok(completion) => {
+                        // Host-local maintenance flush: no viewport/operation
+                        // state changes, only the typed store receipt.
+                        if finished.flush {
+                            if let Some(drain) = maintenance.as_mut() {
+                                match completion.result {
+                                    Ok(Some(ResultValue::ProfileFlush { flushed, .. })) if flushed => {
+                                        drain.flushed = drain.flushed.saturating_add(1);
+                                        continue;
+                                    }
+                                    Err((code, cause)) => {
+                                        let maintenance = maintenance.take().expect("maintenance owner");
+                                        let _ = maintenance.reply.send(error(maintenance.id, code, cause));
+                                        continue;
+                                    }
+                                    _ => {
+                                        let maintenance = maintenance.take().expect("maintenance owner");
+                                        let _ = maintenance.reply.send(error(maintenance.id, "PROFILE_STORAGE_FAILED", "maintenance flush did not report a saved store"));
+                                        continue;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
                         // A failed resize may have changed Page partially. Keep the
                         // last committed geometry/revision and fence the faulted Page.
                         if viewport_update.is_none() { session.viewport = completion.viewport; }
                         session.document_revision = session.document_revision.max(completion.document_revision);
+                        session.presentation_revision = session.presentation_revision.max(completion.presentation_revision);
+                        session.active_tab_id = completion.active_tab_id.clone();
+                        session.tabs = completion.tabs.clone();
+                        session.navigation = completion.navigation.clone();
                         if completion.fault.is_some() { session.fault = completion.fault; }
                         if let Some(update) = viewport_update {
                             if update.cancelled {
@@ -810,13 +1114,17 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
                     let _ = operation.reply.send(response);
                 }
             },
-            update = fault_events.recv(), if session.fault.is_none() => {
+            update = fault_rx.recv() => {
                 match update {
-                    Some(update) => {
-                        session.document_revision = session.document_revision.max(update.document_revision);
-                        session.fault = update.fault;
+                    Some((sid, update)) => {
+                        if let Some(runtime) = sessions.get_mut(&sid) {
+                            if runtime.session.fault.is_none() {
+                                runtime.session.document_revision = runtime.session.document_revision.max(update.document_revision);
+                                runtime.session.fault = update.fault;
+                            }
+                        }
                     }
-                    None => session.fault = Some("Browser worker stopped".into()),
+                    None => {},
                 }
             },
             Some(completed) = tasks.join_next(), if !tasks.is_empty() => match completed {
@@ -828,12 +1136,15 @@ pub async fn serve(socket_dir: PathBuf, allow_private_network: bool) -> Result<(
     }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
-    drop(work);
-    // Keep the bounded page-update channel draining while accepted work exits.
-    // Otherwise a navigation update can block the worker that we are joining.
-    while fault_events.recv().await.is_some() {}
-    // The worker finishes accepted work before exiting; never move/drop V8 here.
-    tokio::task::spawn_blocking(move || worker.join().map_err(|_| anyhow::anyhow!("browser worker panicked"))?).await??;
-    drop(session); drop(listener); drop(media_listener); drop(directory);
+    // Drop work senders so workers finish accepted work and exit, then join the
+    // worker threads without moving V8 onto this thread.
+    let mut joins = Vec::new();
+    for (_, runtime) in sessions.drain() { joins.push(runtime.join); }
+    drop(fault_tx);
+    drop(incoming);
+    for join in joins {
+        tokio::task::spawn_blocking(move || join.join().map_err(|_| anyhow::anyhow!("browser worker panicked"))?).await??;
+    }
+    drop(listener); drop(media_listener); drop(directory);
     Ok(())
 }
