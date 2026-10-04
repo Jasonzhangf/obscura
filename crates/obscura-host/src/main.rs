@@ -3,6 +3,10 @@ mod catalog;
 #[cfg(unix)]
 mod daemon;
 #[cfg(unix)]
+mod remote_admission;
+#[cfg(unix)]
+mod remote_authorization;
+#[cfg(unix)]
 mod worker;
 #[cfg(unix)]
 mod media;
@@ -19,6 +23,10 @@ struct Args {
     /// child directory. When omitted the Host runs a single in-memory profile.
     #[arg(long)]
     profile_root: Option<std::path::PathBuf>,
+    /// Explicit typed authorization registry. Required for remote admission.
+    /// The path is configuration truth, never discovered from payload or logs.
+    #[arg(long)]
+    authorization_registry: Option<std::path::PathBuf>,
     #[arg(long)]
     allow_private_network: bool,
 }
@@ -27,7 +35,13 @@ struct Args {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    daemon::serve(args.socket_dir, args.profile_root, args.allow_private_network).await
+    daemon::serve(
+        args.socket_dir,
+        args.profile_root,
+        args.authorization_registry,
+        args.allow_private_network,
+    )
+    .await
 }
 
 #[cfg(not(unix))]

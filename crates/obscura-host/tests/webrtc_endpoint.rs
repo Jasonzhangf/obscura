@@ -3,6 +3,7 @@
 use std::{path::PathBuf, process::Stdio, time::Duration};
 
 use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::Command, net::TcpListener};
+use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}};
 
 #[tokio::test]
@@ -39,9 +40,12 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     std::fs::write(root.join("client.der"), client.der())?;
     std::fs::write(root.join("client.key"), client_key.serialize_der())?;
     std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
+    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"), root.join("profiles"), &client.der().to_vec())?;
 
     let host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
+        .arg("--profile-root").arg(root.join("profiles"))
+        .arg("--authorization-registry").arg(root.join("registry.json"))
         .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
     wait_socket(root.join("host/host.sock")).await;
     let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await?;
@@ -66,6 +70,7 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
         .arg("--client-ca").arg(root.join("ca.der")).arg("--media-bin").arg(&media_bin)
+        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
     if encoder_failure { endpoint_command.arg("--ffmpeg").arg("/nonexistent-obscura-encoder"); }
     let endpoint = endpoint_command.stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
@@ -149,6 +154,72 @@ fn identity(state: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"session_id":state["session_id"],"attachment_id":state["attachment_id"],
         "sequence":state["next_sequence"],"control_epoch":state["control"]["epoch"],
         "viewport_revision":state["viewport_revision"],"document_revision":state["document_revision"]})
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn write_authorized(registry_path: PathBuf, projection_path: PathBuf, profile_root: PathBuf, client_der: &[u8]) -> anyhow::Result<()> {
+    let fingerprint = hex(&Sha256::digest(client_der));
+    let registry = serde_json::json!({
+        "schema_version": 2,
+        "authorization_revision": 1,
+        "host_id": "host-test",
+        "devices": [{
+            "device_id": "test-device",
+            "device_label": "test client",
+            "client_certificate_sha256": fingerprint,
+            "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
+            "initial_profile_grant": {
+                "selection": "default_profile",
+                "authorization_revision": 1
+            },
+            "scope_revision": 1,
+            "status": "active",
+            "not_before_unix": 0,
+            "not_after_unix": 4102444800i64,
+            "created_at_unix": 0,
+            "revoked_at_unix": null
+        }]
+    });
+    std::fs::write(&registry_path, serde_json::to_vec(&registry)?)?;
+    let projection = serde_json::json!({
+        "schema_version": 2,
+        "authorization_revision": 1,
+        "registry_sha256": "00".repeat(32),
+        "clients": [{
+            "device_id": "test-device",
+            "client_certificate_sha256": fingerprint,
+            "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
+            "initial_profile_grant": {
+                "selection": "default_profile",
+                "authorization_revision": 1
+            }
+        }]
+    });
+    std::fs::write(&projection_path, serde_json::to_vec(&projection)?)?;
+    let members = serde_json::json!(["local", "test-device"]);
+    let catalog = serde_json::json!({
+        "catalog_revision": 1,
+        "profiles": [{
+            "profile_id": "default",
+            "display_name": "Default",
+            "default": true,
+            "access": {"owner_device_id": "local", "members": members}
+        }],
+        "default_profile_id": "default",
+        "next_id": 1
+    });
+    std::fs::create_dir_all(&profile_root)?;
+    std::fs::write(profile_root.join("catalog.json"), serde_json::to_string_pretty(&catalog)?)?;
+    Ok(())
 }
 
 fn release_binary(name: &str) -> PathBuf {
