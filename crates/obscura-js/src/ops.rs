@@ -4918,9 +4918,14 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
 }
 
 /// Shared localStorage bridge. `cmd` is `load` / `set` / `remove` / `clear`.
-/// `load` returns the origin's JSON snapshot; every other command returns an
-/// empty string. Without a profile backend this is a no-op and the JS Storage
-/// object stays in-memory.
+///
+/// `load` carries the backend as a typed presence: `None` when no profile
+/// backend is installed (JS `null`) and `Some(snapshot)` when one is, where a
+/// valid empty backend snapshot is the present `"{}"` and stays distinct from
+/// absence. The JS mirror treats `null` as "no backend, keep the standalone
+/// in-memory store" and a present string as the authoritative snapshot. Every
+/// other command performs its backend effect and returns `Some("")`; with no
+/// backend the storage commands are no-ops.
 #[op2]
 #[string]
 fn op_local_storage(
@@ -4928,28 +4933,28 @@ fn op_local_storage(
     #[string] cmd: String,
     #[string] key: String,
     #[string] value: String,
-) -> String {
+) -> Option<String> {
     let shared = state.borrow::<SharedState>().clone();
     let state = shared.borrow();
     let Some(backend) = state.local_storage.as_ref() else {
-        return String::new();
+        return None;
     };
     let origin = state.local_storage_origin.clone();
     match cmd.as_str() {
-        "load" => backend.load(&origin),
+        "load" => Some(backend.load(&origin)),
         "set" => {
             backend.set(&origin, &key, &value);
-            String::new()
+            Some(String::new())
         }
         "remove" => {
             backend.remove(&origin, &key);
-            String::new()
+            Some(String::new())
         }
         "clear" => {
             backend.clear(&origin);
-            String::new()
+            Some(String::new())
         }
-        _ => String::new(),
+        _ => Some(String::new()),
     }
 }
 

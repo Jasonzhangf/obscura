@@ -114,20 +114,41 @@ impl SharedLocalStorage {
         guard.remove(origin);
     }
 
-    /// Persist every origin snapshot atomically. A failure is returned so a
-    /// close/flush never reports a false `saved`.
+    /// Persist every authoritative origin snapshot atomically and remove owned
+    /// origin snapshot files that are no longer authoritative, so a cleared or
+    /// removed origin cannot be resurrected by a cold reload. A write or
+    /// removal failure is returned so a close/flush never reports a false
+    /// `saved`. Only owned snapshot files (`<hex-origin>.json`) are removed;
+    /// unrelated files and the storage root are left untouched.
     pub fn flush(&self) -> Result<(), ProfileStorageError> {
         let Some(dir) = &self.dir else { return Ok(()); };
         std::fs::create_dir_all(dir).map_err(|error| ProfileStorageError::io("create local storage directory", error))?;
-        let snapshot: Vec<(String, BTreeMap<String, String>)> = {
-            let guard = self.state.lock().expect("local storage owner");
-            guard.iter().map(|(origin, map)| (origin.clone(), map.clone())).collect()
-        };
-        for (origin, map) in snapshot {
+        // Hold the owner lock across the write/remove pass so a concurrent
+        // set/clear cannot interleave with the authoritative snapshot.
+        let guard = self.state.lock().expect("local storage owner");
+        for (origin, map) in guard.iter() {
             let path = dir.join(format!("{origin}.json"));
-            let json = serde_json::to_string_pretty(&map)
+            let json = serde_json::to_string_pretty(map)
                 .map_err(|error| ProfileStorageError::new("PROFILE_STORAGE_FAILED", format!("serialize local storage for {origin}: {error}")))?;
             write_atomic(&path, json.as_bytes()).map_err(|error| ProfileStorageError::io("write local storage file", error))?;
+        }
+        let entries = std::fs::read_dir(dir)
+            .map_err(|error| ProfileStorageError::io("read local storage directory", error))?;
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| ProfileStorageError::io("read local storage directory entry", error))?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if stem.is_empty() || !is_hex(stem) || guard.contains_key(stem) {
+                continue;
+            }
+            std::fs::remove_file(&path)
+                .map_err(|error| ProfileStorageError::io("remove obsolete local storage file", error))?;
         }
         Ok(())
     }

@@ -1,0 +1,171 @@
+    Blocking waiting for file lock on package cache
+   Compiling cosmic-text v0.14.2 (/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004/vendor/cosmic-text)
+   Compiling obscura-dom v0.1.0 (/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004/crates/obscura-dom)
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:136:22
+    |
+136 |     pub fn as_family(&self) -> Family {
+    |                      ^^^^^     ^^^^^^ the same lifetime is hidden here
+    |                      |
+    |                      the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+136 |     pub fn as_family(&self) -> Family<'_> {
+    |                                      ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:611:21
+    |
+611 |     pub fn as_attrs(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+611 |     pub fn as_attrs(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:651:21
+    |
+651 |     pub fn defaults(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+651 |     pub fn defaults(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:683:21
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs {
+    |                     ^^^^^                   ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs<'_> {
+    |                                                  ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/buffer.rs:868:24
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter {
+    |                        ^^^^^     ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                        |
+    |                        the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter<'_> {
+    |                                               ++++
+
+   Compiling obscura-js v0.1.0 (/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004/crates/obscura-js)
+warning: `cosmic-text` (lib) generated 5 warnings (run `cargo fix --lib -p cosmic-text` to apply 5 suggestions)
+   Compiling obscura-net v0.1.0 (/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004/crates/obscura-net)
+   Compiling obscura-render v0.1.0 (/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004/crates/obscura-render)
+   Compiling obscura-host-protocol v0.1.0 (/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004/protocol/browser)
+warning: unused variable: `document_sheet`
+    --> crates/obscura-render/src/dom.rs:2569:5
+     |
+2569 |     document_sheet: &crate::css::Stylesheet,
+     |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_document_sheet`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling obscura-media v0.1.0 (/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004/crates/obscura-media)
+warning: constant `K_CF_NUMBER_INT_TYPE` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:34:7
+   |
+34 | const K_CF_NUMBER_INT_TYPE: i32 = 9;
+   |       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `K_CF_STRING_ENCODING_UTF8` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:35:7
+   |
+35 | const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `profile_level` is never used
+   --> crates/obscura-media/src/videotoolbox.rs:706:12
+    |
+458 | impl VtSession {
+    | -------------- method in this implementation
+...
+706 |     pub fn profile_level(&self) -> Option<String> {
+    |            ^^^^^^^^^^^^^
+
+warning: function `CFStringGetCString` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:81:8
+   |
+81 |     fn CFStringGetCString(
+   |        ^^^^^^^^^^^^^^^^^^
+
+warning: `obscura-media` (lib) generated 4 warnings
+   Compiling obscura-browser v0.1.0 (/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004/crates/obscura-browser)
+warning: `obscura-render` (lib) generated 1 warning (run `cargo fix --lib -p obscura-render` to apply 1 suggestion)
+   Compiling obscura-host v0.1.0 (/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004/crates/obscura-host)
+warning: variable does not need to be mutable
+  --> crates/obscura-host/src/catalog.rs:56:25
+   |
+56 |                     let mut store = Self {
+   |                         ----^^^^^
+   |                         |
+   |                         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `editor_context` is never read
+   --> crates/obscura-host/src/worker.rs:383:9
+    |
+383 |         editor_context = None;
+    |         ^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `root_configured` is never used
+  --> crates/obscura-host/src/catalog.rs:69:12
+   |
+33 | impl ProfileCatalogStore {
+   | ------------------------ method in this implementation
+...
+69 |     pub fn root_configured(&self) -> bool { self.root.is_some() }
+   |            ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Release` is never constructed
+  --> crates/obscura-host/src/daemon.rs:22:5
+   |
+16 | enum Event {
+   |      ----- variant in this enum
+...
+22 |     Release { connection: u64, reply: oneshot::Sender<Result<(), &'static str>> },
+   |     ^^^^^^^
+
+warning: field `profile` is never read
+   --> crates/obscura-host/src/daemon.rs:102:5
+    |
+ 80 | struct Session {
+    |        ------- field in this struct
+...
+102 |     profile: ProfileBinding,
+    |     ^^^^^^^
+
+warning: `obscura-host` (bin "obscura-host") generated 5 warnings (run `cargo fix --bin "obscura-host" -p obscura-host` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 1m 27s
