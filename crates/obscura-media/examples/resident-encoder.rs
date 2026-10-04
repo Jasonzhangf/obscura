@@ -23,7 +23,9 @@ use tokio::runtime::Runtime;
 fn frame_info(width: u32, height: u32, sequence: u64) -> FrameInfo {
     FrameInfo {
         session_id: "resident-consumer".into(),
+        tab_id: "resident-tab".into(),
         sequence,
+        presentation_revision: 1,
         document_revision: 1,
         viewport_revision: 1,
         width,
