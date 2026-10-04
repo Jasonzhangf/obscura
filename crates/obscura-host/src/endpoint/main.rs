@@ -1,8 +1,15 @@
-//! Prepaired direct WSS endpoint. Browser authority stays on host.sock.
+//! Prepaired direct WSS endpoint. Browser authority stays on the Host-owned
+//! `remote-admission.sock` admission stream.
 #[cfg(unix)]
 mod channels;
 #[cfg(unix)]
 mod server;
+#[cfg(unix)]
+#[path = "../remote_admission.rs"]
+mod remote_admission;
+#[cfg(unix)]
+#[path = "../remote_authorization.rs"]
+mod remote_authorization;
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -18,6 +25,9 @@ struct Args {
     #[arg(long)] server_key: PathBuf,
     /// DER trust anchor for explicitly paired client certificates.
     #[arg(long)] client_ca: PathBuf,
+    /// Explicit typed authorized-client projection (schema_version 2). Required;
+    /// an empty `clients` set starts the endpoint in deny-all mode.
+    #[arg(long)] authorized_clients: PathBuf,
     #[arg(long)] media_bin: PathBuf,
     #[arg(long, default_value = "ffmpeg")] ffmpeg: PathBuf,
     /// Explicitly enable the UDP WebRTC media backend. WSS remains available

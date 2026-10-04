@@ -4,8 +4,9 @@ use tokio::{net::{TcpListener, UnixListener}, sync::{watch, Semaphore}};
 use tokio_rustls::{TlsAcceptor, rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}}};
 use tokio_tungstenite::{accept_hdr_async_with_config, tungstenite::{handshake::server::{Request, Response, ErrorResponse}, protocol::WebSocketConfig}};
 use super::{Args, channels};
+use crate::remote_authorization::{self, EndpointStatusReceipt};
 
-struct Grant { peer: Vec<u8>, active: watch::Sender<bool>, media_used: bool }
+struct Grant { peer: Vec<u8>, active: watch::Sender<channels::MediaState>, media_used: bool }
 type Grants = Arc<Mutex<HashMap<String, Grant>>>;
 #[derive(Clone, Copy)]
 struct MediaLifecycle { ingest_done: bool, active: usize }
@@ -18,7 +19,9 @@ impl Drop for MediaLease {
 struct Lease { token: String, grants: Grants }
 impl Drop for Lease {
     fn drop(&mut self) {
-        if let Some(grant) = self.grants.lock().expect("grant owner").remove(&self.token) { grant.active.send_replace(false); }
+        if let Some(grant) = self.grants.lock().expect("grant owner").remove(&self.token) {
+            grant.active.send_replace(channels::MediaState::default());
+        }
     }
 }
 struct Directory(PathBuf);
@@ -34,6 +37,9 @@ fn reject() -> ErrorResponse {
 
 pub async fn serve(args: Args) -> Result<()> {
     if args.enable_webrtc { ensure!(args.webrtc_bind_ip.is_some(), "--enable-webrtc requires explicit --webrtc-bind-ip"); }
+    let projection = remote_authorization::LoadedProjection::load(&args.authorized_clients)?;
+    let status = EndpointStatusReceipt::ready(&projection, std::process::id());
+    eprintln!("{}", serde_json::to_string(&status)?);
     let key_permissions = std::fs::metadata(&args.server_key)?.permissions().mode();
     ensure!(key_permissions & 0o077 == 0, "Endpoint private key must not be group/world accessible");
     let mut roots = rustls::RootCertStore::empty(); roots.add(CertificateDer::from(std::fs::read(&args.client_ca)?))?;
@@ -53,6 +59,7 @@ pub async fn serve(args: Args) -> Result<()> {
         .arg("--ffmpeg").arg(args.ffmpeg).stdout(Stdio::null()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().context("Start single media adapter")?;
     let (latest, frames) = watch::channel(None);
     let (encoded_latest, encoded_frames) = watch::channel(None);
+    let projection = Arc::new(projection);
     let media = async {
         let (socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept()).await.context("Media adapter startup deadline")??;
         channels::ingest(socket, latest, encoded_latest).await
@@ -90,12 +97,17 @@ pub async fn serve(args: Args) -> Result<()> {
                 let encoded_frames = encoded_frames.clone(); let enable_webrtc = args.enable_webrtc;
                 let media_lifecycle = media_lifecycle.clone(); let media_failure = media_failure.clone();
                 let webrtc_bind = args.webrtc_bind_ip.map(|ip| SocketAddr::new(ip, 0));
-                let host = args.host_dir.join("host.sock");
+                let host_dir = args.host_dir.clone();
+                let projection = Arc::clone(&projection);
                 clients.spawn(async move {
                     let _permit = permit;
                     tokio::time::timeout(Duration::from_secs(3600), async {
                         let tls = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(socket)).await??;
-                        let peer = tls.get_ref().1.peer_certificates().context("Paired client certificate required")?[0].as_ref().to_vec();
+                        let peer_cert = tls.get_ref().1.peer_certificates().context("Paired client certificate required")?[0].as_ref();
+                        let peer = peer_cert.to_vec();
+                        let peer_sha256 = remote_authorization::sha256(peer_cert);
+                        let (principal, initial) = projection.principal_for_cert(&peer_sha256)
+                            .context("ENDPOINT_CLIENT_NOT_AUTHORIZED: peer certificate is not in the authorized-client projection")?;
                         let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
                         let mut media_active = None;
                         let mut media_lease = None;
@@ -117,7 +129,7 @@ pub async fn serve(args: Args) -> Result<()> {
                                     let supplied = request.headers().get("authorization").and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).ok_or_else(reject)?;
                                     let mut entries = grants.lock().expect("grant owner");
                                     let grant = entries.get_mut(supplied).ok_or_else(reject)?;
-                                    if grant.peer != peer || !*grant.active.borrow() || grant.media_used { return Err(reject()); }
+                                    if grant.peer != peer || !grant.active.borrow().attached || grant.media_used { return Err(reject()); }
                                     let mut admitted = false;
                                     media_lifecycle_for_handshake.send_modify(|state| {
                                         if !state.ingest_done {
@@ -134,10 +146,14 @@ pub async fn serve(args: Args) -> Result<()> {
                             Ok(response)
                         }, Some(config))).await??;
                         if is_control {
-                            let (active, _) = watch::channel(false);
-                            grants.lock().expect("grant owner").insert(token.clone(), Grant { peer, active: active.clone(), media_used: false });
+                            let (active, _) = watch::channel(channels::MediaState::default());
+                            grants.lock().expect("grant owner").insert(token.clone(), Grant {
+                                peer,
+                                active: active.clone(),
+                                media_used: false,
+                            });
                             let _lease = Lease { token, grants };
-                            channels::control(remote, &host, active, encoded_frames, enable_webrtc, webrtc_bind).await
+                            channels::control(remote, &host_dir, active, encoded_frames, principal, initial, enable_webrtc, webrtc_bind).await
                         } else {
                             let _media_lease = media_lease.context("Missing media lease")?;
                             let result = channels::media(remote, frames, media_active.context("Missing media grant")?).await;

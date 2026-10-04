@@ -7,6 +7,11 @@ use obscura_host_protocol::{Command, Control, ControlPhase, Device, EditorContex
 use crate::media;
 use crate::worker::{self, Completion, Work, WorkKind};
 use crate::catalog::{self, ProfileCatalogStore};
+use crate::remote_admission::{
+    self, AdmissionRead, RemoteAdmissionErrorCode, RemoteAdmissionRequest, RemoteAdmissionResult,
+    RemoteConnectionIo, RemotePrincipalContext, RemoteScope,
+};
+use crate::remote_authorization::{self, AuthFailure};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -15,6 +20,10 @@ use tokio::time::{timeout, Duration};
 const MAX_FRAME: usize = 64 * 1024;
 enum Event {
     Request { connection: u64, request: Request, reply: oneshot::Sender<Response> },
+    /// One typed remote admission request. The main loop owns registry
+    /// verification, catalog membership and the route reservation; the
+    /// accepted stream task only carries bytes.
+    RemoteAdmission { connection: u64, request: RemoteAdmissionRequest, reply: oneshot::Sender<RemoteAdmissionResult> },
     Gone(u64),
     MediaGone(String),
     /// Detach one connection without retiring its identity, for a profile
@@ -31,6 +40,9 @@ impl Drop for SocketDir {
         }
         if let Err(error) = std::fs::remove_file(self.0.join("frames.sock")) {
             if error.kind() != std::io::ErrorKind::NotFound { eprintln!("media socket cleanup: {error}"); }
+        }
+        if let Err(error) = std::fs::remove_file(self.0.join("remote-admission.sock")) {
+            if error.kind() != std::io::ErrorKind::NotFound { eprintln!("remote admission socket cleanup: {error}"); }
         }
         if let Err(error) = std::fs::remove_dir(&self.0) { eprintln!("socket directory cleanup: {error}"); }
     }
@@ -54,27 +66,64 @@ async fn write(stream: &mut tokio::net::unix::OwnedWriteHalf, response: Response
     Ok(())
 }
 
-async fn connection(stream: UnixStream, id: u64, session: String, events: mpsc::Sender<Event>) -> Result<()> {
-    let (read, mut out) = stream.into_split();
-    let mut reader = BufReader::new(read);
-    write(&mut out, Response::Ready { version: HOST_PROTOCOL_VERSION, session_id: session }).await?;
+/// The single browser request/response loop. Both the local Ready-first path
+/// and the remote admission path call this with the same retained reader and
+/// writer; no path resplits, reconstructs or reads ahead.
+async fn browser_loop(
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    out: &mut tokio::net::unix::OwnedWriteHalf,
+    id: u64,
+    events: mpsc::Sender<Event>,
+) -> Result<()> {
     loop {
         let mut frame = Vec::new();
-        let size = (&mut reader).take((MAX_FRAME + 1) as u64).read_until(b'\n', &mut frame).await?;
+        let size = (&mut *reader).take((MAX_FRAME + 1) as u64).read_until(b'\n', &mut frame).await?;
         if size == 0 { return Ok(()); }
         if size > MAX_FRAME || frame.last() != Some(&b'\n') {
-            write(&mut out, error(0, "INVALID_FRAME", "Bounded newline JSON required")).await?;
+            write(out, error(0, "INVALID_FRAME", "Bounded newline JSON required")).await?;
             return Ok(());
         }
         let request: Request = match serde_json::from_slice(&frame) {
             Ok(request) => request,
-            Err(_) => { write(&mut out, error(0, "INVALID_REQUEST", "Invalid protocol request")).await?; continue; }
+            Err(_) => { write(out, error(0, "INVALID_REQUEST", "Invalid protocol request")).await?; continue; }
         };
         let (reply, result) = oneshot::channel();
         events.send(Event::Request { connection: id, request, reply }).await?;
         // Disconnect never cancels an accepted mutation. The session owns its outcome.
-        write(&mut out, result.await?).await?;
+        write(out, result.await?).await?;
     }
+}
+
+/// Local `host.sock` bootstrap: Ready-first, then the shared browser loop.
+async fn connection(stream: UnixStream, id: u64, session: String, events: mpsc::Sender<Event>) -> Result<()> {
+    let mut io = RemoteConnectionIo::from_stream(stream);
+    write(&mut io.writer, Response::Ready { version: HOST_PROTOCOL_VERSION, session_id: session }).await?;
+    browser_loop(&mut io.reader, &mut io.writer, id, events).await
+}
+
+/// Remote `remote-admission.sock` bootstrap: one split, one retained reader,
+/// admission -> typed result -> Ready (only on Ok) -> the same browser loop.
+async fn remote_connection(stream: UnixStream, id: u64, events: mpsc::Sender<Event>) -> Result<()> {
+    let mut io = RemoteConnectionIo::from_stream(stream);
+    let result = match remote_admission::read_remote_admission(&mut io.reader).await? {
+        AdmissionRead::FrameDecoded(request) => {
+            let (reply, outcome) = oneshot::channel();
+            events.send(Event::RemoteAdmission { connection: id, request, reply }).await?;
+            match outcome.await {
+                Ok(result) => result,
+                Err(_) => return Ok(()),
+            }
+        }
+        AdmissionRead::Failure(failure) => remote_admission::admission_error_result(failure),
+        AdmissionRead::NoFrameEof => return Ok(()),
+    };
+    remote_admission::write_remote_admission_result(&mut io.writer, &result).await?;
+    let session_id = match result {
+        RemoteAdmissionResult::Ok { session_id, .. } => session_id,
+        RemoteAdmissionResult::Err { .. } => return Ok(()),
+    };
+    write(&mut io.writer, Response::Ready { version: HOST_PROTOCOL_VERSION, session_id }).await?;
+    browser_loop(&mut io.reader, &mut io.writer, id, events).await
 }
 
 struct Session {
@@ -767,7 +816,143 @@ async fn spawn_session(
     Ok(SessionRuntime { session, work, frames: latest, interest, viewers: 0, join: worker })
 }
 
-pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_private_network: bool) -> Result<()> {
+/// Host-local reservation for one remote admission. It binds the accepted
+/// `remote-admission.sock` stream to exactly one profile session before
+/// `Ready`. It grants no attachment, control, frame or media right.
+struct Route {
+    profile_id: String,
+    session_id: String,
+    reservation_id: String,
+}
+
+/// Re-read the current committed registry and verify the presented principal.
+/// This is the per-command authorization truth; a stale or revoked revision is
+/// refused with no fallback to a cached projection.
+fn verify_current_authorization(
+    registry_path: Option<&std::path::Path>,
+    principal: &RemotePrincipalContext,
+) -> Result<(), AuthFailure> {
+    let Some(path) = registry_path else {
+        return Err(AuthFailure::new(
+            RemoteAdmissionErrorCode::RemoteAuthRequired,
+            "Host has no authorization registry configured",
+        ));
+    };
+    let registry = remote_authorization::RegistryFile::load(path).map_err(|cause| {
+        AuthFailure::new(RemoteAdmissionErrorCode::RemoteAuthRequired, format!("Authorization registry unavailable: {cause}"))
+    })?;
+    registry.authorize(principal).map(|_| ())
+}
+
+/// Per-command remote gate. Scope and registry revision are re-checked for
+/// every request; a bare endpoint allowlist never substitutes for this.
+fn remote_request_gate(
+    id: u64,
+    request: &Request,
+    principal: &RemotePrincipalContext,
+    registry_path: Option<&std::path::Path>,
+) -> Option<Response> {
+    let local_only = matches!(
+        request.command,
+        Command::FlushProfiles {}
+            | Command::CloseSession {}
+            | Command::Evaluate { .. }
+            | Command::Resize { .. }
+            | Command::ResumeAgent { .. }
+    ) || matches!(request.command, Command::Attach { mode: Mode::Agent, .. });
+    if local_only {
+        return Some(error(id, "REMOTE_COMMAND_FORBIDDEN", "Remote access permits observation and human browser operations only"));
+    }
+    if let Err(failure) = verify_current_authorization(registry_path, principal) {
+        return Some(error(id, failure.code.as_str(), failure.message));
+    }
+    let required = match &request.command {
+        Command::ProfileCatalog {} => RemoteScope::ProfileRead,
+        Command::ProfileCreate { .. } => RemoteScope::ProfileCreate,
+        Command::ProfileSelect { .. } => RemoteScope::ProfileSelect,
+        _ => RemoteScope::ObserveHumanControl,
+    };
+    if !principal.scopes.contains(&required) {
+        return Some(error(id, "REMOTE_PROFILE_SCOPE_REQUIRED", format!("Remote principal lacks {} scope", required.wire_name())));
+    }
+    None
+}
+
+/// Resolve one completely decoded admission request against the current
+/// registry and Host catalog, then reserve the route on the same accepted
+/// stream. Every denial is returned as a correlated `RemoteAdmissionResult`.
+async fn resolve_remote_admission(
+    registry_path: Option<&std::path::Path>,
+    catalog: &ProfileCatalogStore,
+    sessions: &mut HashMap<String, SessionRuntime>,
+    conn_route: &mut HashMap<u64, Route>,
+    conn_principal: &mut HashMap<u64, RemotePrincipalContext>,
+    connection: u64,
+    request: RemoteAdmissionRequest,
+    allow_private_network: bool,
+    fault_tx: &mpsc::Sender<(String, worker::PageUpdate)>,
+) -> RemoteAdmissionResult {
+    let request_id = request.request_id;
+    let deny = |code: RemoteAdmissionErrorCode, message: String| RemoteAdmissionResult::denial(request_id, code, message);
+    let Some(path) = registry_path else {
+        return deny(RemoteAdmissionErrorCode::RemoteAuthRequired, "Host has no authorization registry configured".into());
+    };
+    let registry = match remote_authorization::RegistryFile::load(path) {
+        Ok(registry) => registry,
+        Err(cause) => return deny(RemoteAdmissionErrorCode::RemoteAuthRequired, format!("Authorization registry unavailable: {cause}")),
+    };
+    let grant = match registry.authorize(&request.principal) {
+        Ok(grant) => grant,
+        Err(failure) => return deny(failure.code, failure.message),
+    };
+    if request.initial != grant {
+        return deny(RemoteAdmissionErrorCode::RemotePrincipalRevoked, "Initial profile grant does not match the current registry".into());
+    }
+    if request.principal.device_id != request.initial.device_id {
+        return deny(RemoteAdmissionErrorCode::RemoteAuthRequired, "Admission principal and initial grant belong to different devices".into());
+    }
+    if !request.principal.scopes.contains(&RemoteScope::ObserveHumanControl) {
+        return deny(RemoteAdmissionErrorCode::RemoteProfileScopeRequired, "Remote principal lacks observe_human_control".into());
+    }
+    let profile_id = match grant.selection {
+        remote_admission::InitialProfileSelection::DefaultProfile => match catalog.default_id() {
+            Some(id) => id,
+            None => return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, "Catalog has no default profile".into()),
+        },
+        remote_admission::InitialProfileSelection::ProfileId(id) => id,
+    };
+    let Some(entry) = catalog.record(&profile_id) else {
+        return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Profile {profile_id} does not exist"));
+    };
+    let Some(access) = entry.access.as_ref() else {
+        return deny(RemoteAdmissionErrorCode::ProfileAccessMigrationRequired, format!("Profile {profile_id} has no Host-side access record"));
+    };
+    if !access.grants(&request.principal.device_id) {
+        return deny(RemoteAdmissionErrorCode::RemoteInitialProfileAccessDenied, format!("Profile {profile_id} does not grant this device"));
+    }
+    let profile_dir = catalog.profile_dir(&profile_id);
+    if !sessions.contains_key(&profile_id) {
+        match spawn_session(profile_id.clone(), profile_dir, allow_private_network, fault_tx.clone()).await {
+            Ok(runtime) => { sessions.insert(profile_id.clone(), runtime); }
+            Err(cause) => return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Session unavailable: {cause}")),
+        }
+    }
+    let Some(runtime) = sessions.get(&profile_id) else {
+        return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Session {profile_id} unavailable"));
+    };
+    let session_id = runtime.session.id.clone();
+    let reservation_id = uuid::Uuid::new_v4().to_string();
+    conn_route.insert(connection, Route { profile_id, session_id: session_id.clone(), reservation_id: reservation_id.clone() });
+    conn_principal.insert(connection, request.principal.clone());
+    RemoteAdmissionResult::Ok { request_id, reservation_id, session_id }
+}
+
+pub async fn serve(
+    socket_dir: PathBuf,
+    profile_root: Option<PathBuf>,
+    authorization_registry: Option<PathBuf>,
+    allow_private_network: bool,
+) -> Result<()> {
     std::fs::DirBuilder::new().mode(0o700).create(&socket_dir).context("socket directory must be new")?;
     let directory = SocketDir(socket_dir.clone());
     if let Some(root) = &profile_root { catalog::prepare_root(root).map_err(|cause| anyhow::anyhow!("{}: {}", cause.code, cause.message))?; }
@@ -781,11 +966,15 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
     sessions.insert(default_profile.clone(), default_runtime);
     let mut presented = default_profile.clone();
     let mut conn_session: HashMap<u64, String> = HashMap::new();
+    let mut conn_route: HashMap<u64, Route> = HashMap::new();
+    let mut conn_principal: HashMap<u64, RemotePrincipalContext> = HashMap::new();
 
     let listener = UnixListener::bind(socket_dir.join("host.sock"))?;
     std::fs::set_permissions(socket_dir.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_listener = UnixListener::bind(socket_dir.join("frames.sock"))?;
     std::fs::set_permissions(socket_dir.join("frames.sock"), std::fs::Permissions::from_mode(0o600))?;
+    let remote_listener = UnixListener::bind(socket_dir.join("remote-admission.sock"))?;
+    std::fs::set_permissions(socket_dir.join("remote-admission.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_permits = Arc::new(Semaphore::new(16));
     let permits = Arc::new(Semaphore::new(16));
     let (events, mut incoming) = mpsc::channel(64);
@@ -919,6 +1108,20 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                     }
                 }
             }
+            accepted = remote_listener.accept() => {
+                let (stream, _) = accepted?;
+                if let Ok(permit) = permits.clone().try_acquire_owned() {
+                    counter = counter.checked_add(1).context("connection identity exhausted")?;
+                    let connection_id = counter;
+                    let sender = events.clone();
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        let result = remote_connection(stream, connection_id, sender.clone()).await;
+                        sender.send(Event::Gone(connection_id)).await.ok();
+                        result
+                    });
+                }
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 if let Ok(permit) = permits.clone().try_acquire_owned() {
@@ -950,6 +1153,22 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                             session.retired.remove(&connection);
                         }
                     }
+                    conn_route.remove(&connection);
+                    conn_principal.remove(&connection);
+                }
+                Event::RemoteAdmission { connection, request, reply } => {
+                    let outcome = resolve_remote_admission(
+                        authorization_registry.as_deref(),
+                        &catalog,
+                        &mut sessions,
+                        &mut conn_route,
+                        &mut conn_principal,
+                        connection,
+                        request,
+                        allow_private_network,
+                        &fault_tx,
+                    ).await;
+                    let _ = reply.send(outcome);
                 }
                 Event::Release { connection, reply } => {
                     let result = match conn_session.get(&connection).and_then(|sid| sessions.get_mut(sid)) {
@@ -959,18 +1178,35 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                     let _ = reply.send(result);
                 }
                 Event::Request { connection, request, reply } => {
-                    let request_target = conn_session.get(&connection).cloned().unwrap_or_else(|| presented.clone());
-                    let cleanup_inflight = pending.as_ref()
-                        .is_some_and(|pending| pending.cleanup.is_some() && pending.session_id == request_target)
-                        || sessions.get(&request_target).is_some_and(|runtime| runtime.session.terminal_cleanup.is_some());
-                    if cleanup_inflight {
-                        deferred.push((request_target, connection, request, reply));
-                        continue;
-                    }
                     let id = request.id;
+                    let remote_principal = conn_principal.get(&connection).cloned();
+                    if let Some(principal) = &remote_principal {
+                        if let Some(response) = remote_request_gate(id, &request, principal, authorization_registry.as_deref()) {
+                            let _ = reply.send(response);
+                            continue;
+                        }
+                    }
+                    let request_target = if remote_principal.is_some() {
+                        conn_session.get(&connection).cloned().or_else(|| conn_route.get(&connection).map(|route| route.profile_id.clone()))
+                    } else {
+                        conn_session.get(&connection).cloned().or_else(|| Some(presented.clone()))
+                    };
+                    if let Some(target) = &request_target {
+                        let cleanup_inflight = pending.as_ref()
+                            .is_some_and(|pending| pending.cleanup.is_some() && pending.session_id == *target)
+                            || sessions.get(target).is_some_and(|runtime| runtime.session.terminal_cleanup.is_some());
+                        if cleanup_inflight {
+                            deferred.push((target.clone(), connection, request, reply));
+                            continue;
+                        }
+                    }
                     match &request.command {
                         Command::ProfileCatalog {} => {
-                            let _ = reply.send(Response::Result { id, value: ResultValue::ProfileCatalog { catalog: catalog.catalog() } });
+                            let catalog_value = match &remote_principal {
+                                Some(principal) => catalog.remote_catalog(&principal.device_id),
+                                None => catalog.catalog(),
+                            };
+                            let _ = reply.send(Response::Result { id, value: ResultValue::ProfileCatalog { catalog: catalog_value } });
                             continue;
                         }
                         Command::FlushProfiles {} => {
@@ -995,9 +1231,22 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                                 let _ = reply.send(error(id, "OPERATION_REQUIRED", "Profile selection requires an operation identity for the bound session"));
                                 continue;
                             }
-                            if catalog.record(&profile_id).is_none() {
+                            let Some(target_entry) = catalog.record(&profile_id).cloned() else {
                                 let _ = reply.send(error(id, "PROFILE_NOT_FOUND", "Unknown profile id"));
                                 continue;
+                            };
+                            if let Some(principal) = &remote_principal {
+                                match &target_entry.access {
+                                    Some(access) if access.grants(&principal.device_id) => {}
+                                    Some(_) => {
+                                        let _ = reply.send(error(id, "REMOTE_INITIAL_PROFILE_ACCESS_DENIED", "Profile does not grant this remote device"));
+                                        continue;
+                                    }
+                                    None => {
+                                        let _ = reply.send(error(id, "PROFILE_ACCESS_MIGRATION_REQUIRED", "Profile has no Host-side access record"));
+                                        continue;
+                                    }
+                                }
                             }
                             let source_busy = pending.as_ref().is_some_and(|pending| pending.session_id == source && pending.operation.as_ref().is_some_and(|operation| operation.connection == connection))
                                 || sessions.get(&source).is_some_and(|runtime| runtime.session.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection));
@@ -1034,14 +1283,38 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                                 other => { let _ = reply.send(other); continue; }
                             };
                             conn_session.insert(connection, profile_id.clone());
-                            presented = profile_id.clone();
                             let session_id = runtime.session.id.clone();
+                            if remote_principal.is_some() {
+                                conn_route.insert(connection, Route { profile_id: profile_id.clone(), session_id: session_id.clone(), reservation_id: String::new() });
+                            } else {
+                                presented = profile_id.clone();
+                            }
                             let _ = reply.send(Response::Result { id, value: ResultValue::ProfileSelected { binding: ProfileBinding { profile_id, session_id }, status } });
                             continue;
                         }
                         _ => {}
                     }
-                    let target = conn_session.get(&connection).cloned().unwrap_or_else(|| presented.clone());
+                    let Some(target) = request_target.clone() else {
+                        let _ = reply.send(error(id, "SESSION_UNAVAILABLE", "No authorized session route for this connection"));
+                        continue;
+                    };
+                    if let Some(principal) = &remote_principal {
+                        match catalog.record(&target).and_then(|entry| entry.access.as_ref()) {
+                            Some(access) if access.grants(&principal.device_id) => {}
+                            Some(_) => {
+                                let _ = reply.send(error(id, "REMOTE_INITIAL_PROFILE_ACCESS_DENIED", "Profile does not grant this remote device"));
+                                continue;
+                            }
+                            None if catalog.record(&target).is_some() => {
+                                let _ = reply.send(error(id, "PROFILE_ACCESS_MIGRATION_REQUIRED", "Profile has no Host-side access record"));
+                                continue;
+                            }
+                            None => {
+                                let _ = reply.send(error(id, "SESSION_UNAVAILABLE", "Authorized profile is unavailable"));
+                                continue;
+                            }
+                        }
+                    }
                     let Some(runtime) = sessions.get_mut(&target) else {
                         let _ = reply.send(error(id, "SESSION_UNAVAILABLE", "Session is unavailable"));
                         continue;
@@ -1055,7 +1328,12 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                         Admission::Replied(response) => {
                             if is_attach && matches!(response, Response::Result { .. }) {
                                 conn_session.insert(connection, target.clone());
-                                presented = target.clone();
+                                if remote_principal.is_some() {
+                                    let session_id = session.id.clone();
+                                    conn_route.insert(connection, Route { profile_id: target.clone(), session_id, reservation_id: String::new() });
+                                } else {
+                                    presented = target.clone();
+                                }
                             } else if is_detach { conn_session.remove(&connection); }
                             let _ = reply.send(response);
                         }
@@ -1102,8 +1380,17 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                             let previous_sequence = session.begin_dispatch(&dispatch);
                             let result = match &dispatch.command {
                                 Command::ProfileCreate { display_name, make_default } => {
-                                    match catalog.create(display_name, *make_default) {
-                                        Ok(profile) => Ok(Some(ResultValue::ProfileCreated { profile, catalog: catalog.catalog() })),
+                                    let owner = remote_principal.as_ref()
+                                        .map(|principal| principal.device_id.clone())
+                                        .unwrap_or_else(|| catalog::LOCAL_DEVICE_ID.to_string());
+                                    match catalog.create(display_name, *make_default, &owner) {
+                                        Ok(profile) => {
+                                            let catalog_value = match &remote_principal {
+                                                Some(principal) => catalog.remote_catalog(&principal.device_id),
+                                                None => catalog.catalog(),
+                                            };
+                                            Ok(Some(ResultValue::ProfileCreated { profile, catalog: catalog_value }))
+                                        }
                                         Err(cause) => Err((cause.code, cause.message)),
                                     }
                                 }

@@ -1,6 +1,7 @@
 #![cfg(unix)]
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use futures_util::{SinkExt, StreamExt};
+use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName}};
 use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -31,8 +32,50 @@ async fn exercise() {
     std::fs::write(root.join("key.der"), host_key.serialize_der()).unwrap();
     std::fs::set_permissions(root.join("key.der"), std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(root.join("ca.der"), ca.der()).unwrap();
+    let client_fingerprint = hex(&Sha256::digest(client_cert.der()));
+    let authorized = serde_json::json!({
+        "schema_version": 2,
+        "authorization_revision": 1,
+        "registry_sha256": "00".repeat(32),
+        "clients": [{
+            "device_id": "test-device",
+            "client_certificate_sha256": client_fingerprint,
+            "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
+            "initial_profile_grant": {
+                "selection": "default_profile",
+                "authorization_revision": 1
+            }
+        }]
+    });
+    std::fs::write(root.join("authorized-clients.json"), serde_json::to_vec(&authorized).unwrap()).unwrap();
+    let registry = serde_json::json!({
+        "schema_version": 2,
+        "authorization_revision": 1,
+        "host_id": "host-test",
+        "devices": [{
+            "device_id": "test-device",
+            "device_label": "test client",
+            "client_certificate_sha256": hex(&Sha256::digest(client_cert.der())),
+            "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
+            "initial_profile_grant": {
+                "selection": "default_profile",
+                "authorization_revision": 1
+            },
+            "scope_revision": 1,
+            "status": "active",
+            "not_before_unix": 0,
+            "not_after_unix": 4102444800i64,
+            "created_at_unix": 0,
+            "revoked_at_unix": null
+        }]
+    });
+    std::fs::write(root.join("registry.json"), serde_json::to_vec(&registry).unwrap()).unwrap();
+    write_catalog(&root, &["local".to_string(), "test-device".to_string()]);
     let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
-        .arg("--socket-dir").arg(root.join("host")).stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        .arg("--socket-dir").arg(root.join("host"))
+        .arg("--profile-root").arg(root.join("profiles"))
+        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
     wait_socket(root.join("host/host.sock")).await;
     let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await.unwrap();
     let mut local = BufReader::new(local);
@@ -49,7 +92,8 @@ async fn exercise() {
         .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("key.der"))
-        .arg("--client-ca").arg(root.join("ca.der")).arg("--media-bin").arg(media)
+        .arg("--client-ca").arg(root.join("ca.der")).arg("--authorized-clients").arg(root.join("authorized-clients.json"))
+        .arg("--media-bin").arg(media)
         .stdout(Stdio::null()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
     wait_socket(root.join("endpoint/encoded.sock")).await;
     let mut roots = rustls::RootCertStore::empty(); roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
@@ -92,18 +136,20 @@ async fn exercise() {
     control.send(Message::text(r#"{"id":9,"command":{"type":"resize","width":100,"height":100}}"#)).await.unwrap();
     let resize: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(resize["code"], "REMOTE_COMMAND_FORBIDDEN");
-    // Profile management is a Host-level authorization decision. A paired
-    // mTLS principal has no profile scope on this endpoint, so these commands
-    // must be refused instead of silently forwarded with implied authority.
-    for forbidden in [
-        r#"{"id":20,"command":{"type":"profile_catalog"}}"#,
-        r#"{"id":21,"command":{"type":"profile_create","display_name":"Remote","make_default":false}}"#,
-        r#"{"id":22,"command":{"type":"profile_select","profile_id":"default"}}"#,
-    ] {
-        control.send(Message::text(forbidden.to_string())).await.unwrap();
-        let response: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        assert_eq!(response["code"], "REMOTE_COMMAND_FORBIDDEN", "{forbidden} -> {response}");
-    }
+    control.send(Message::text(r#"{"id":20,"command":{"type":"profile_catalog"}}"#)).await.unwrap();
+    let catalog: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(catalog["type"], "result", "profile catalog was not forwarded: {catalog}");
+    assert_eq!(catalog["value"]["catalog"]["profiles"][0]["profile_id"], "default");
+    control.send(Message::text(r#"{"id":21,"command":{"type":"profile_create","display_name":"Remote","make_default":false}}"#)).await.unwrap();
+    let created: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(created["type"], "error", "remote profile_create requires an operation identity: {created}");
+    assert_eq!(created["code"], "OPERATION_REQUIRED");
+    control.send(Message::text(r#"{"id":22,"command":{"type":"profile_select","profile_id":"default"}}"#)).await.unwrap();
+    let selected: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(selected["code"], "OPERATION_REQUIRED");
+    control.send(Message::text(r#"{"id":23,"command":{"type":"flush_profiles"}}"#)).await.unwrap();
+    let flush: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(flush["code"], "REMOTE_COMMAND_FORBIDDEN");
     let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
     let mut invalid = format!("wss://localhost:{}/media", address.port()).into_client_request().unwrap();
     invalid.headers_mut().insert("authorization", "Bearer invalid".parse().unwrap());
@@ -196,6 +242,37 @@ fn identity(state: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"session_id":state["session_id"],"attachment_id":state["attachment_id"],
         "sequence":state["next_sequence"],"control_epoch":state["control"]["epoch"],
         "viewport_revision":state["viewport_revision"],"document_revision":state["document_revision"]})
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(DIGITS[(byte >> 4) as usize] as char);
+        out.push(DIGITS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn write_catalog(root: &std::path::Path, members: &[String]) {
+    let members: Vec<serde_json::Value> = members.iter().cloned().map(serde_json::Value::String).collect();
+    let access = serde_json::json!({
+        "owner_device_id": "local",
+        "members": members
+    });
+    let catalog = serde_json::json!({
+        "catalog_revision": 1,
+        "profiles": [{
+            "profile_id": "default",
+            "display_name": "Default",
+            "default": true,
+            "access": access
+        }],
+        "default_profile_id": "default",
+        "next_id": 1
+    });
+    std::fs::create_dir_all(root.join("profiles")).unwrap();
+    std::fs::write(root.join("profiles/catalog.json"), serde_json::to_string_pretty(&catalog).unwrap()).unwrap();
 }
 
 async fn local_request(socket: &mut BufReader<tokio::net::UnixStream>, request: serde_json::Value) -> serde_json::Value {

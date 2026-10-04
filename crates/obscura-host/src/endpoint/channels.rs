@@ -1,14 +1,30 @@
 use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
 use anyhow::{bail, ensure, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use obscura_host_protocol::{Command, Mode, Request, Response, ResultValue, VideoPacket, WebRtcSignal};
+use obscura_host_protocol::{Command, Request, Response, ResultValue, VideoPacket, WebRtcSignal, HOST_PROTOCOL_VERSION};
 use obscura_media::EncodedFrame;
 use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::UnixStream, sync::{mpsc, watch}};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
+use crate::remote_admission::{self, InitialProfileGrant, RemoteAdmissionErrorCode, RemoteAdmissionRequest, RemoteAdmissionResult, RemotePrincipalContext};
+
 pub type Socket = WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
-pub struct Video { pub bytes: Vec<u8>, pub closed: bool }
+pub struct Video { pub bytes: Vec<u8>, pub closed: bool, pub session_id: Option<String> }
 pub type Frame = Arc<Video>;
+
+/// Exact admitted media subscription state for one mTLS control attachment.
+/// Authority is only set after the Host confirms the final `Attach`/rebind; a
+/// reservation or endpoint handshake alone never grants media rights.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaState {
+    pub attached: bool,
+    pub session_id: Option<String>,
+    pub generation: u64,
+}
+
+impl Default for MediaState {
+    fn default() -> Self { Self { attached: false, session_id: None, generation: 0 } }
+}
 
 async fn reply(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> Result<Response> {
     let mut bytes = Vec::new();
@@ -19,17 +35,51 @@ async fn reply(reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>) -> Resul
 
 pub async fn control(
     mut remote: Socket,
-    path: &Path,
-    active: watch::Sender<bool>,
+    host_dir: &Path,
+    active: watch::Sender<MediaState>,
     latest: watch::Receiver<Option<Arc<EncodedFrame>>>,
+    principal: RemotePrincipalContext,
+    initial: InitialProfileGrant,
     enable_webrtc: bool,
     webrtc_bind: Option<SocketAddr>,
 ) -> Result<()> {
-    let local = UnixStream::connect(path).await.context("Connect local Host control")?;
+    // Same-stream pre-Ready admission: one split, one retained reader that
+    // carries admission -> result -> Ready -> every browser response.
+    let admission_path = host_dir.join("remote-admission.sock");
+    let local = UnixStream::connect(&admission_path).await.context("Connect Host remote admission")?;
     let (read, mut write) = local.into_split(); let mut reader = BufReader::new(read);
-    let ready = reply(&mut reader).await?;
-    send(&mut remote, Message::text(serde_json::to_string(&ready)?)).await?;
+    let request_id = 1u64;
+    let request = RemoteAdmissionRequest { principal, initial, request_id };
+    remote_admission::write_remote_admission_request(&mut write, &request).await?;
+    let Some(result) = remote_admission::read_remote_admission_result(&mut reader).await? else {
+        bail!("Host closed the remote admission stream before a result");
+    };
+    match &result {
+        RemoteAdmissionResult::Ok { request_id: id, session_id, .. } => {
+            ensure!(*id == request_id, "Remote admission result correlation mismatch");
+            let ready = reply(&mut reader).await?;
+            match &ready {
+                Response::Ready { version, session_id: ready_session } => {
+                    ensure!(*version == HOST_PROTOCOL_VERSION, "Host Ready protocol version mismatch");
+                    ensure!(ready_session == session_id, "Host Ready session does not match the admission reservation");
+                }
+                _ => bail!("Host did not publish Ready after remote admission"),
+            }
+            send(&mut remote, Message::text(serde_json::to_string(&ready)?)).await?;
+        }
+        RemoteAdmissionResult::Err { request_id: id, code, message } => {
+            let acceptable = match id {
+                Some(id) => *id == request_id,
+                None => *code == RemoteAdmissionErrorCode::RemoteAdmissionMalformed,
+            };
+            ensure!(acceptable, "Illegal remote admission result: {result:?}");
+            let response = Response::Error { id: request_id, code: code.as_str().to_string(), message: message.clone() };
+            send(&mut remote, Message::text(serde_json::to_string(&response)?)).await?;
+            return Ok(());
+        }
+    }
     let mut webrtc_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
+    let mut webrtc_filter: Option<tokio::task::JoinHandle<()>> = None;
     let mut browser_requests: Option<mpsc::Receiver<Request>> = None;
     let mut browser_responses: Option<mpsc::Sender<Response>> = None;
     let mut internal_id = u64::MAX;
@@ -48,7 +98,7 @@ pub async fn control(
                         WebRtcSignal::Offer { id, capability, sdp } => {
                             let result = if !enable_webrtc {
                                 Err(anyhow::anyhow!("WEBRTC_DISABLED: WebRTC requires explicit endpoint enablement"))
-                            } else if !*active.borrow() {
+                            } else if !active.borrow().attached {
                                 Err(anyhow::anyhow!("ATTACH_REQUIRED: Observe attachment must be active before WebRTC signaling"))
                             } else if webrtc_task.is_some() {
                                 Err(anyhow::anyhow!("WEBRTC_CONNECTED: One WebRTC media connection per mTLS control attachment"))
@@ -63,8 +113,9 @@ pub async fn control(
                                 ensure!(authorized_capability == capability, "Host returned a different WebRTC capability");
                                 let (browser_request_tx, browser_request_rx) = mpsc::channel(16);
                                 let (browser_response_tx, browser_response_rx) = mpsc::channel(16);
+                                let (webrtc_latest, filter) = exact_session_stream(latest.clone(), active.subscribe());
                                 let (answer_sdp, endpoint) = obscura_media::webrtc_endpoint::accept_offer(
-                                    sdp, capability.clone(), binding.clone(), latest.clone(),
+                                    sdp, capability.clone(), binding.clone(), webrtc_latest,
                                     browser_request_tx, browser_response_rx, bind).await?;
                                 let consumed = host_command(&mut write, &mut reader, &mut internal_id,
                                     Command::ConsumeWebRtc { binding: binding.clone(), capability: capability.clone() }).await?;
@@ -74,6 +125,7 @@ pub async fn control(
                                 send(&mut remote, Message::text(serde_json::to_string(&answer)?)).await?;
                                 browser_requests = Some(browser_request_rx);
                                 browser_responses = Some(browser_response_tx);
+                                webrtc_filter = Some(filter);
                                 webrtc_task = Some(tokio::spawn(async move {
                                     let result = endpoint.run().await;
                                     if let Err(error) = &result { eprintln!("WebRTC endpoint task ended: {error}"); }
@@ -101,15 +153,12 @@ pub async fn control(
                         send(&mut remote, Message::text(serde_json::to_string(&error)?)).await?; continue;
                     }
                 };
-                let result = if permitted_remote_command(&request.command) {
-                    host_request(&mut write, &mut reader, request).await?
-                } else {
-                    remote_command_error(request.id)
-                };
-                let detached = update_active(&active, &result);
+                let result = forward_remote_request(&mut write, &mut reader, request).await?;
+                let detached = update_media_state(&active, &result);
                 send(&mut remote, Message::text(serde_json::to_string(&result)?)).await?;
                 if detached {
                     if let Some(task) = webrtc_task.take() { task.abort(); }
+                    if let Some(task) = webrtc_filter.take() { task.abort(); }
                     browser_requests = None;
                     browser_responses = None;
                 }
@@ -126,16 +175,13 @@ pub async fn control(
                     webrtc_task = None;
                     continue;
                 };
-                let result = if permitted_remote_command(&request.command) {
-                    host_request(&mut write, &mut reader, request).await?
-                } else {
-                    remote_command_error(request.id)
-                };
-                let detached = update_active(&active, &result);
+                let result = forward_remote_request(&mut write, &mut reader, request).await?;
+                let detached = update_media_state(&active, &result);
                 let response_tx = browser_responses.as_ref().context("WebRTC browser response pump unavailable")?;
                 response_tx.send(result).await.context("WebRTC browser response receiver ended")?;
                 if detached {
                     if let Some(task) = webrtc_task.take() { task.abort(); }
+                    if let Some(task) = webrtc_filter.take() { task.abort(); }
                     browser_requests = None;
                     browser_responses = None;
                 }
@@ -143,50 +189,91 @@ pub async fn control(
         }
     }
     if let Some(task) = webrtc_task { task.abort(); }
+    if let Some(task) = webrtc_filter { task.abort(); }
     Ok(())
 }
 
-fn permitted_remote_command(command: &Command) -> bool {
-    // Profile catalog/create/select are Host-level authorization decisions.
-    // A paired mTLS principal carries no profile scope here, so they are
-    // refused remotely; the local authenticated Host socket keeps them. Do not
-    // widen this allowlist without binding an explicit typed scope.
-    matches!(command,
-        Command::Attach { mode: Mode::Observe, .. }
-            | Command::DeclareViewport { .. }
-            | Command::Status {}
-            | Command::Detach {}
-            | Command::RequestTakeover { .. }
-            | Command::ReleaseControl { .. }
-            | Command::Navigate { .. }
-            | Command::Back
-            | Command::Forward
-            | Command::Reload
-            | Command::TabCreate {}
-            | Command::TabSelect { .. }
-            | Command::TabClose { .. }
-            | Command::Click { .. }
-            | Command::InputText { .. }
-            | Command::Input { .. }
-            | Command::Scroll { .. })
+/// Derive an exact-session view of the endpoint encoded stream for one admitted
+/// attachment. It never forwards a frame that does not belong to the
+/// connection's current admitted session, so the shared encoded stream cannot
+/// leak another profile's media to this peer. The task ends when the
+/// attachment detaches or either watch closes.
+fn exact_session_stream(
+    mut source: watch::Receiver<Option<Arc<EncodedFrame>>>,
+    mut state: watch::Receiver<MediaState>,
+) -> (watch::Receiver<Option<Arc<EncodedFrame>>>, tokio::task::JoinHandle<()>) {
+    let (filtered, receiver) = watch::channel(None);
+    let task = tokio::spawn(async move {
+        loop {
+            let current = state.borrow().clone();
+            let session = match (current.attached, current.session_id) {
+                (true, Some(session)) => session,
+                _ => { filtered.send_replace(None); return; }
+            };
+            match source.borrow_and_update().clone() {
+                Some(frame) if packet_session(&frame.packet).as_deref() == Some(session.as_str()) => {
+                    filtered.send_replace(Some(frame));
+                }
+                _ => { filtered.send_replace(None); }
+            }
+            tokio::select! {
+                changed = source.changed() => { if changed.is_err() { return; } }
+                changed = state.changed() => { if changed.is_err() { return; } }
+            }
+        }
+    });
+    (receiver, task)
+}
+
+/// Forward a raw browser request over the already-admitted stream. The endpoint
+/// no longer substitutes a bare command allowlist for Host scope/access
+/// checks; only the local-only maintenance drain stays endpoint-refused.
+async fn forward_remote_request(
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+    request: Request,
+) -> Result<Response> {
+    if matches!(request.command, Command::FlushProfiles {}) {
+        return Ok(remote_command_error(request.id));
+    }
+    host_request(write, reader, request).await
 }
 
 fn remote_command_error(id: u64) -> Response {
     Response::Error {
         id,
         code: "REMOTE_COMMAND_FORBIDDEN".into(),
-        message: "Prepaired remote access permits observation and human browser operations only".into(),
+        message: "FlushProfiles is a Host-local maintenance command".into(),
     }
 }
 
-fn update_active(
-    active: &watch::Sender<bool>,
+fn update_media_state(
+    active: &watch::Sender<MediaState>,
     result: &Response,
 ) -> bool {
-    let Response::Result { value: ResultValue::Status(status), .. } = result else { return false; };
-    let attached = status.attachment_id.is_some();
-    active.send_replace(attached);
-    !attached
+    match result {
+        Response::Result { value: ResultValue::Status(status), .. } => {
+            let attached = status.attachment_id.is_some();
+            let session_id = attached.then(|| status.session_id.clone());
+            active.send_modify(|state| {
+                if state.session_id != session_id { state.generation = state.generation.wrapping_add(1); }
+                state.attached = attached;
+                state.session_id = session_id;
+            });
+            !attached
+        }
+        Response::Result { value: ResultValue::ProfileSelected { binding, status }, .. } => {
+            let attached = status.attachment_id.is_some();
+            let session_id = attached.then(|| binding.session_id.clone());
+            active.send_modify(|state| {
+                if state.session_id != session_id { state.generation = state.generation.wrapping_add(1); }
+                state.attached = attached;
+                state.session_id = session_id;
+            });
+            !attached
+        }
+        _ => false,
+    }
 }
 
 async fn host_request(
@@ -220,7 +307,17 @@ pub async fn send(remote: &mut Socket, message: Message) -> Result<()> {
     tokio::time::timeout(Duration::from_secs(2), remote.send(message)).await.context("WSS consumer stalled")??; Ok(())
 }
 
-pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>>, mut active: watch::Receiver<bool>) -> Result<()> {
+fn packet_session(packet: &VideoPacket) -> Option<String> {
+    match packet {
+        VideoPacket::Waiting { session_id }
+        | VideoPacket::Unavailable { session_id, .. }
+        | VideoPacket::EncoderUnavailable { session_id, .. }
+        | VideoPacket::Closed { session_id } => Some(session_id.clone()),
+        VideoPacket::AccessUnit { source, .. } => Some(source.session_id.clone()),
+    }
+}
+
+pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>>, mut active: watch::Receiver<MediaState>) -> Result<()> {
     let mut emit = true;
     loop {
         // A client may end its control attachment before this endpoint receives
@@ -228,9 +325,30 @@ pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>
         // calls network.disconnect after moveTaskToBack). That is a normal
         // client teardown, not a server/media delivery failure: there is no
         // longer a consumer that must receive Closed.
-        if !*active.borrow() { return Ok(()); }
+        let expected = (*active.borrow()).clone();
+        if !expected.attached { return Ok(()); }
+        let expected_session = expected.session_id.clone().context("Attached media state has no session identity")?;
+        let expected_generation = expected.generation;
         let frame = if emit { latest.borrow_and_update().clone() } else { None };
         if let Some(frame) = frame {
+            // Exact admitted session/generation only. A frame from any other
+            // profile session is never forwarded to this peer.
+            if frame.session_id.as_deref() != Some(expected_session.as_str()) {
+                tokio::select! {
+                    changed = latest.changed() => { changed.context("Encoder stream ended")?; emit = true; }
+                    changed = active.changed() => {
+                        match changed {
+                            Ok(_) => {
+                                let current = (*active.borrow()).clone();
+                                if !current.attached || current.generation != expected_generation { return Ok(()); }
+                                emit = true;
+                            }
+                            Err(_) => return Ok(()),
+                        }
+                    }
+                }
+                continue;
+            }
             send(&mut remote, Message::Binary(frame.bytes.clone().into())).await?;
             if frame.closed { return Ok(()); }
         }
@@ -239,8 +357,10 @@ pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>
             changed = latest.changed() => { changed.context("Encoder stream ended")?; emit = true; }
             changed = active.changed() => {
                 match changed {
-                    Ok(_) if !*active.borrow() => return Ok(()),
-                    Ok(_) => {}
+                    Ok(_) => {
+                        let current = (*active.borrow()).clone();
+                        if !current.attached || current.generation != expected_generation { return Ok(()); }
+                    }
                     Err(_) => return Ok(()),
                 }
             }
@@ -274,7 +394,8 @@ pub async fn ingest(
         let mut bytes = Vec::with_capacity(4 + header.len() + payload.len());
         bytes.extend_from_slice(&(header.len() as u32).to_be_bytes()); bytes.extend_from_slice(&header); bytes.extend_from_slice(&payload);
         let closed = matches!(packet, VideoPacket::Closed { .. });
-        latest.send_replace(Some(Arc::new(Video { bytes, closed })));
+        let session_id = packet_session(&packet);
+        latest.send_replace(Some(Arc::new(Video { bytes, closed, session_id })));
         if matches!(packet, VideoPacket::EncoderUnavailable { .. }) {
             // EncoderUnavailable is terminal at this local ABI boundary. Close
             // both fan-out watches immediately so every endpoint can deliver
