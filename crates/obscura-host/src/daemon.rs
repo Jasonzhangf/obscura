@@ -639,7 +639,7 @@ impl Session {
                         || matches!(self.control.phase, ControlPhase::Human { attachment_id } if attachment_id == connection);
                     let lease_owner = operation.as_ref().is_some_and(|operation| self.continues_open_lease(connection, operation));
                     if !allowed && !lease_owner { return Admission::Replied(error(id, "CONTROL_REQUIRED", "Input requires current control ownership")); }
-                } else {
+                } else if !host_mutation {
                     if self.agent != Some(connection) { return Admission::Replied(error(id, "AGENT_REQUIRED", "Observer cannot mutate or evaluate JavaScript")); }
                     if !matches!(self.control.phase, ControlPhase::Agent) { return Admission::Replied(error(id, "CONTROL_REQUIRED", "Agent control is suspended")); }
                 }

@@ -541,7 +541,15 @@ fn click_receipt_precedes_navigation_and_old_document_input_is_rejected() {
         };
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut reader = BufReader::new(stream.try_clone().unwrap());
-        loop { let mut line = String::new(); assert!(reader.read_line(&mut line).unwrap() > 0); if line == "\r\n" { break; } }
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(read) if read > 0 && line == "\r\n" => break,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                Err(error) => panic!("fixture request read: {error}"),
+            }
+        }
         arrived.send(()).unwrap();
         gate.recv_timeout(Duration::from_secs(4)).unwrap();
         let body = "<title>destination</title><button style='position:absolute;left:10px;top:10px;width:200px;height:60px' onclick='window.unwanted=true'>new document</button>";
@@ -632,9 +640,8 @@ fn sleeping_page_remains_responsive_and_fetch_finishes_after_disconnect() {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                    let mut input = BufReader::new(stream.try_clone().unwrap());
-                    loop { let mut line = String::new(); input.read_line(&mut line).unwrap(); if line == "\r\n" { break; } }
+                    let mut header = [0u8; 4096];
+                    let _ = stream.peek(&mut header);
                     std::thread::sleep(Duration::from_millis(250));
                     write!(stream, "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone").unwrap();
                     break;

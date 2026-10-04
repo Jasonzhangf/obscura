@@ -14,7 +14,7 @@ struct Root {
 
 impl Root {
     fn new(name: &str) -> Self {
-        let dir = std::path::PathBuf::from("/tmp").join(format!("onp-{name}-{}", uuid::Uuid::new_v4().simple()));
+        let dir = std::path::PathBuf::from("/tmp").join(format!("n-{name}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir(&dir).expect("create private test root");
         Self { dir }
     }
@@ -35,7 +35,7 @@ struct Daemon {
 
 impl Daemon {
     fn start(root: &Root) -> Self {
-        let dir = root.path().join(format!("sock-{}", uuid::Uuid::new_v4().simple()));
+        let dir = root.path().join("s");
         let profile_root = root.path().join("profiles");
         let child = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
             .arg("--socket-dir").arg(&dir)
