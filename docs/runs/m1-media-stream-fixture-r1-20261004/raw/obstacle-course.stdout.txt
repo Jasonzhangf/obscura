@@ -1,0 +1,40 @@
+obstacle course: 33 stages, 1 runs (warmup 0), wait 3s
+  bin: /Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/release/obscura
+
+stage             cat         result   min ms  med ms   detail
+--------------------------------------------------------------------------------------
+static            baseline    PASS     3039.1  3039.1   baseline: HTML parse + querySelectorAll
+dom-build         perf        PASS     3158.0  3158.0   vanilla-JS DOM throughput (build 5000 rows)
+react             frameworks  PASS     3071.8  3071.8   client-side React render (full client-side rendering, not just static HTML)
+preact            frameworks  PASS     3055.6  3055.6   client-side Preact render via h()/render() (100-item list)
+vue               frameworks  PASS     3032.1  3032.1   client-side Vue 3 render via createApp/mount (100-item list)
+ssr-hydrate       modern-web  PASS     3020.9  3020.9   SSR hydration: server-rendered <ul> of 10 <li> ships in the initial HTML, then Preact hydrate() (../vendor/preact.umd.js) attaches client-side over the existing DOM. The hydrated component runs on the client and computes a checksum (sum of indices 0..9 = 45) the static HTML never contained, and marks the status node 'client', proving the client took over the pre-rendered markup.
+es-modules        modern-web  PASS     3018.9  3018.9   ES modules / code-splitting: <script type=module> statically imports ../modules/util.js (PREFIX + sum(range(5))=10) and does a runtime dynamic import() of ../modules/lazy.js, a code-split chunk that itself imports util.js (lazy.fib(10)=55, lazy.total([0..4])=10). Proves obscura runs module scripts, resolves nested static+dynamic module graphs, and settles on the async chunk load.
+observer-intersectionmodern-web  PASS     3019.9  3019.9   infinite-scroll/lazy-load: IntersectionObserver on a sentinel fires the callback, appends batches of 10 until 50 items are loaded, then disconnects and reports the total card count
+observer-mutation modern-web  PASS     3050.1  3050.1   MutationObserver childList: observing a container, appending 3 children delivers 3 mutation records (3 added nodes total, 3 children), recorded in the MO callback
+storage-roundtrip modern-web  PASS     3041.1  3041.1   Web Storage round-trip: setItem to localStorage and sessionStorage, read both back, and report values plus each store's length (1 each)
+raf-update        modern-web  PASS     3020.1  3020.1   requestAnimationFrame-driven DOM update: a 2-frame rAF chain advances a counter and writes the final value into the DOM after the frames run
+modern-js-lang    modern-web  PASS     3032.5  3032.5   modern ES language surface in one assert: optional chaining (?.) + nullish coalescing (??), array/object destructuring with defaults, array+object spread, template literals, Map/Set, BigInt arithmetic past Number.MAX_SAFE_INTEGER, Array.flatMap, Array.prototype.at(-1), and Object.fromEntries
+modern-js-platformmodern-web  PASS     3018.9  3018.9   modern platform APIs via top-level async/await: Promise.allSettled (mixed fulfil/reject), Promise.any (first winner), structuredClone deep-copy independence, AbortController + AbortSignal.aborted state flip, TextEncoder/TextDecoder UTF-8 round-trip of multi-byte chars (12 bytes), crypto.randomUUID v4 shape, and async crypto.subtle.digest SHA-256 of "abc" (known-answer ba7816bf8f01)
+spa-mini-app      modern-web  PASS     3078.5  3078.5   composite SPA: same-origin fetch() of a JSON dataset, a pushState client-side router, a Preact list view then a detail view after navigating to /article/<slug>, with a shared store (list count + selection) persisted across the client-side navigation
+async-render      capability  PASS     3076.4  3076.4   fetch() same-origin JSON then render (async settle)
+spa-router        capability  PASS     3049.7  3049.7   pushState client-side routing
+timers            capability  PASS     3040.2  3040.2   setTimeout chain + microtask (event-loop settle)
+web-component     web-api     PASS     3020.2  3020.2   custom element + shadow DOM render
+url               web-api     PASS     3022.0  3022.0   WHATWG URL parser: decompose https://u:p@h.test:8/a?x=1#y into protocol/username/password/hostname/port/host/pathname/search/hash
+textdecoder       web-api     PASS     3026.4  3026.4   TextDecoder legacy charset: new TextDecoder('shift_jis').decode([0x82,0xA0]) yields the Japanese hiragana あ via the Encoding Standard index tables
+fileapi           web-api     PASS     3019.2  3019.2   File API: Blob construction (size 18) plus async FileReader.readAsText load event returning the concatenated blob text
+range             web-api     PASS     3047.8  3047.8   Range: createRange + selectNodeContents over a 3-child container, toString walks the subtree (offsets 0..3)
+selection         web-api     PASS     3020.2  3020.2   Selection: getSelection().selectAllChildren produces one range and toString returns the container's text
+custom-element    web-api     PASS     3065.9  3065.9   Custom element: customElements.define upgrades the connected element and connectedCallback sets its content
+dialog            web-api     PASS     3048.9  3048.9   HTMLDialogElement: showModal sets open=true, close('confirmed') clears open and sets returnValue
+input-step        web-api     PASS     3021.2  3021.2   HTMLInputElement number: valueAsNumber reads 10, stepUp(3) advances by 3*step(5) to 25 and reflects into value
+extract-article   extraction  PASS     3029.6  3029.6   --dump text readability extraction: keeps the <article> body, strips <nav>/<header>/<aside>/<footer> boilerplate
+extract-markdown  extraction  PASS     3052.7  3052.7   --dump markdown: headings (# / ##), list bullets (- ), link syntax ](url), and fenced code blocks
+extract-links     extraction  PASS     3044.1  3044.1   --dump links: harvests every anchor href from the rendered page
+extract-html      extraction  PASS     3020.2  3020.2   --dump html: serializes the live DOM including a JS-injected element to prove rendered state is captured
+fingerprint       scraping    PASS     3104.5  3104.5   stealth fingerprint: navigator.userAgent reads as Chrome, navigator.webdriver is not advertised (undefined/false), and platform/language/timezone are populated and consistent
+cookies           scraping    PASS     3019.5  3019.5   document.cookie round-trip: cookies written from JS are read back from a real cookie jar
+charset-shiftjis  scraping    PASS     3019.2  3019.2   charset meta-sniff: page stored as raw Shift_JIS bytes with <meta charset=shift_jis>; obscura decodes the body to correct Japanese text
+--------------------------------------------------------------------------------------
+correctness: 33/33 stages passed   |   median latency: 3032.5ms across stages

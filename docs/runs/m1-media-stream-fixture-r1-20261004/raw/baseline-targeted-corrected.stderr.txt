@@ -1,0 +1,43 @@
+   Compiling obscura-host-protocol v0.1.0 (/Volumes/Intel/playground/obscura/m1-media-stream-fixture-r1-20261004/protocol/browser)
+   Compiling obscura-media v0.1.0 (/Volumes/Intel/playground/obscura/m1-media-stream-fixture-r1-20261004/crates/obscura-media)
+warning: constant `K_CF_NUMBER_INT_TYPE` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:34:7
+   |
+34 | const K_CF_NUMBER_INT_TYPE: i32 = 9;
+   |       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `K_CF_STRING_ENCODING_UTF8` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:35:7
+   |
+35 | const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `profile_level` is never used
+   --> crates/obscura-media/src/videotoolbox.rs:706:12
+    |
+458 | impl VtSession {
+    | -------------- method in this implementation
+...
+706 |     pub fn profile_level(&self) -> Option<String> {
+    |            ^^^^^^^^^^^^^
+
+warning: function `CFStringGetCString` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:81:8
+   |
+81 |     fn CFStringGetCString(
+   |        ^^^^^^^^^^^^^^^^^^
+
+warning: `obscura-media` (lib) generated 4 warnings
+    Finished `release` profile [optimized] target(s) in 5.19s
+────────────
+ Nextest run ID 39eb517b-4f5b-4e6c-85a5-168602aab70a with nextest profile: default
+    Starting 5 tests across 1 binary
+        PASS [   0.235s] (1/5) obscura-media::stream public_adapter_rejects_session_switch_and_exits
+        PASS [   0.236s] (2/5) obscura-media::stream public_adapter_reports_encoder_failure_and_exits
+        PASS [   0.234s] (3/5) obscura-media::stream public_adapter_stops_after_first_closed_packet
+        PASS [   0.343s] (4/5) obscura-media::stream public_adapter_recovers_after_host_unavailable
+        PASS [   0.395s] (5/5) obscura-media::stream public_adapter_preserves_host_identity_through_resize_and_close
+────────────
+     Summary [   0.399s] 5 tests run: 5 passed, 0 skipped
