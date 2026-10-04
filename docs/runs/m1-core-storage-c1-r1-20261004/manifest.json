@@ -1,0 +1,126 @@
+{
+  "task": "m1-core-storage-c1-r1-20261004",
+  "owner_branch": "codex/m1-core-storage-c1-r1-20261004",
+  "owner_worktree": "/Volumes/Intel/playground/obscura/m1-core-storage-c1-r1-20261004",
+  "status": "AUTHOR_SCOPE_VERIFIED",
+  "combined_status": "COMBINED_E2E_WAIT",
+  "next_owner": "C3 Engine editor/input author (consume the typed op_local_storage presence in the bootstrap.js mirror), then the root-assigned combined verification/review author for full release workspace nextest + exact CLI release build + 33-stage obstacle course",
+  "base": {
+    "commit": "a40d1bb626831cb030b945758f83be217b1e78d2",
+    "tree": "f8001162ec6e0cfc990b62dabce345e77931d5cc",
+    "fork_main": "948f054b51af442306be046d0014cfa3da628f27"
+  },
+  "candidate": {
+    "commit": "69cf78ecaa730d1aa4de34d13247f25df8b989a7",
+    "tree": "d1b112f9bd348e197b7ac0ed2f8bc76f6cc2785b",
+    "parent": "a40d1bb626831cb030b945758f83be217b1e78d2"
+  },
+  "product_files": {
+    "crates/obscura-js/src/ops.rs": "3806233699f4a92bc402d9a14bd56c1f6e6a188aabd9cf7c01ca7e974eade266",
+    "crates/obscura-browser/src/context.rs": "d7c3d5b5fbf111a481617aaa9538aeba0ba3a22788a61b6e08deddd9466e2654"
+  },
+  "test_files": {
+    "crates/obscura-js/tests/local_storage_public_r2.rs": "c47594141a786f8a7d96e61aa44d735209cb3d70939c12b8a78311a38bbd50f3",
+    "crates/obscura-browser/tests/storage_clear_r2.rs": "530f3efdd04c126ebb5b06c63f6234e3f9eae7503f32b368aea1f61c97c35c11"
+  },
+  "test_artifacts": {
+    "candidate_host_sha256": "d751b403fd5f1b5fc9180b09c8f8e36db56716b95ca01e749d4fac508c550b4f",
+    "frozen_host_sha256_before": "e78bbc25cc27e0b639f48c4c0fe2446f82823f98b5f78cbe48418c8ffaa70539",
+    "frozen_cli_sha256_unchanged": "8e5240ee2966216c53345eae66135075a949acbde9a0ed8e7b52d812e183779b",
+    "consumer_binary_sha256": "5d71f660b678797afe1f42601553b32bc735453a2ab263f92c238032879bb66a",
+    "host_probe_py_sha256": "c4c7a8fc433d54090a58599f7c243d51808ba71a8fbe02fe5015ab9543265eb5",
+    "copied_consumer_main_rs_sha256": "fbd673a6cb8eb1160cbb8792f9465bec3c7c799794832ec7ec6f1bca2281778c"
+  },
+  "gates": {
+    "scoped_nextest": {
+      "command": "CARGO_TARGET_DIR=<granted> CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo nextest run --locked --release --features render -p obscura-js --test local_storage_public_r2 -p obscura-browser --test storage_clear_r2 --no-fail-fast",
+      "exit": 0,
+      "tests": "6/6 passed"
+    },
+    "candidate_host_build": {
+      "command": "CARGO_TARGET_DIR=<granted> CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --locked --release --features render -p obscura-host --bin obscura-host",
+      "exit": 0
+    },
+    "f1_storage_clear_restart": {
+      "command": "python3 docs/runs/m1-core-storage-c1-r1-20261004/host_probe.py --host-binary <candidateHost> --scenario storage-clear-restart --work-root <fresh-absent>",
+      "exit": 0,
+      "cold_get": null,
+      "obsolete_snapshot_absent": true,
+      "resurrection_observed": false
+    },
+    "constructor_consumer": {
+      "command": "CARGO_TARGET_DIR=<granted> cargo run --locked --release --manifest-path docs/runs/m1-core-storage-c1-r1-20261004/consumer/Cargo.toml",
+      "exit": 1,
+      "absent_phase": "FAIL",
+      "valid_empty_phase": "PASS",
+      "summary": "FAIL",
+      "note": "honest COMBINED_E2E_WAIT; C3 bootstrap.js mirror still treats null as empty"
+    },
+    "consumer_decoder_negative_tests": {
+      "command": "CARGO_TARGET_DIR=<granted> cargo test --locked --release --manifest-path docs/runs/m1-core-storage-c1-r1-20261004/consumer/Cargo.toml",
+      "exit": 0,
+      "tests": "3/3 passed"
+    },
+    "diff_check_full": {
+      "command": "git diff --check a40d1bb HEAD",
+      "exit": 2,
+      "warning": "docs/runs/m1-core-storage-c1-r1-20261004/raw/consumer-decoder-tests.stdout:8: new blank line at EOF."
+    },
+    "diff_check_scoped_excluding_raw": {
+      "command": "git diff --check a40d1bb HEAD -- ':(exclude)docs/runs/m1-core-storage-c1-r1-20261004/raw'",
+      "exit": 0
+    }
+  },
+  "raw_whitespace_disclosure": {
+    "policy": "store raw exact bytes; disclose whitespace instead of rewriting evidence",
+    "file": "docs/runs/m1-core-storage-c1-r1-20261004/raw/consumer-decoder-tests.stdout",
+    "bytes": 288,
+    "sha256": "5e0c4104878c9c4d508540f9d609a6578cadc744eef4b6cc7316bf770567d2d2",
+    "detail": "cargo test stdout ends with one blank line at EOF; bytes stored exact and not trimmed"
+  },
+  "raw_sha256": {
+    "candidate-host-build.exit": "ce706d40b6f9b1b9add553f35b5b482d4812f773d13013fb4cd667e1d78c7ab5",
+    "candidate-host-build.stderr": "236bb369b171785d9dda009ba20867cdde0cb9481943f5a7217a8cb7f1aa4d5b",
+    "candidate-host-build.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "constructor-run.exit": "a4822452252f2d29a069783f7035fb5489b2456f48ba6ed5d7016261e9903eca",
+    "constructor-run.stderr": "f5b3664487142284a8dc0b3ee5786aa5f0537c46df54bd72ba7e238eb00936df",
+    "constructor-run.stdout": "1b893cb9bb8b37d4ba8623f3dd0f9c3b31dc9f2ed62d58283d8f5695aa8d2e8f",
+    "consumer-decoder-tests.exit": "040881be76901fdb1f952c410c2767411e1ada539c3a6203b4c50bf4eb648623",
+    "consumer-decoder-tests.stderr": "47670e04c60227c5b7f159032056539add65b2492db8324e0a5de04356c92be1",
+    "consumer-decoder-tests.stdout": "5e0c4104878c9c4d508540f9d609a6578cadc744eef4b6cc7316bf770567d2d2",
+    "consumer-generate-lockfile.exit": "e3b60c5028a79d208ba433998e8e5e2161ca8f78364950d6eac55f27704d49c6",
+    "consumer-generate-lockfile.stderr": "f05056e6ead66fab3f5c7583e085fc428bb83c9a859c97f1cb58e4d4e40de8b3",
+    "consumer-generate-lockfile.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "diffcheck-full.exit": "f913fb252e862ceee297d4b155d5705d3f7aac294c3117ba053a1623b1d89edc",
+    "diffcheck-full.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "diffcheck-full.stdout": "386cb3ce5053f5c03a0f33571ef7bd7d0c164958f41606dc6894d5fec831fae7",
+    "diffcheck-scoped.exit": "bb25409cc08c879137591a2cfce468a1e205d4e24674aa5ed34ba2c2c3e2e585",
+    "diffcheck-scoped.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "diffcheck-scoped.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "f1-storage-clear-restart.exit": "418a5c17f33c70e99b0cc0a07fce69191489cfedc94164bfa903785777c5bd4b",
+    "f1-storage-clear-restart.stderr": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "f1-storage-clear-restart.stdout": "e615bc531bfd96eb7bcb7794dfa010a21c1c794344868816a8fd37e04513e66d",
+    "host-hash.post": "b68e21e1c35507bef73d342f86113c3f078676ff73409030194d328e1aa0a2f7",
+    "host-hash.pre": "3118a35a7958f469141d73f3cf89aa0774cee480b24cff408b96ed8b17b40107",
+    "host-probe.sha256": "c85b52b7d1980ab4c11f05816a019a22d9ce2e94b304536ec4565f7dcceb6307",
+    "scoped-nextest.exit": "418a5c17f33c70e99b0cc0a07fce69191489cfedc94164bfa903785777c5bd4b",
+    "scoped-nextest.stderr": "ef07e0d61b5c81002e9d9d712f5f6d38b73b8ab7f739979abd133fbc3690e416",
+    "scoped-nextest.stdout": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "lease": {
+    "owner_task": "m1-core-storage-c1-r1-20261004",
+    "state": "granted",
+    "target_dir": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target",
+    "runtime_grant": false,
+    "device_grant": false
+  },
+  "not_claimed": [
+    "full release workspace nextest",
+    "exact CLI release build",
+    "33-stage obstacle course",
+    "F7 public absent-backend localStorage (pending C3 mirror)",
+    "independent architecture review",
+    "install / formal runtime restart / device / profile / credentials",
+    "merge / push / OTA / release"
+  ]
+}
