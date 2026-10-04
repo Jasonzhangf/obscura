@@ -117,3 +117,13 @@
 - Result: source product files, other tests, Cargo/config/hooks, parent
   evidence, leases, and other worktrees were not modified. Only owned run
   evidence remains untracked. The shared target is retained for parent intake.
+
+2026-10-04T17:06:29Z / commit / DOCS_ONLY
+
+- Result: committed the owned run notes and raw evidence with
+  `cf05edb435de74e088b1a5cf5824d0b5073252eb`.
+- Scope: docs-only commit under
+  `docs/runs/m1-media-stream-fixture-r1-20261004/**`; `stream.rs` remains
+  byte-identical to the frozen input.
+- Next: record this commit identity in a follow-up docs-only commit and report
+  the final branch identity to the parent.
