@@ -240,3 +240,50 @@ fn evaluate_mutation_publishes_new_context_and_keeps_stale_binding_rejected() {
         "Evaluate must publish a real lost focus as null context: {blurred}"
     );
 }
+
+#[test]
+fn evaluate_mutation_exception_publishes_current_editor_context() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":"data:text/html,<input id=field style='position:absolute;left:10px;top:10px;width:300px;height:30px'>"}));
+    agent.click(20.0, 20.0);
+
+    let initial = agent.status();
+    let initial_revision = initial["editor_context"]["editor_revision"].as_u64().unwrap();
+
+    let status_for_operation = agent.status();
+    let id = agent.next_id;
+    agent.next_id += 1;
+    let evaluation = agent.raw(json!({
+        "id": id,
+        "operation": identity(&status_for_operation),
+        "command": {"type":"evaluate","expression":"(function(){var f=document.getElementById('field');f.value='changed';f.setSelectionRange(0,7);throw new Error('mutation exception');})()"}
+    }));
+    assert_eq!(evaluation["code"], "JAVASCRIPT_EXCEPTION", "{evaluation}");
+
+    let after_exception = agent.status();
+    let edit_receipt = input_request(
+        &mut agent,
+        0,
+        &after_exception,
+        editor_binding(&after_exception["editor_context"], "after-exception"),
+        json!({"type":"replace_text","text":"fresh","input_type":"insertText"}),
+    );
+
+    let mutated_revision = after_exception["editor_context"]["editor_revision"].as_u64().unwrap();
+    assert!(
+        mutated_revision > initial_revision,
+        "Evaluate must publish the mutated editor revision after a JavaScript exception: {after_exception} edit_receipt={edit_receipt}"
+    );
+    assert_eq!(
+        after_exception["editor_context"]["selection"]["start"], 0,
+        "{after_exception}"
+    );
+    assert_eq!(
+        after_exception["editor_context"]["selection"]["end"], 7,
+        "{after_exception}"
+    );
+    assert_eq!(edit_receipt["value"]["editing"]["state"], "applied", "{edit_receipt}");
+    assert_eq!(agent.eval("document.getElementById('field').value"), "fresh");
+}

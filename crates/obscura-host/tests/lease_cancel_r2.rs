@@ -171,6 +171,11 @@ fn editor_binding(context: &Value, edit_session_id: &str) -> Value {
 }
 
 const COMPOSE_PAGE: &str = "data:text/html,<input id=f value=seed style='position:absolute;left:10px;top:10px;width:300px;height:30px'>";
+const GESTURE_PAGE: &str = "data:text/html,<div id=target style='position:absolute;left:10px;top:10px;width:300px;height:30px;background:red'></div>";
+
+fn gesture_binding(gesture_session_id: &str) -> Value {
+    json!({"type":"gesture","gesture_session_id":gesture_session_id})
+}
 
 fn focus_editor(client: &mut Client) {
     client.ok(json!({"type":"attach","mode":"agent"}));
@@ -311,4 +316,169 @@ fn direct_same_session_composition_cancel_stays_green() {
     assert!(after["input_lease"].is_null(), "{after}");
     assert!(after["editor_context"]["composition"].is_null(), "{after}");
     assert_eq!(after["editor_context"]["surrounding"]["text"], "seed");
+}
+
+#[test]
+fn explicit_detach_cancels_composition_before_handover() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect();
+    focus_editor(&mut agent);
+
+    let status = agent.status();
+    let context = status["editor_context"].clone();
+    let operation = identity(&status);
+    let binding = editor_binding(&context, "detach-compose");
+    let begin = agent.input(&status, operation.clone(), 0, binding.clone(), json!({"type":"composition_begin","data":"中"}));
+    assert_eq!(begin["value"]["editing"]["state"], "pending", "{begin}");
+    let update = agent.input(&status, operation.clone(), 1, binding.clone(), json!({"type":"composition_update","data":"中文"}));
+    assert_eq!(update["value"]["editing"]["state"], "pending", "{update}");
+    let provisional = agent.status()["editor_context"]["surrounding"]["text"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(provisional, "seed", "composition update must be visible before detach");
+
+    agent.ok(json!({"type":"detach"}));
+    drop(agent);
+
+    let mut reattached = daemon.connect();
+    let attach = reattached.raw(json!({"id":1,"operation":null,"command":{"type":"attach","mode":"agent"}}));
+    assert_eq!(attach["type"], "result", "{attach}");
+    let clean = reattached.status();
+    let next_operation = identity(&clean);
+    let next_binding = editor_binding(&clean["editor_context"], "detach-compose-next");
+    let next_begin = reattached.input(
+        &clean,
+        next_operation.clone(),
+        0,
+        next_binding.clone(),
+        json!({"type":"composition_begin","data":"文"}),
+    );
+    let mut next_cancel = json!(null);
+    if next_begin["value"]["editing"]["state"] == "pending" {
+        next_cancel = reattached.input(
+            &clean,
+            next_operation,
+            1,
+            next_binding,
+            json!({"type":"composition_cancel"}),
+        );
+    }
+
+    let mut observer = daemon.connect();
+    let attach_observer = observer.raw(json!({"id":1,"operation":null,"command":{"type":"attach","mode":"observe"}}));
+    assert_eq!(attach_observer["type"], "result", "{attach_observer}");
+    let epoch = observer.status()["control"]["epoch"].clone();
+    let takeover = observer.ok(json!({"type":"request_takeover","epoch":epoch}));
+
+    assert!(
+        clean["input_lease"].is_null(),
+        "explicit detach must release the composition lease: clean={clean} next_begin={next_begin} takeover={takeover}"
+    );
+    assert!(
+        clean["editor_context"]["composition"].is_null(),
+        "explicit detach must clear the Engine composition: {clean}"
+    );
+    assert_eq!(
+        clean["editor_context"]["surrounding"]["text"],
+        "seed",
+        "explicit detach must restore the pre-composition snapshot: {clean}"
+    );
+    assert_eq!(
+        next_begin["value"]["editing"]["state"],
+        "pending",
+        "new composition after explicit detach must be admitted: {next_begin}"
+    );
+    assert_eq!(
+        next_cancel["value"]["editing"]["state"],
+        "cancelled",
+        "new composition terminal must stay available after explicit detach: {next_cancel}"
+    );
+    assert_eq!(
+        takeover["control"]["phase"]["type"],
+        "human",
+        "takeover must finish after explicit detach released the lease: {takeover}"
+    );
+}
+
+#[test]
+fn explicit_detach_cancels_gesture_before_handover() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    let status = agent.status();
+    let id = agent.next_id;
+    agent.next_id += 1;
+    let navigate = agent.raw(json!({
+        "id": id,
+        "operation": identity(&status),
+        "command": {"type":"navigate","url":GESTURE_PAGE}
+    }));
+    assert_eq!(navigate["type"], "result", "{navigate}");
+
+    let status = agent.status();
+    let operation = identity(&status);
+    let gesture = gesture_binding("detach-gesture");
+    let down = agent.input(
+        &status,
+        operation.clone(),
+        0,
+        gesture.clone(),
+        json!({"type":"pointer_down","pointer_id":1,"x":20.0,"y":20.0,"button":"left","buttons":1,"modifiers":0}),
+    );
+    assert_eq!(down["value"]["input"]["state"], "pending", "{down}");
+    assert_eq!(agent.status()["input_lease"]["kind"], "gesture");
+
+    agent.ok(json!({"type":"detach"}));
+    drop(agent);
+
+    let mut reattached = daemon.connect();
+    let attach = reattached.raw(json!({"id":1,"operation":null,"command":{"type":"attach","mode":"agent"}}));
+    assert_eq!(attach["type"], "result", "{attach}");
+    let clean = reattached.status();
+    let next_operation = identity(&clean);
+    let next_gesture = gesture_binding("detach-gesture-next");
+    let next_down = reattached.input(
+        &clean,
+        next_operation.clone(),
+        0,
+        next_gesture.clone(),
+        json!({"type":"pointer_down","pointer_id":1,"x":20.0,"y":20.0,"button":"left","buttons":1,"modifiers":0}),
+    );
+    let mut next_up = json!(null);
+    if next_down["value"]["input"]["state"] == "pending" {
+        next_up = reattached.input(
+            &clean,
+            next_operation,
+            1,
+            next_gesture,
+            json!({"type":"pointer_up","pointer_id":1,"x":20.0,"y":20.0,"button":"left","buttons":0,"modifiers":0}),
+        );
+    }
+
+    let mut observer = daemon.connect();
+    let attach_observer = observer.raw(json!({"id":1,"operation":null,"command":{"type":"attach","mode":"observe"}}));
+    assert_eq!(attach_observer["type"], "result", "{attach_observer}");
+    let epoch = observer.status()["control"]["epoch"].clone();
+    let takeover = observer.ok(json!({"type":"request_takeover","epoch":epoch}));
+
+    assert!(
+        clean["input_lease"].is_null(),
+        "explicit detach must release the gesture lease: clean={clean} next_down={next_down} takeover={takeover}"
+    );
+    assert_eq!(
+        next_down["value"]["input"]["state"],
+        "pending",
+        "new gesture after explicit detach must be admitted: {next_down}"
+    );
+    assert_eq!(
+        next_up["value"]["input"]["state"],
+        "succeeded",
+        "new gesture terminal after explicit detach must succeed: {next_up}"
+    );
+    assert_eq!(
+        takeover["control"]["phase"]["type"],
+        "human",
+        "takeover must finish after explicit detach released the gesture lease: {takeover}"
+    );
 }
