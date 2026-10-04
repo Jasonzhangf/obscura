@@ -529,7 +529,10 @@ impl Session {
         }
         if self.viewport.is_none() && !host_mutation { return Admission::Replied(error(id, "SESSION_CLOSED", "Session was explicitly closed")); }
         if self.attachments.contains_key(&connection) && matches!(request.command, Command::Status {} | Command::Detach {}) {
-            if matches!(request.command, Command::Detach {}) { self.detach(connection); }
+            // An explicit detach drops the authorizing attachment just like a
+            // disconnect, so it must also queue the Engine terminal for any
+            // open gesture/composition before the lease can be released.
+            if matches!(request.command, Command::Detach {}) { self.disconnect(connection); }
             return Admission::Replied(Response::Result { id, value: self.status(connection, busy) });
         }
         if matches!(&request.command, Command::CloseSession {}) && self.agent == Some(connection) {

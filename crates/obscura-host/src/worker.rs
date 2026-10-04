@@ -476,18 +476,23 @@ async fn execute(
                     Err(("OUTCOME_UNKNOWN", cause))
                 } else {
                     match result.unwrap() {
-                        Ok(value) if !value.thrown => {
+                        Ok(value) => {
                             // Evaluate can mutate the focused editor (for example a page
                             // script changes value or selection). Publish the Engine's
                             // current context in the same completion so the Host does
-                            // not keep fencing a binding against stale context.
+                            // not keep fencing a binding against stale context, even when
+                            // the evaluation throws after mutating. The thrown result is
+                            // still reported as JAVASCRIPT_EXCEPTION.
                             let context = obscura_browser::input::editor_context_json(page)
                                 .ok()
                                 .and_then(|value| serde_json::from_value(value).ok());
                             editor_context = context;
-                            Ok(Some(ResultValue::Evaluation { result: EvaluationResult { value: value.value, js_type: value.js_type } }))
+                            if value.thrown {
+                                Err(("JAVASCRIPT_EXCEPTION", value.description))
+                            } else {
+                                Ok(Some(ResultValue::Evaluation { result: EvaluationResult { value: value.value, js_type: value.js_type } }))
+                            }
                         }
-                        Ok(value) => Err(("JAVASCRIPT_EXCEPTION", value.description)),
                         Err(cause) => { fault = Some(cause.clone()); Err(("OUTCOME_UNKNOWN", cause)) }
                     }
                 }

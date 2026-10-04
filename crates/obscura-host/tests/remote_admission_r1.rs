@@ -327,7 +327,7 @@ fn operation(status: &Value) -> Value {
     })
 }
 
-fn default_access(owner: &str, members: &[&str]) -> Option<(&str, &[&str])> {
+fn default_access<'a>(owner: &'a str, members: &'a [&'a str]) -> Option<(&'a str, &'a [&'a str])> {
     Some((owner, members))
 }
 
@@ -419,7 +419,7 @@ async fn rp04_missing_scope_is_denied_before_ready() {
         let observe_only = DeviceSpec::new("dev-d", 0x42, &[OBSERVE], json!("default_profile"), 7);
         let fixture = HostFixture::start("rp04", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-c", &["dev-c", "dev-d"])),
-        ]), &[no_observe, observe_only.clone()]).await;
+        ]), &[no_observe.clone(), observe_only.clone()]).await;
         let mut denied = fixture.admission().await;
         denied.write_json(&no_observe.admission(1)).await;
         expect_denial(&mut denied, 1, "REMOTE_PROFILE_SCOPE_REQUIRED").await;

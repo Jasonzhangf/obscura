@@ -151,7 +151,11 @@ pub async fn perform_gesture(
             Ok((GestureReceipt::Succeeded, context))
         }
         "pointer_cancel" => {
-            evaluate(page, "globalThis.__obscura_mouse_down=null;true").map_err(InputError::Unknown)?;
+            // The runtime wraps this string as an expression, so the release
+            // must be a single expression. A bare `a=null;true` is a parse
+            // error and would leave the pointer held.
+            evaluate(page, "(function(){ globalThis.__obscura_mouse_down=null; return true; })()")
+                .map_err(InputError::Unknown)?;
             Ok((GestureReceipt::Cancelled, None))
         }
         other => Err(InputError::Rejected(format!("Unsupported gesture event: {other}"))),

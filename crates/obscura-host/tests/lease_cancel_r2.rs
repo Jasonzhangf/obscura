@@ -104,6 +104,19 @@ impl Client {
         self.ok(json!({"type":"status"}))
     }
 
+    fn eval(&mut self, expression: &str) -> Value {
+        let status = self.status();
+        let id = self.next_id;
+        self.next_id += 1;
+        let response = self.raw(json!({
+            "id": id,
+            "operation": identity(&status),
+            "command": {"type":"evaluate","expression":expression}
+        }));
+        assert_eq!(response["type"], "result", "{response}");
+        response["value"]["result"]["value"].clone()
+    }
+
     fn click(&mut self, x: f64, y: f64) -> Value {
         let status = self.status();
         let id = self.next_id;
@@ -319,6 +332,59 @@ fn direct_same_session_composition_cancel_stays_green() {
 }
 
 #[test]
+fn direct_same_session_gesture_cancel_terminates_engine_pointer() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    let status = agent.status();
+    let id = agent.next_id;
+    agent.next_id += 1;
+    let navigate = agent.raw(json!({
+        "id": id,
+        "operation": identity(&status),
+        "command": {"type":"navigate","url":GESTURE_PAGE}
+    }));
+    assert_eq!(navigate["type"], "result", "{navigate}");
+
+    // Record whether the Engine actually held a pointer at down time, so the
+    // post-cancel check proves a held pointer was released rather than never
+    // having been set. This runs before any lease is open.
+    let armed = agent.eval(
+        "(function(){window.__heldAtDown=null;document.getElementById('target').addEventListener('mousedown',function(){window.__heldAtDown=!!globalThis.__obscura_mouse_down;});return true;})()",
+    );
+    assert_eq!(armed, true);
+
+    let status = agent.status();
+    let operation = identity(&status);
+    let gesture = gesture_binding("direct-gesture-cancel");
+    let down = agent.input(
+        &status,
+        operation.clone(),
+        0,
+        gesture.clone(),
+        json!({"type":"pointer_down","pointer_id":1,"x":20.0,"y":20.0,"button":"left","buttons":1,"modifiers":0}),
+    );
+    assert_eq!(down["value"]["input"]["state"], "pending", "{down}");
+
+    let cancel = agent.input(
+        &status,
+        operation,
+        1,
+        gesture,
+        json!({"type":"pointer_cancel","pointer_id":1}),
+    );
+    assert_eq!(cancel["value"]["input"]["state"], "cancelled", "{cancel}");
+    let after = agent.status();
+    assert!(after["input_lease"].is_null(), "{after}");
+    let observed = agent.eval("[window.__heldAtDown===true,globalThis.__obscura_mouse_down===null]");
+    assert_eq!(
+        observed,
+        json!([true, true]),
+        "pointer_cancel must release a pointer the Engine held at down time: {after}"
+    );
+}
+
+#[test]
 fn explicit_detach_cancels_composition_before_handover() {
     let daemon = Daemon::start();
     let mut agent = daemon.connect();
@@ -435,6 +501,16 @@ fn explicit_detach_cancels_gesture_before_handover() {
     let mut reattached = daemon.connect();
     let attach = reattached.raw(json!({"id":1,"operation":null,"command":{"type":"attach","mode":"agent"}}));
     assert_eq!(attach["type"], "result", "{attach}");
+    let clean = reattached.status();
+    // The detach terminal must reach the Engine, not only clear the Host lease:
+    // held pointer state is Engine-owned `globalThis` truth. Observe it before
+    // opening the next lease so the check reflects the detach terminal.
+    let held_after_detach = reattached.eval("globalThis.__obscura_mouse_down===null");
+    assert_eq!(
+        held_after_detach,
+        true,
+        "explicit detach must release the Engine-held pointer: clean={clean}"
+    );
     let clean = reattached.status();
     let next_operation = identity(&clean);
     let next_gesture = gesture_binding("detach-gesture-next");
