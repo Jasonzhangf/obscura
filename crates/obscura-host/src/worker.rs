@@ -379,6 +379,11 @@ async fn execute(
     let mut fault = None;
     let mut editor_context = current_editor_context;
     if matches!(command, Command::CloseSession {}) {
+        // Persist the shared profile store before the Pages and their context
+        // are dropped. A failed flush must not publish a false `closed:true`.
+        if let Err(cause) = context.save_profile_storage() {
+            return simple(Err((cause.code, cause.message)), editor_context, pages.active_page().map(|page| page.viewport));
+        }
         pages.tabs.clear();
         editor_context = None;
         return simple(Ok(Some(ResultValue::Closed { closed: true })), None, None);
@@ -471,7 +476,17 @@ async fn execute(
                     Err(("OUTCOME_UNKNOWN", cause))
                 } else {
                     match result.unwrap() {
-                        Ok(value) if !value.thrown => Ok(Some(ResultValue::Evaluation { result: EvaluationResult { value: value.value, js_type: value.js_type } })),
+                        Ok(value) if !value.thrown => {
+                            // Evaluate can mutate the focused editor (for example a page
+                            // script changes value or selection). Publish the Engine's
+                            // current context in the same completion so the Host does
+                            // not keep fencing a binding against stale context.
+                            let context = obscura_browser::input::editor_context_json(page)
+                                .ok()
+                                .and_then(|value| serde_json::from_value(value).ok());
+                            editor_context = context;
+                            Ok(Some(ResultValue::Evaluation { result: EvaluationResult { value: value.value, js_type: value.js_type } }))
+                        }
                         Ok(value) => Err(("JAVASCRIPT_EXCEPTION", value.description)),
                         Err(cause) => { fault = Some(cause.clone()); Err(("OUTCOME_UNKNOWN", cause)) }
                     }

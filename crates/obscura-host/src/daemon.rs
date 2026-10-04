@@ -94,6 +94,7 @@ struct Session {
     viewport_repair: Option<(u32, u32)>,
     editor_context: Option<EditorContext>,
     input_lease: Option<InputLease>,
+    terminal_cleanup: Option<TerminalCleanup>,
     sequences: HashMap<u64, u64>,
     presentation_revision: u64,
     active_tab_id: String,
@@ -108,6 +109,7 @@ struct Record { operation: Operation, command: Command, response: Option<Respons
 enum Admission {
     Replied(Response),
     Run(Dispatch),
+    HostMutation(Dispatch),
 }
 struct Dispatch {
     connection: u64,
@@ -115,6 +117,16 @@ struct Dispatch {
     operation: Operation,
     input: Option<InputEnvelope>,
     fresh: bool,
+}
+
+/// A terminal input event queued because its attachment disconnected before
+/// delivering it. It reuses the original operation identity, binding and frame
+/// so the Host never clears the lease before the Engine confirms the terminal
+/// outcome.
+struct TerminalCleanup {
+    connection: u64,
+    operation: Operation,
+    command: Command,
 }
 
 fn replay_response(id: u64, response: &Response) -> Response {
@@ -154,6 +166,35 @@ fn lease_projection(operation: &Operation, command: &Command) -> Option<InputLea
         InputBinding::Gesture { gesture_session_id } => Some(base(InputLeaseKind::Gesture, Some(gesture_session_id.clone()), None, None)),
         InputBinding::Editor { edit_session_id, target_id, .. } => Some(base(InputLeaseKind::Composition, None, Some(edit_session_id.clone()), Some(target_id.clone()))),
     }
+}
+
+/// Synthesize the terminal event for an open lease without changing its
+/// operation identity, binding or frame. A composition is cancelled (never
+/// committed) and a gesture receives a pointer cancel. The result is only a
+/// request; the Engine still confirms the terminal state before the lease is
+/// released.
+fn terminal_command(lease: &InputLease, command: &Command) -> Option<Command> {
+    let Command::Input { envelope } = command else { return None; };
+    let event = match lease.kind {
+        InputLeaseKind::Composition => InputEvent::CompositionCancel {},
+        InputLeaseKind::Gesture => {
+            let pointer_id = match &envelope.event {
+                InputEvent::PointerDown { pointer_id, .. }
+                | InputEvent::PointerMove { pointer_id, .. }
+                | InputEvent::PointerUp { pointer_id, .. } => *pointer_id,
+                _ => 0,
+            };
+            InputEvent::PointerCancel { pointer_id }
+        }
+    };
+    Some(Command::Input {
+        envelope: InputEnvelope {
+            event_sequence: 0,
+            frame: envelope.frame.clone(),
+            binding: envelope.binding.clone(),
+            event,
+        },
+    })
 }
 
 /// Deterministic pre-execution editing refusals that did not consume the
@@ -209,12 +250,6 @@ impl Session {
         Ok(WorkKind::Viewport { width, height, revision, document_revision, cancel })
     }
     fn detach(&mut self, connection: u64) {
-        // A disconnected attachment can no longer deliver the composition's
-        // terminal event. End the local lease here so a later field never
-        // inherits it and so takeover does not wait forever.
-        if self.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection) {
-            self.input_lease = None;
-        }
         self.retired.insert(connection);
         self.attachments.remove(&connection);
         self.sequences.remove(&connection);
@@ -230,6 +265,27 @@ impl Session {
         if matches!(self.control.phase, ControlPhase::Waiting { attachment_id } | ControlPhase::Human { attachment_id } if attachment_id == connection) {
             self.transition(ControlPhase::Paused);
         }
+    }
+
+    /// A disconnected attachment can no longer deliver the terminal event for
+    /// its open gesture/composition. Build that terminal under the original
+    /// operation identity and binding so the Engine, not the Host, decides the
+    /// outcome. The lease is only cleared by the existing completion path once
+    /// that terminal event has actually run.
+    fn disconnect(&mut self, connection: u64) {
+        if self.terminal_cleanup.is_none() {
+            let lease = self.input_lease.clone().filter(|lease| lease.attachment_id == connection);
+            if let Some(lease) = lease {
+                let record = self.records.get(&connection)
+                    .filter(|record| record.operation.operation_id == lease.operation_id);
+                if let Some((operation, command)) = record.map(|record| (record.operation.clone(), record.command.clone())) {
+                    if let Some(command) = terminal_command(&lease, &command) {
+                        self.terminal_cleanup = Some(TerminalCleanup { connection, operation, command });
+                    }
+                }
+            }
+        }
+        self.detach(connection);
     }
 
     /// Remove one connection's attachment without retiring its identity, for a
@@ -336,7 +392,8 @@ impl Session {
         let id = request.id;
         let controlled = matches!(request.command, Command::Click { .. } | Command::InputText { .. } | Command::Scroll { .. } | Command::Navigate { .. } | Command::Input { .. }
             | Command::Back | Command::Forward | Command::Reload | Command::TabCreate {} | Command::TabSelect { .. } | Command::TabClose { .. });
-        let mutation = controlled || matches!(request.command, Command::Evaluate { .. } | Command::Resize { .. } | Command::CloseSession {});
+        let host_mutation = matches!(request.command, Command::ProfileCreate { .. });
+        let mutation = controlled || matches!(request.command, Command::Evaluate { .. } | Command::Resize { .. } | Command::CloseSession {}) || host_mutation;
         let mut operation: Option<Operation> = None;
         let mut fresh = true;
         if mutation {
@@ -421,7 +478,7 @@ impl Session {
         } else if request.operation.is_some() {
             return Admission::Replied(error(id, "INVALID_OPERATION", "Control requests cannot carry browser operation identity"));
         }
-        if self.viewport.is_none() { return Admission::Replied(error(id, "SESSION_CLOSED", "Session was explicitly closed")); }
+        if self.viewport.is_none() && !host_mutation { return Admission::Replied(error(id, "SESSION_CLOSED", "Session was explicitly closed")); }
         if self.attachments.contains_key(&connection) && matches!(request.command, Command::Status {} | Command::Detach {}) {
             if matches!(request.command, Command::Detach {}) { self.detach(connection); }
             return Admission::Replied(Response::Result { id, value: self.status(connection, busy) });
@@ -555,6 +612,8 @@ impl Session {
                         }
                     }
                     Command::Evaluate { .. } => {},
+                    // Host-level mutation; catalog persistence owns its effect.
+                    Command::ProfileCreate { .. } => {},
                     Command::Click { x, y } | Command::Scroll { x, y, .. } => {
                         if !cfg!(feature = "render") { return Admission::Replied(error(id, "INPUT_UNAVAILABLE", "Coordinate input requires a render-enabled Host")); }
                         let (width, height) = self.viewport.unwrap();
@@ -606,13 +665,14 @@ impl Session {
                     }
                     _ => unreachable!("control commands handled above"),
                 }
-                Admission::Run(Dispatch {
+                let dispatch = Dispatch {
                     connection,
                     command,
                     operation: operation.expect("mutation admission checked identity"),
                     input: None,
                     fresh: true,
-                })
+                };
+                if host_mutation { Admission::HostMutation(dispatch) } else { Admission::Run(dispatch) }
             }
         }
     }
@@ -621,6 +681,8 @@ impl Session {
 struct Pending {
     session_id: String,
     operation: Option<PendingOperation>,
+    /// Host-initiated terminal delivery for a disconnected open input lease.
+    cleanup: Option<TerminalCleanup>,
     /// True only for a Host-local maintenance flush of this session's store.
     /// Distinguishes a drain completion from the operation/viewport path.
     flush: bool,
@@ -694,6 +756,7 @@ async fn spawn_session(
         viewport_repair: None,
         editor_context: None,
         input_lease: None,
+        terminal_cleanup: None,
         sequences: HashMap::new(),
         presentation_revision: 0,
         active_tab_id: String::new(),
@@ -727,6 +790,10 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
     let permits = Arc::new(Semaphore::new(16));
     let (events, mut incoming) = mpsc::channel(64);
     let mut tasks = tokio::task::JoinSet::new();
+    // Requests that arrived for a session whose disconnected lease is still
+    // delivering its Engine terminal. They are re-injected once cleanup
+    // completes so no caller observes a lease released before the Engine.
+    let mut deferred: Vec<(String, u64, Request, oneshot::Sender<Response>)> = Vec::new();
     let mut counter = 0u64;
     let mut pending: Option<Pending> = None;
     let mut maintenance: Option<Maintenance> = None;
@@ -735,15 +802,62 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
         // Declarations remain responsive while atomic work completes. Schedule only
         // the latest elected pair, before admitting any subsequent browser mutation.
         if pending.is_none() {
+            // A disconnected attachment's open lease still owes the Engine a
+            // terminal event. Deliver it before any new input can be admitted.
+            let mut cleanup: Option<(String, TerminalCleanup)> = None;
+            for (sid, runtime) in sessions.iter_mut() {
+                if let Some(terminal) = runtime.session.terminal_cleanup.take() {
+                    cleanup = Some((sid.clone(), terminal));
+                    break;
+                }
+            }
+            if let Some((sid, terminal)) = cleanup {
+                let runtime = sessions.get_mut(&sid).expect("cleanup session exists");
+                let kind = WorkKind::Browser {
+                    command: terminal.command.clone(),
+                    document_revision: terminal.operation.document_revision,
+                    operation_id: terminal.operation.operation_id.clone(),
+                };
+                let (reply, result) = oneshot::channel();
+                if runtime.work.try_send(Work { kind, reply }).is_err() {
+                    runtime.session.fault = Some("Browser worker unavailable; input terminal outcome unknown".into());
+                } else {
+                    pending = Some(Pending { session_id: sid, operation: None, cleanup: Some(terminal), flush: false, result });
+                }
+            }
+            // Re-inject callers that were deferred while a disconnected lease
+            // delivered its Engine terminal. Only sessions with no remaining
+            // cleanup work are released back into the request path.
+            if !deferred.is_empty() {
+                let waiting = std::mem::take(&mut deferred);
+                for (waiting_session, waiting_connection, waiting_request, waiting_reply) in waiting {
+                    let still_inflight = pending.as_ref().is_some_and(|pending| pending.cleanup.is_some() && pending.session_id == waiting_session)
+                        || sessions.get(&waiting_session).is_some_and(|runtime| runtime.session.terminal_cleanup.is_some());
+                    if still_inflight {
+                        deferred.push((waiting_session, waiting_connection, waiting_request, waiting_reply));
+                        continue;
+                    }
+                    let event = Event::Request {
+                        connection: waiting_connection,
+                        request: waiting_request,
+                        reply: waiting_reply,
+                    };
+                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(event)) = events.try_send(event) {
+                        if let Event::Request { connection, request, reply } = event {
+                            deferred.push((waiting_session, connection, request, reply));
+                        }
+                    }
+                }
+            }
             // Flush one loaded profile per loop turn so a failure is bound to a
             // single profile and never masks the others.
-            let next = maintenance.as_mut().and_then(|drain| drain.remaining.pop());
+            let next = if pending.is_none() { maintenance.as_mut().and_then(|drain| drain.remaining.pop()) } else { None };
             if let Some(next) = next {
                 match sessions.get_mut(&next) {
                     Some(runtime) => {
                         let (reply, result) = oneshot::channel();
                         match runtime.work.try_send(Work { kind: WorkKind::Flush, reply }) {
-                            Ok(()) => pending = Some(Pending { session_id: next, operation: None, flush: true, result }),
+                            Ok(()) => pending = Some(Pending { session_id: next, operation: None, cleanup: None, flush: true, result }),
                             Err(_) => {
                                 let drain = maintenance.take().expect("maintenance owner");
                                 let _ = drain.reply.send(error(drain.id, "SESSION_FAULTED", "Browser worker unavailable for maintenance flush"));
@@ -752,8 +866,10 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                     }
                     None => {}
                 }
-            } else if let Some(drain) = maintenance.take() {
+            } else if pending.is_none() {
+                if let Some(drain) = maintenance.take() {
                 let _ = drain.reply.send(Response::Result { id: drain.id, value: ResultValue::ProfileFlush { flushed: true, profiles: drain.flushed } });
+                }
             }
             let mut scheduled: Option<(String, WorkKind)> = None;
             let scheduling = maintenance.is_none() && pending.is_none();
@@ -779,7 +895,7 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                 if runtime.work.try_send(Work { kind, reply }).is_err() {
                     runtime.session.viewport_update = None;
                     runtime.session.fault = Some("Browser worker unavailable; recreate session explicitly".into());
-                } else { pending = Some(Pending { session_id: sid, operation: None, flush: false, result }); }
+                } else { pending = Some(Pending { session_id: sid, operation: None, cleanup: None, flush: false, result }); }
             }
         }
         tokio::select! {
@@ -830,11 +946,7 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                     if let Some(sid) = conn_session.remove(&connection) {
                         if let Some(runtime) = sessions.get_mut(&sid) {
                             let session = &mut runtime.session;
-                            if session.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection) {
-                                session.input_lease = None;
-                            }
-                            session.records.remove(&connection);
-                            session.detach(connection);
+                            session.disconnect(connection);
                             session.retired.remove(&connection);
                         }
                     }
@@ -847,6 +959,14 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                     let _ = reply.send(result);
                 }
                 Event::Request { connection, request, reply } => {
+                    let request_target = conn_session.get(&connection).cloned().unwrap_or_else(|| presented.clone());
+                    let cleanup_inflight = pending.as_ref()
+                        .is_some_and(|pending| pending.cleanup.is_some() && pending.session_id == request_target)
+                        || sessions.get(&request_target).is_some_and(|runtime| runtime.session.terminal_cleanup.is_some());
+                    if cleanup_inflight {
+                        deferred.push((request_target, connection, request, reply));
+                        continue;
+                    }
                     let id = request.id;
                     match &request.command {
                         Command::ProfileCatalog {} => {
@@ -861,30 +981,6 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                             let mut remaining: Vec<String> = sessions.keys().cloned().collect();
                             remaining.sort();
                             maintenance = Some(Maintenance { id, reply, remaining, flushed: 0 });
-                            continue;
-                        }
-                        Command::ProfileCreate { display_name, make_default } => {
-                            if !conn_session.contains_key(&connection) {
-                                let _ = reply.send(error(id, "ATTACH_REQUIRED", "Attach before profile management"));
-                            } else {
-                                let mut valid_operation = true;
-                                if let Some(operation) = request.operation.as_ref() {
-                                    if operation.session_id != sessions.get(&conn_session[&connection]).map(|runtime| runtime.session.id.clone()).unwrap_or_default()
-                                        || operation.attachment_id != connection {
-                                        valid_operation = false;
-                                    }
-                                } else {
-                                    valid_operation = false;
-                                }
-                                if !valid_operation {
-                                    let _ = reply.send(error(id, "OPERATION_REQUIRED", "Profile mutations require an operation identity for the bound session"));
-                                } else {
-                                    match catalog.create(display_name, *make_default) {
-                                        Ok(profile) => { let _ = reply.send(Response::Result { id, value: ResultValue::ProfileCreated { profile, catalog: catalog.catalog() } }); }
-                                        Err(cause) => { let _ = reply.send(error(id, cause.code, cause.message)); }
-                                    }
-                                }
-                            }
                             continue;
                         }
                         Command::ProfileSelect { profile_id } => {
@@ -931,7 +1027,7 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                             let runtime = sessions.get_mut(&profile_id).expect("target session exists");
                             let response = match runtime.session.request(connection, attach, pending.is_some()) {
                                 Admission::Replied(response) => response,
-                                Admission::Run(_) => error(id, "REBIND_FAILED", "Observer rebind was unexpectedly deferred"),
+                                Admission::Run(_) | Admission::HostMutation(_) => error(id, "REBIND_FAILED", "Observer rebind was unexpectedly deferred"),
                             };
                             let status = match response {
                                 Response::Result { value: ResultValue::Status(status), .. } => status,
@@ -999,8 +1095,38 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                                     fresh: dispatch.fresh,
                                     previous_sequence,
                                     reply,
-                                }), flush: false, result });
+                                }), cleanup: None, flush: false, result });
                             }
+                        }
+                        Admission::HostMutation(dispatch) => {
+                            let previous_sequence = session.begin_dispatch(&dispatch);
+                            let result = match &dispatch.command {
+                                Command::ProfileCreate { display_name, make_default } => {
+                                    match catalog.create(display_name, *make_default) {
+                                        Ok(profile) => Ok(Some(ResultValue::ProfileCreated { profile, catalog: catalog.catalog() })),
+                                        Err(cause) => Err((cause.code, cause.message)),
+                                    }
+                                }
+                                _ => Err(("INVALID_OPERATION", "Unsupported Host mutation".to_string())),
+                            };
+                            let error_code = match &result { Err((code, _)) => Some(*code), Ok(_) => None };
+                            let unconsumed = dispatch.fresh && error_code.is_some_and(unconsumed_input_error);
+                            let response = match result {
+                                Ok(value) => Response::Result { id, value: value.expect("Host mutation returns a receipt") },
+                                Err((code, cause)) => error(id, code, cause),
+                            };
+                            let response = bounded_response(response)?;
+                            if unconsumed {
+                                if let Some(previous_sequence) = previous_sequence {
+                                    session.sequences.insert(dispatch.connection, previous_sequence);
+                                } else {
+                                    session.sequences.remove(&dispatch.connection);
+                                }
+                                session.records.remove(&dispatch.connection);
+                            } else if let Some(record) = session.records.get_mut(&dispatch.connection) {
+                                record.response = Some(response.clone());
+                            }
+                            let _ = reply.send(response);
                         }
                     }
                 }
@@ -1010,6 +1136,35 @@ pub async fn serve(socket_dir: PathBuf, profile_root: Option<PathBuf>, allow_pri
                 let sid = finished.session_id.clone();
                 let runtime = sessions.get_mut(&sid).expect("pending session exists");
                 let session = &mut runtime.session;
+                if let Some(terminal) = finished.cleanup.as_ref() {
+                    // Host-initiated terminal delivery for a disconnected
+                    // attachment. There is no reply to send; the only Host
+                    // state change is releasing the lease once the Engine has
+                    // confirmed the terminal (or exposing the unknown outcome).
+                    match completion {
+                        Ok(completion) => {
+                            session.document_revision = session.document_revision.max(completion.document_revision);
+                            session.presentation_revision = session.presentation_revision.max(completion.presentation_revision);
+                            session.active_tab_id = completion.active_tab_id.clone();
+                            session.tabs = completion.tabs.clone();
+                            session.navigation = completion.navigation.clone();
+                            session.editor_context = completion.editor_context.clone();
+                            if completion.fault.is_some() { session.fault = completion.fault; }
+                            if let Err((code, cause)) = &completion.result {
+                                session.fault = Some(format!("Input terminal {code}: {cause}"));
+                            }
+                        }
+                        Err(_) => {
+                            session.fault = Some("Browser worker stopped; input terminal outcome unknown".into());
+                        }
+                    }
+                    session.records.remove(&terminal.connection);
+                    if session.input_lease.as_ref().is_some_and(|lease| lease.operation_id == terminal.operation.operation_id) {
+                        session.input_lease = None;
+                    }
+                    session.finish_handover();
+                    continue;
+                }
                 let viewport_update = session.viewport_update.take();
                 let outcome = match completion {
                     Ok(completion) => {

@@ -413,15 +413,21 @@ fn public_editor_rejects_stale_target_and_epoch() {
     assert_eq!(stale_target["code"], "STALE_EDITOR_TARGET", "{stale_target}");
     assert_eq!(agent.eval("document.getElementById('area').value"), "");
 
-    let mut stale_epoch = identity(&area_status);
+    // The rejected stale-target attempt consumed and rolled back its operation
+    // sequence, so a fresh status yields the next valid operation identity.
+    // The epoch case must use its own operation id: reusing the prior id with a
+    // different epoch fence is an OPERATION_CONFLICT, not a control-epoch test.
+    let epoch_status = agent.status();
+    let mut stale_epoch = identity(&epoch_status);
+    stale_epoch["operation_id"] = json!("stale-epoch-op");
     stale_epoch["control_epoch"] =
         json!(stale_epoch["control_epoch"].as_u64().unwrap().saturating_sub(1));
     let stale_epoch_result = input_request_with_operation(
         &mut agent,
         0,
-        &area_status,
+        &epoch_status,
         stale_epoch,
-        editor_binding(&area_status["editor_context"], "stale-epoch"),
+        editor_binding(&epoch_status["editor_context"], "stale-epoch"),
         json!({"type":"replace_text","text":"blocked","input_type":"insertText"}),
     );
     assert_eq!(stale_epoch_result["code"], "STALE_CONTROL", "{stale_epoch_result}");
