@@ -496,6 +496,19 @@ async fn run_terminal_mode(
                     let response = fence(data_channel, control, control_rx, track, media, session_id, transport, request, deadline).await?;
                     trigger_receipt = Some(serde_json::to_value(response)?);
                 }
+                "detach-backpressure" => {
+                    send_control(data_channel, &WebRtcControlMessage::BrowserRequest {
+                        request: Request { id: TRIGGER_REQUEST_ID, command: Command::Detach {}, operation: None },
+                    }).await?;
+                    for offset in 1..=17 {
+                        send_control(data_channel, &WebRtcControlMessage::BrowserRequest {
+                            request: Request { id: 300 + offset as u64, command: Command::Status {}, operation: None },
+                        }).await?;
+                    }
+                    let response = wait_for_correlated_response(control_rx, track, media, session_id, TRIGGER_REQUEST_ID).await?;
+                    anyhow::ensure!(response_id(&response) == Some(TRIGGER_REQUEST_ID), "no correlated fence receipt under backpressure");
+                    trigger_receipt = Some(serde_json::to_value(response)?);
+                }
                 other => bail!("unknown terminal trigger {other:?}"),
             }
         }
@@ -756,6 +769,35 @@ async fn request_dc(
 ) -> Result<Response> {
     let request_id = request.id;
     send_control(channel, &WebRtcControlMessage::BrowserRequest { request }).await?;
+    timeout(DEADLINE, async {
+        loop {
+            tokio::select! {
+                message = rx.recv() => match message.context("WebRTC DataChannel reader ended")?? {
+                    WebRtcControlMessage::VideoFrame { descriptor } => media.accept_descriptor(descriptor, session_id)?,
+                    WebRtcControlMessage::BrowserResponse { response } => {
+                        ensure!(response_id(&response) == Some(request_id), "WebRTC browser response id mismatch");
+                        return Ok(response);
+                    }
+                    WebRtcControlMessage::Pong { .. } => {},
+                    WebRtcControlMessage::Error { code, message } => bail!("Host WebRTC error {code}: {message}"),
+                    other => bail!("unexpected WebRTC control message while waiting for browser response: {other:?}"),
+                },
+                event = track.poll() => media.accept_track_event(event.context("receiver H.264 track ended")?)?,
+            }
+        }
+    }).await.context("timed out waiting for WebRTC browser response")?
+}
+
+/// Wait for a response to a request that was already sent. This is used for
+/// the backpressure regression so the harness does not issue another request
+/// while it is waiting for the fenced operation's matched receipt.
+async fn wait_for_correlated_response(
+    rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
+    track: &Arc<dyn TrackRemote>,
+    media: &mut MediaAssociations,
+    session_id: &str,
+    request_id: u64,
+) -> Result<Response> {
     timeout(DEADLINE, async {
         loop {
             tokio::select! {

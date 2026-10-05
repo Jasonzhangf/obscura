@@ -226,10 +226,28 @@ impl WebRtcEndpoint {
                                 send_control_message(&data_channel, &WebRtcControlMessage::Pong { request_id }).await?;
                             }
                             WebRtcControlMessage::BrowserRequest { request } => {
-                                self.browser_requests
-                                    .send(request)
-                                    .await
-                                    .context("send WebRTC browser request to Host pump")?;
+                                let mut terminal_pending = self.terminal_pending.clone();
+                                if *terminal_pending.borrow() {
+                                    continue;
+                                }
+                                let mut send = Box::pin(self.browser_requests.send(request));
+                                let mut pending = Box::pin(terminal_pending.changed());
+                                tokio::select! {
+                                    biased;
+                                    changed = pending.as_mut() => {
+                                        if changed.is_err() {
+                                            return Err(anyhow!("Host terminal-pending watch ended before request forwarding"));
+                                        }
+                                        // A completed watch change means the
+                                        // attachment is fenced; do not queue
+                                        // requests behind the terminal response
+                                        // that run_inner must drain.
+                                        continue;
+                                    }
+                                    result = send.as_mut() => {
+                                        result.context("send WebRTC browser request to Host pump")?;
+                                    }
+                                }
                             }
                             WebRtcControlMessage::BrowserResponse { .. } => {
                                 bail!("remote sent Host-owned WebRTC browser response")

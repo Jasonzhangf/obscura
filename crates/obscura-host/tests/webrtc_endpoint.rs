@@ -47,6 +47,12 @@ async fn active_receiver_observes_rebind_terminal_without_leak() {
 }
 
 #[tokio::test]
+async fn active_receiver_observes_saturated_request_queue_terminal_without_leak() {
+    tokio::time::timeout(Duration::from_secs(240), run_terminal_lifecycle("backpressure-detach"))
+        .await.expect("saturated request queue terminal lifecycle timed out").unwrap();
+}
+
+#[tokio::test]
 async fn active_receiver_observes_source_close_terminal() {
     tokio::time::timeout(Duration::from_secs(240), run_terminal_lifecycle("none"))
         .await.expect("source-close terminal lifecycle timed out").unwrap();
@@ -412,10 +418,11 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
 async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::process::Stdio;
-    anyhow::ensure!(matches!(mode, "detach" | "rebind" | "none" | "wss-detach" | "wss-rebind"),
+    anyhow::ensure!(matches!(mode, "detach" | "rebind" | "none" | "wss-detach" | "wss-rebind" | "backpressure-detach"),
         "unsupported terminal mode {mode}");
     let (trigger, transport) = match mode {
         "wss-detach" | "wss-rebind" => (&mode[4..], "wss"),
+        "backpressure-detach" => ("detach-backpressure", "data-channel"),
         other => (other, "data-channel"),
     };
     let root = PathBuf::from("/tmp").join(format!("ow-terminal-{}", uuid::Uuid::new_v4().simple()));
@@ -552,7 +559,7 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
         anyhow::ensure!(frame["session_id"].as_str() == Some(session_id.as_str()),
             "terminal stream carried a non-admitted frame: {frame}");
     }
-    if trigger == "detach" {
+    if trigger == "detach" || trigger == "detach-backpressure" {
         let receipt = &report["trigger_receipt"];
         anyhow::ensure!(receipt["type"] == "result" && receipt["id"] == 200, "detach produced no correlated result receipt: {report}");
         anyhow::ensure!(receipt["value"]["attachment_id"].is_null(),
