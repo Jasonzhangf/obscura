@@ -1,0 +1,1 @@
+{"error_code":"ENCODER_UNAVAILABLE","error_message":"Encoder for session 21eaebdc-bbaf-4713-8c87-7f2879ea11cd is unavailable: Start configured FFmpeg H.264 encoder","pass":true,"session_id":"21eaebdc-bbaf-4713-8c87-7f2879ea11cd"}

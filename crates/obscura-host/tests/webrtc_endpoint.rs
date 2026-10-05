@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::Command, net::TcpListener};
 use sha2::{Digest, Sha256};
@@ -20,6 +20,16 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = PathBuf::from("/tmp").join(format!("ow-{}", uuid::Uuid::new_v4().simple()));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let raw_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/runs/m1-public-gate-close-r3-20261004/raw/webrtc")
+        .join(format!("ow-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&raw_root)?;
+    std::fs::write(raw_root.join("command.env"), format!(
+        "encoder_failure={encoder_failure}\nUTC={}\n",
+        std::process::Command::new("/bin/date").arg("-u").arg("+%Y-%m-%dT%H:%M:%SZ").output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    ))?;
     let bind_ip = "127.0.0.1";
     let ca_key = rcgen::KeyPair::generate()?;
     let mut ca_params = rcgen::CertificateParams::new(vec![])?;
@@ -46,7 +56,10 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
         .arg("--authorization-registry").arg(root.join("registry.json"))
-        .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
+        .stdout(std::fs::File::create(raw_root.join("host.stdout"))?)
+        .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
+        .kill_on_drop(true).spawn()?;
+    std::fs::write(raw_root.join("host.pid"), host.id().expect("Host child pid").to_string())?;
     wait_socket(root.join("host/host.sock")).await;
     let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await?;
     let mut local = BufReader::new(local);
@@ -72,13 +85,17 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
         .arg("--client-ca").arg(root.join("ca.der")).arg("--media-bin").arg(&media_bin)
         .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
+    endpoint_command
+        .stdout(std::fs::File::create(raw_root.join("endpoint.stdout"))?)
+        .stderr(std::fs::File::create(raw_root.join("endpoint.stderr"))?);
     if encoder_failure { endpoint_command.arg("--ffmpeg").arg("/nonexistent-obscura-encoder"); }
-    let endpoint = endpoint_command.stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
+    let endpoint = endpoint_command.kill_on_drop(true).spawn()?;
+    std::fs::write(raw_root.join("endpoint.pid"), endpoint.id().expect("endpoint child pid").to_string())?;
     wait_socket(root.join("endpoint/encoded.sock")).await;
 
-    let first = run_receiver(&receiver_bin, address, &root, false, false, encoder_failure).await?;
+    let first = run_receiver(&receiver_bin, address, &root, &raw_root, "first", false, false, encoder_failure).await?;
     if encoder_failure {
-        anyhow::ensure!(first.status.success(), "typed encoder failure receiver failed: {}", String::from_utf8_lossy(&first.stderr));
+        anyhow::ensure!(first.status.success(), "typed encoder failure receiver failed at {}: {}", raw_root.display(), String::from_utf8_lossy(&first.stderr));
         let report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
         anyhow::ensure!(report["pass"] == true && report["error_code"] == "ENCODER_UNAVAILABLE",
             "remote encoder failure was not typed: {report}");
@@ -91,7 +108,7 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
         std::fs::remove_dir_all(root)?;
         return Ok(());
     }
-    anyhow::ensure!(first.status.success(), "independent WebRTC receiver failed: {}", String::from_utf8_lossy(&first.stderr));
+    anyhow::ensure!(first.status.success(), "independent WebRTC receiver failed at {}: {}", raw_root.display(), String::from_utf8_lossy(&first.stderr));
     let first_report: serde_json::Value = serde_json::from_slice(&first.stdout)?;
     anyhow::ensure!(first_report["pass"] == true && first_report["browser_path"] == "webrtc_data_channel", "WebRTC DataChannel browser path missing: {first_report}");
     let ice = &first_report["ice"];
@@ -117,13 +134,13 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     }
     anyhow::ensure!(frames.iter().any(|frame| frame["changed"] == true), "Host click did not produce a different WebRTC frame: {first_report}");
 
-    let stale = run_receiver(&receiver_bin, address, &root, false, true, false).await?;
-    anyhow::ensure!(stale.status.success(), "stale-binding receiver failed: {}", String::from_utf8_lossy(&stale.stderr));
+    let stale = run_receiver(&receiver_bin, address, &root, &raw_root, "stale", false, true, false).await?;
+    anyhow::ensure!(stale.status.success(), "stale-binding receiver failed at {}: {}", raw_root.display(), String::from_utf8_lossy(&stale.stderr));
     let stale_report: serde_json::Value = serde_json::from_slice(&stale.stdout)?;
     anyhow::ensure!(stale_report["negative"] == "stale_binding_rejected", "stale binding was not rejected: {stale_report}");
 
-    let second = run_receiver(&receiver_bin, address, &root, true, false, false).await?;
-    anyhow::ensure!(second.status.success(), "reconnected WebRTC receiver failed: {}", String::from_utf8_lossy(&second.stderr));
+    let second = run_receiver(&receiver_bin, address, &root, &raw_root, "reconnect", true, false, false).await?;
+    anyhow::ensure!(second.status.success(), "reconnected WebRTC receiver failed at {}: {}", raw_root.display(), String::from_utf8_lossy(&second.stderr));
     let second_report: serde_json::Value = serde_json::from_slice(&second.stdout)?;
     anyhow::ensure!(second_report["pass"] == true, "reconnect evidence missing: {second_report}");
     anyhow::ensure!(second_report["session_id"] == first_report["session_id"], "reconnect changed Host Session identity");
@@ -139,7 +156,7 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_receiver(binary: &PathBuf, address: std::net::SocketAddr, root: &PathBuf, skip_click: bool, bad_binding: bool, expect_encoder_error: bool) -> anyhow::Result<std::process::Output> {
+async fn run_receiver(binary: &PathBuf, address: std::net::SocketAddr, root: &PathBuf, raw_root: &PathBuf, phase: &str, skip_click: bool, bad_binding: bool, expect_encoder_error: bool) -> anyhow::Result<std::process::Output> {
     let mut command = Command::new(binary);
     command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
         .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
@@ -147,7 +164,13 @@ async fn run_receiver(binary: &PathBuf, address: std::net::SocketAddr, root: &Pa
     if skip_click { command.arg("--skip-click"); }
     if bad_binding { command.arg("--bad-binding"); }
     if expect_encoder_error { command.arg("--expect-encoder-error"); }
-    Ok(command.output().await?)
+    let output = command.output().await?;
+    let phase_dir = raw_root.join(phase);
+    std::fs::create_dir_all(&phase_dir)?;
+    std::fs::write(phase_dir.join("stdout.txt"), &output.stdout)?;
+    std::fs::write(phase_dir.join("stderr.txt"), &output.stderr)?;
+    std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", output.status.code()))?;
+    Ok(output)
 }
 
 fn identity(state: &serde_json::Value) -> serde_json::Value {

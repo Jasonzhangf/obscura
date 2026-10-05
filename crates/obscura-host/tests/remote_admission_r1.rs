@@ -752,14 +752,25 @@ async fn rp23_repeated_admission_frame_is_invalid_request() {
 #[tokio::test]
 async fn rp24_admission_denial_creates_no_route() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x13, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new("dev-a", 0x13, &ALL_SCOPES, json!("default_profile"), 8);
+        let unbound_device = DeviceSpec::new("dev-b", 0x14, &ALL_SCOPES, json!({"profile_id": "missing"}), 8);
         let fixture = HostFixture::start("rp24", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ]), &[device_a.clone(), unbound_device.clone()]).await;
+
+        // A request selection that differs from the registry-owned grant is a
+        // principal/revocation mismatch, not an unbound profile.
         let mut denied = fixture.admission().await;
         denied.write_json(&device_a.admission_with_selection(json!({"profile_id": "nope"}), 1)).await;
-        expect_denial(&mut denied, 1, "REMOTE_INITIAL_PROFILE_UNBOUND").await;
-        // No reservation leaked into the owner's healthy route.
+        expect_denial(&mut denied, 1, "REMOTE_PRINCIPAL_REVOKED").await;
+
+        // The distinct true-unbound case uses the registry-owned selection:
+        // the registry itself points at a profile the catalog does not contain.
+        let mut unbound = fixture.admission().await;
+        unbound.write_json(&unbound_device.admission(2)).await;
+        expect_denial(&mut unbound, 2, "REMOTE_INITIAL_PROFILE_UNBOUND").await;
+
+        // Neither denial leaks a reservation into the healthy owner route.
         let (mut healthy, _, _) = admit_ok(&fixture, &device_a, 2).await;
         attach_observe(&mut healthy).await;
     }).await.expect("rp24 timed out");

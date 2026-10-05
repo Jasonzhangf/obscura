@@ -81,6 +81,25 @@ fn identity(status: &Value) -> Value {
     json!({"session_id":status["session_id"],"attachment_id":status["attachment_id"],"sequence":status["next_sequence"],"control_epoch":status["control"]["epoch"],"viewport_revision":status["viewport_revision"],"document_revision":status["document_revision"]})
 }
 
+fn read_complete_http_request(mut stream: &std::net::TcpStream, max_header_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut buffered = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if buffered.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(buffered);
+        }
+        if buffered.len() >= max_header_bytes {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "HTTP request headers exceeded fixture bound"));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "HTTP request closed before header end")),
+            Ok(read) => buffered.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 struct Media(BufReader<UnixStream>);
 
 fn declaration(device: &str, width: u32, height: u32, orientation: &str) -> Value {
@@ -540,16 +559,9 @@ fn click_receipt_precedes_navigation_and_old_document_input_is_rejected() {
             }
         };
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(read) if read > 0 && line == "\r\n" => break,
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(error) => panic!("fixture request read: {error}"),
-            }
-        }
+        let request = read_complete_http_request(&stream, 8 * 1024)
+            .unwrap_or_else(|error| panic!("fixture request read: {error}"));
+        assert!(request.starts_with(b"GET / HTTP/"), "fixture did not observe a complete HTTP GET request: {request:?}");
         arrived.send(()).unwrap();
         gate.recv_timeout(Duration::from_secs(4)).unwrap();
         let body = "<title>destination</title><button style='position:absolute;left:10px;top:10px;width:200px;height:60px' onclick='window.unwanted=true'>new document</button>";
@@ -640,9 +652,10 @@ fn sleeping_page_remains_responsive_and_fetch_finishes_after_disconnect() {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut header = [0u8; 4096];
-                    let _ = stream.peek(&mut header);
-                    std::thread::sleep(Duration::from_millis(250));
+                    stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                    let request = read_complete_http_request(&stream, 8 * 1024)
+                        .unwrap_or_else(|error| panic!("fixture request read: {error}"));
+                    assert!(request.starts_with(b"GET / HTTP/"), "fixture did not observe a complete HTTP GET request: {request:?}");
                     write!(stream, "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone").unwrap();
                     break;
                 }

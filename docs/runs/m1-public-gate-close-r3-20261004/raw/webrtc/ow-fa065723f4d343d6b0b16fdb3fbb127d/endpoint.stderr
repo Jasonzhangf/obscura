@@ -1,0 +1,4 @@
+{"status":"ready","authorization_revision":1,"registry_sha256":"0000000000000000000000000000000000000000000000000000000000000000","projection_sha256":"7133fa424f38b911bbd3605a64e79b0c6f2412fbcae7d6469fe157b45a4c04f7","endpoint_pid":37776}
+WebRTC endpoint task ended: Host media frame sequence regressed or repeated
+endpoint connection ended: IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
+Error: Host media ended without Closed

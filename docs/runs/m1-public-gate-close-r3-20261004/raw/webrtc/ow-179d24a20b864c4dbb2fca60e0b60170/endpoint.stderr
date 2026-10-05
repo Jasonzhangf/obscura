@@ -1,0 +1,4 @@
+{"status":"ready","authorization_revision":1,"registry_sha256":"0000000000000000000000000000000000000000000000000000000000000000","projection_sha256":"229c33b58937e03c43a07e2f9424aeb772d0dd91513ba3d9e12dbf2ad29249d7","endpoint_pid":48007}
+WebRTC endpoint task ended: Host browser request pump ended
+endpoint connection ended: IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof
+Error: Host media ended without Closed
