@@ -50,6 +50,10 @@ struct Args {
     /// `none` waits for the producer/source to close; `detach` and `rebind`
     /// trigger a typed Host fence after the first decoded frame.
     #[arg(long, default_value = "off")] terminal_trigger: String,
+    /// Transport that carries a self-triggered `detach`/`rebind` fence.
+    /// `data-channel` is the declared browser-operation path; `wss` keeps the
+    /// separate mTLS control-socket coverage.
+    #[arg(long, default_value = "data-channel")] terminal_transport: String,
     /// Written once the first frame is decoded, so an external producer can
     /// close the source at a known active point.
     #[arg(long)] ready_file: Option<PathBuf>,
@@ -166,7 +170,7 @@ async fn main() -> Result<()> {
     let track = timeout(DEADLINE, track_rx.recv()).await.context("timed out waiting for Host H.264 track")?
         .context("Host WebRTC track ended before media")?;
     if args.terminal_trigger != "off" {
-        return run_terminal_mode(&args, &mut control, &mut control_rx, &track, &mut media,
+        return run_terminal_mode(&args, &data_channel, &mut control, &mut control_rx, &track, &mut media,
             &session_id, attachment_id, &attached, terminal, terminal_state).await;
     }
     let mut evidence = Vec::new();
@@ -427,9 +431,14 @@ impl Terminal {
 /// after the first decoded frame, or waits for the external producer to close
 /// (`none`), then reports the terminal it actually observed. Every decoded
 /// frame must belong to the admitted session, so a replacement binding cannot
-/// leak into the old stream.
+/// leak into the old stream. A self-triggered fence is issued over the
+/// authenticated DataChannel by default; `--terminal-transport wss` keeps the
+/// separate mTLS control-socket coverage. On the DataChannel path the caller
+/// must observe the correlated BrowserResponse at the trigger request id
+/// before the terminal is reported.
 async fn run_terminal_mode(
     args: &Args,
+    data_channel: &Arc<dyn DataChannel>,
     control: &mut Socket,
     control_rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
     track: &Arc<dyn TrackRemote>,
@@ -441,6 +450,8 @@ async fn run_terminal_mode(
     terminal_state: Arc<Mutex<Option<String>>>,
 ) -> Result<()> {
     let trigger = args.terminal_trigger.as_str();
+    let transport = args.terminal_transport.as_str();
+    ensure!(matches!(transport, "data-channel" | "wss"), "unknown terminal transport {transport:?}");
     let wait_secs = args.terminal_timeout.unwrap_or(DEADLINE.as_secs_f64()).max(1.0);
     let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(wait_secs);
     let mut evidence: Vec<FrameEvidence> = Vec::new();
@@ -472,18 +483,18 @@ async fn run_terminal_mode(
             match trigger {
                 "none" => {}
                 "detach" => {
-                    send_json(control, &Request { id: TRIGGER_REQUEST_ID, command: Command::Detach {}, operation: None }).await?;
-                    trigger_receipt = Some(serde_json::to_value(
-                        read_control_response(control, TRIGGER_REQUEST_ID, deadline).await?)?);
+                    let request = Request { id: TRIGGER_REQUEST_ID, command: Command::Detach {}, operation: None };
+                    let response = fence(data_channel, control, control_rx, track, media, session_id, transport, request, deadline).await?;
+                    trigger_receipt = Some(serde_json::to_value(response)?);
                 }
                 "rebind" => {
-                    send_json(control, &Request {
-                            id: TRIGGER_REQUEST_ID,
-                            command: Command::ProfileSelect { profile_id: "p1".into() },
-                            operation: Some(operation_for(status)?),
-                    }).await?;
-                    trigger_receipt = Some(serde_json::to_value(
-                        read_control_response(control, TRIGGER_REQUEST_ID, deadline).await?)?);
+                    let request = Request {
+                        id: TRIGGER_REQUEST_ID,
+                        command: Command::ProfileSelect { profile_id: "p1".into() },
+                        operation: Some(operation_for(status)?),
+                    };
+                    let response = fence(data_channel, control, control_rx, track, media, session_id, transport, request, deadline).await?;
+                    trigger_receipt = Some(serde_json::to_value(response)?);
                 }
                 other => bail!("unknown terminal trigger {other:?}"),
             }
@@ -506,9 +517,8 @@ async fn run_terminal_mode(
                 Some(Err(error)) => break Terminal::DataChannelClosed { detail: error.to_string() },
                 Some(Ok(WebRtcControlMessage::VideoFrame { descriptor })) => media.accept_descriptor(descriptor, session_id)?,
                 Some(Ok(WebRtcControlMessage::Pong { .. })) => {},
-                // The fence request is issued on the mTLS control socket, so its
-                // correlated result never arrives on the WebRTC DataChannel.
-                Some(Ok(WebRtcControlMessage::BrowserResponse { .. })) => {},
+                Some(Ok(WebRtcControlMessage::BrowserResponse { .. })) => bail!(
+                    "unsolicited WebRTC browser response after the fence receipt"),
                 Some(Ok(WebRtcControlMessage::Error { code, message })) => break Terminal::ControlError { code, message },
                 Some(Ok(other)) => bail!("unexpected Host WebRTC control message while observing terminal: {other:?}"),
             },
@@ -765,6 +775,47 @@ async fn request_dc(
     }).await.context("timed out waiting for WebRTC browser response")?
 }
 
+/// Issue a self-triggered terminal fence on the transport under test and return
+/// its correlated Host result. The `data-channel` path is the declared
+/// browser-operation boundary; `wss` is retained as separate control-socket
+/// coverage.
+#[allow(clippy::too_many_arguments)]
+async fn fence(
+    data_channel: &Arc<dyn DataChannel>,
+    control: &mut Socket,
+    control_rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
+    track: &Arc<dyn TrackRemote>,
+    media: &mut MediaAssociations,
+    session_id: &str,
+    transport: &str,
+    request: Request,
+    deadline: tokio::time::Instant,
+) -> Result<Response> {
+    match transport {
+        "data-channel" => request_dc(data_channel, control_rx, track, media, session_id, request).await,
+        "wss" => {
+            let request_id = request.id;
+            send_json(control, &request).await?;
+            read_control_response(control, request_id, deadline).await
+        }
+        other => bail!("unknown terminal transport {other:?}"),
+    }
+}
+
+/// Read the correlated Host result for a fence request sent on the mTLS control
+/// socket. The control socket is independent of the WebRTC peer, so a
+/// detach/rebind receipt is delivered even when the fence tears the old media
+/// stream down.
+async fn read_control_response(socket: &mut Socket, request_id: u64, deadline: tokio::time::Instant) -> Result<Response> {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        ensure!(!remaining.is_zero(), "control response for request {request_id} not observed before deadline");
+        let response = timeout(remaining, next_response(socket)).await
+            .context("timed out waiting for correlated control response")??;
+        if response_id(&response) == Some(request_id) { return Ok(response); }
+    }
+}
+
 fn operation_for(status: &SessionStatus) -> Result<Operation> {
     let sequence = status.next_sequence;
     Ok(Operation {
@@ -840,16 +891,6 @@ async fn next_response(socket: &mut Socket) -> Result<Response> {
 /// socket. The control socket is independent of the WebRTC peer, so a
 /// detach/rebind receipt is delivered even when the fence tears the old media
 /// stream down.
-async fn read_control_response(socket: &mut Socket, request_id: u64, deadline: tokio::time::Instant) -> Result<Response> {
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        ensure!(!remaining.is_zero(), "control response for request {request_id} not observed before deadline");
-        let response = timeout(remaining, next_response(socket)).await
-            .context("timed out waiting for correlated control response")??;
-        if response_id(&response) == Some(request_id) { return Ok(response); }
-    }
-}
-
 async fn next_signal(socket: &mut Socket) -> Result<WebRtcSignal> {
     loop {
         match socket.next().await.context("signaling socket ended")?? {

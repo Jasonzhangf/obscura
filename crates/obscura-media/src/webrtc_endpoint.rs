@@ -4,7 +4,7 @@
 //! the H.264 RTP/DataChannel adapter and consumes the encoded-frame stream
 //! produced by the existing raw-frame media owner.
 
-use std::{net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::{future::Future, net::SocketAddr, pin::Pin, sync::Arc, time::{Duration, Instant}};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use obscura_host_protocol::{Request, Response, VideoCodec, VideoPacket, WebRtcCapability, WebRtcControlMessage,
@@ -22,6 +22,27 @@ use crate::webrtc::{h264_media_engine, h264_media_track, send_control_message, w
     MAX_CONTROL_MESSAGE, H264_CLOCK_RATE, H264_PAYLOAD_TYPE, H264_RTP_MTU, H264_SSRC, FRAME_DURATION};
 
 const WEBRTC_DEADLINE: Duration = Duration::from_secs(15);
+pub const SETTLEMENT_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Browser responses sent over the authenticated WebRTC DataChannel.
+///
+/// `Terminal` marks the response that settles a fenced attachment. The sender
+/// drains the DataChannel before the builder returns so the peer can observe
+/// the correlated result before the PeerConnection closes.
+pub enum BrowserResponseDispatch {
+    Ordinary(Response),
+    Terminal {
+        response: Response,
+        completion: tokio::sync::oneshot::Sender<WebRtcBrowserResponseCompletion>,
+    },
+}
+
+#[derive(Debug)]
+pub enum WebRtcBrowserResponseCompletion {
+    BufferDrained,
+    SendFailed(anyhow::Error),
+    SendTimedOut,
+}
 
 /// A server-side PeerConnection after the mTLS WSS signaling exchange has
 /// produced an SDP answer. It is not usable until the remote DataChannel
@@ -35,7 +56,8 @@ pub struct WebRtcEndpoint {
     binding: WebRtcSessionBinding,
     latest: watch::Receiver<Option<Arc<EncodedFrame>>>,
     browser_requests: mpsc::Sender<Request>,
-    browser_responses: mpsc::Receiver<Response>,
+    browser_responses: mpsc::Receiver<BrowserResponseDispatch>,
+    terminal_pending: watch::Receiver<bool>,
 }
 
 /// Accept one complete SDP offer and prepare the answer. ICE candidates are
@@ -46,7 +68,8 @@ pub async fn accept_offer(
     binding: WebRtcSessionBinding,
     latest: watch::Receiver<Option<Arc<EncodedFrame>>>,
     browser_requests: mpsc::Sender<Request>,
-    browser_responses: mpsc::Receiver<Response>,
+    browser_responses: mpsc::Receiver<BrowserResponseDispatch>,
+    terminal_pending: watch::Receiver<bool>,
     bind: SocketAddr,
 ) -> Result<(String, WebRtcEndpoint)> {
     validate_capability(&capability)?;
@@ -94,6 +117,7 @@ pub async fn accept_offer(
         latest,
         browser_requests,
         browser_responses,
+        terminal_pending,
     }))
 }
 
@@ -141,7 +165,9 @@ impl WebRtcEndpoint {
         let mut last_pts = None;
         let mut emit_current = true;
         loop {
-            if emit_current {
+            if *self.terminal_pending.borrow() {
+                emit_current = false;
+            } else if emit_current {
                 let frame = self.latest.borrow_and_update().clone();
                 emit_frame(&self.track, &data_channel, frame, &self.binding, &mut last_sequence,
                     &mut last_document_revision, &mut last_viewport_revision, &mut last_pts,
@@ -151,6 +177,10 @@ impl WebRtcEndpoint {
         tokio::select! {
             changed = self.latest.changed() => {
                 if let Err(error) = changed {
+                    if *self.terminal_pending.borrow() {
+                        emit_current = false;
+                        continue;
+                    }
                     let terminal_error = self.latest
                         .borrow()
                         .as_deref()
@@ -174,8 +204,17 @@ impl WebRtcEndpoint {
                 emit_current = true;
             }
             response = self.browser_responses.recv() => {
-                let response = response.context("Host browser request pump ended")?;
-                send_control_message(&data_channel, &WebRtcControlMessage::BrowserResponse { response }).await?;
+                let dispatch = response.context("Host browser response pump ended")?;
+                match dispatch {
+                    BrowserResponseDispatch::Ordinary(response) => {
+                        send_control_message(&data_channel, &WebRtcControlMessage::BrowserResponse { response }).await?;
+                    }
+                    BrowserResponseDispatch::Terminal { response, completion } => {
+                        let outcome = send_browser_response(&data_channel, response).await;
+                        let _ = completion.send(outcome);
+                        return Ok(());
+                    }
+                }
             }
             event = data_channel.poll() => match event {
                 Some(DataChannelEvent::OnMessage(message)) => {
@@ -207,6 +246,59 @@ impl WebRtcEndpoint {
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+async fn send_browser_response(
+    channel: &Arc<dyn DataChannel>,
+    response: Response,
+) -> WebRtcBrowserResponseCompletion {
+    match timeout(SETTLEMENT_DEADLINE, terminal_send_and_drain(channel, response)).await {
+        Ok(outcome) => outcome,
+        Err(_) => WebRtcBrowserResponseCompletion::SendTimedOut,
+    }
+}
+
+/// Quiesced terminal send: the only DataChannel poller while it runs. It
+/// enqueues the correlated BrowserResponse, then observes the transport
+/// release its whole send buffer. `run_inner` stays suspended on the terminal
+/// dispatch, so no other send or poll arm competes with this drain.
+async fn terminal_send_and_drain(
+    channel: &Arc<dyn DataChannel>,
+    response: Response,
+) -> WebRtcBrowserResponseCompletion {
+    if let Err(error) = send_control_message(channel, &WebRtcControlMessage::BrowserResponse { response }).await {
+        return WebRtcBrowserResponseCompletion::SendFailed(error);
+    }
+    wait_for_drain(channel).await
+}
+
+async fn wait_for_drain(channel: &Arc<dyn DataChannel>) -> WebRtcBrowserResponseCompletion {
+    // Owned handle keeps the borrowed one-shot receive valid across ticks.
+    let channel_owned = Arc::clone(channel);
+    let mut pending: Pin<Box<dyn Future<Output = Option<DataChannelEvent>> + Send>> =
+        Box::pin(channel_owned.poll());
+    let mut tick = tokio::time::interval(Duration::from_millis(10));
+    tick.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            event = &mut pending => match event {
+                Some(DataChannelEvent::OnError)
+                | Some(DataChannelEvent::OnClose)
+                | None => return WebRtcBrowserResponseCompletion::SendFailed(anyhow!(
+                    "WebRTC DataChannel closed or errored during terminal drain")),
+                // Consume one non-terminal event and arm exactly one replacement
+                // receive, matching the rtc DataChannel one-shot poll semantics.
+                Some(_) => { pending = Box::pin(channel_owned.poll()); }
+            },
+            _ = tick.tick() => match channel.outstanding_bytes().await {
+                Ok(0) => return WebRtcBrowserResponseCompletion::BufferDrained,
+                Ok(_) => {}
+                Err(error) => return WebRtcBrowserResponseCompletion::SendFailed(
+                    anyhow!("read WebRTC DataChannel outstanding bytes: {error}")),
+            },
         }
     }
 }

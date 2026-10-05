@@ -3,6 +3,7 @@ use anyhow::{bail, ensure, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use obscura_host_protocol::{Command, Request, Response, ResultValue, VideoPacket, WebRtcSignal, HOST_PROTOCOL_VERSION};
 use obscura_media::EncodedFrame;
+use obscura_media::webrtc_endpoint::{BrowserResponseDispatch, WebRtcBrowserResponseCompletion, SETTLEMENT_DEADLINE};
 use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::UnixStream, sync::{mpsc, watch}};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
@@ -81,7 +82,8 @@ pub async fn control(
     let mut webrtc_task: Option<tokio::task::JoinHandle<Result<()>>> = None;
     let mut webrtc_filter: Option<tokio::task::JoinHandle<()>> = None;
     let mut browser_requests: Option<mpsc::Receiver<Request>> = None;
-    let mut browser_responses: Option<mpsc::Sender<Response>> = None;
+    let mut browser_responses: Option<mpsc::Sender<BrowserResponseDispatch>> = None;
+    let mut terminal_pending: Option<watch::Sender<bool>> = None;
     let mut internal_id = u64::MAX;
     loop {
         tokio::select! {
@@ -113,10 +115,11 @@ pub async fn control(
                                 ensure!(authorized_capability == capability, "Host returned a different WebRTC capability");
                                 let (browser_request_tx, browser_request_rx) = mpsc::channel(16);
                                 let (browser_response_tx, browser_response_rx) = mpsc::channel(16);
+                                let (terminal_tx, terminal_rx) = watch::channel(false);
                                 let (filtered_latest, webrtc_latest) = watch::channel(None);
                                 let (answer_sdp, endpoint) = obscura_media::webrtc_endpoint::accept_offer(
                                     sdp, capability.clone(), binding.clone(), webrtc_latest,
-                                    browser_request_tx, browser_response_rx, bind).await?;
+                                    browser_request_tx, browser_response_rx, terminal_rx, bind).await?;
                                 let consumed = host_command(&mut write, &mut reader, &mut internal_id,
                                     Command::ConsumeWebRtc { binding: binding.clone(), capability: capability.clone() }).await?;
                                 ensure!(matches!(consumed, Response::Result { value: ResultValue::WebRtcConsumed { .. }, .. }),
@@ -129,6 +132,7 @@ pub async fn control(
                                 send(&mut remote, Message::text(serde_json::to_string(&answer)?)).await?;
                                 browser_requests = Some(browser_request_rx);
                                 browser_responses = Some(browser_response_tx);
+                                terminal_pending = Some(terminal_tx);
                                 webrtc_filter = Some(filter);
                                 webrtc_task = Some(tokio::spawn(async move {
                                     let result = endpoint.run().await;
@@ -171,6 +175,7 @@ pub async fn control(
                     webrtc_task = None;
                     browser_requests = None;
                     browser_responses = None;
+                    terminal_pending = None;
                 }
             }
             request = async {
@@ -186,10 +191,31 @@ pub async fn control(
                     continue;
                 };
                 let result = forward_remote_request(&mut write, &mut reader, request).await?;
+                let admitted = active.borrow().clone();
+                let terminal = response_ends_media(&admitted, &result);
+                if terminal {
+                    let _ = terminal_pending.as_ref().context("WebRTC terminal-pending sender unavailable")?
+                        .send(true);
+                }
                 let detached = update_media_state(&active, &result);
                 let response_tx = browser_responses.as_ref().context("WebRTC browser response pump unavailable")?;
-                response_tx.send(result).await.context("WebRTC browser response receiver ended")?;
-                if detached {
+                if terminal {
+                    let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+                    response_tx.send(BrowserResponseDispatch::Terminal {
+                        response: result,
+                        completion: completion_tx,
+                    }).await.context("WebRTC terminal browser response receiver ended before terminal dispatch")?;
+                    match tokio::time::timeout(SETTLEMENT_DEADLINE, completion_rx).await {
+                        Ok(Ok(WebRtcBrowserResponseCompletion::BufferDrained)) => {}
+                        Ok(Ok(outcome)) => bail!("WebRTC terminal browser response failed: {outcome:?}"),
+                        Ok(Err(_)) => bail!("WebRTC terminal browser response receiver ended before completion"),
+                        Err(_) => bail!("WebRTC terminal browser response settlement deadline exceeded"),
+                    }
+                } else {
+                    response_tx.send(BrowserResponseDispatch::Ordinary(result)).await
+                        .context("WebRTC browser response receiver ended")?;
+                }
+                if terminal || detached {
                     if let Some(task) = webrtc_filter.take() { task.abort(); }
                     // See the WSS path above: detach the endpoint handle so the
                     // peer closes with an observable terminal and a later offer
@@ -197,6 +223,7 @@ pub async fn control(
                     webrtc_task = None;
                     browser_requests = None;
                     browser_responses = None;
+                    terminal_pending = None;
                 }
             }
         }
@@ -365,6 +392,23 @@ fn update_media_state(
         }
         _ => false,
     }
+}
+
+/// A response ends media for the current attachment when the Host reports no
+/// active attachment, or when it moved the attachment to a different session.
+/// A detach clears the attachment id; a rebind keeps an attachment id but
+/// changes the session. Either case fences the admitted stream. The terminal
+/// dispatch is committed before `update_media_state` publishes the fence, so
+/// the correlated response remains reachable after the filter closes.
+fn response_ends_media(admitted: &MediaState, result: &Response) -> bool {
+    let (attachment_id, session_id) = match result {
+        Response::Result { value: ResultValue::Status(status), .. } =>
+            (status.attachment_id, Some(status.session_id.as_str())),
+        Response::Result { value: ResultValue::ProfileSelected { status, .. }, .. } =>
+            (status.attachment_id, Some(status.session_id.as_str())),
+        _ => return false,
+    };
+    attachment_id.is_none() || admitted.session_id.as_deref() != session_id
 }
 
 async fn host_request(

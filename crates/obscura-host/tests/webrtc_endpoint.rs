@@ -52,6 +52,20 @@ async fn active_receiver_observes_source_close_terminal() {
         .await.expect("source-close terminal lifecycle timed out").unwrap();
 }
 
+// Separate coverage: the same fence issued on the mTLS control socket must
+// still deliver its correlated receipt and fence the old stream.
+#[tokio::test]
+async fn active_receiver_observes_wss_detach_terminal() {
+    tokio::time::timeout(Duration::from_secs(240), run_terminal_lifecycle("wss-detach"))
+        .await.expect("WSS detach terminal lifecycle timed out").unwrap();
+}
+
+#[tokio::test]
+async fn active_receiver_observes_wss_rebind_terminal_without_leak() {
+    tokio::time::timeout(Duration::from_secs(240), run_terminal_lifecycle("wss-rebind"))
+        .await.expect("WSS rebind terminal lifecycle timed out").unwrap();
+}
+
 async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = PathBuf::from("/tmp").join(format!("ow-{}", uuid::Uuid::new_v4().simple()));
@@ -387,14 +401,23 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
 
 /// Keep a real receiver authenticated and active across the terminal the old
 /// harness never reached. `mode` selects the fence the receiver itself triggers
-/// after the first decoded frame (`detach`/`rebind`) or a wait for the external
-/// producer to close (`none`). Every decoded frame must belong to the admitted
-/// session, and after a fence a fresh authorized attachment must still receive
-/// media from the still-running producer.
+/// over the authenticated DataChannel after the first decoded frame
+/// (`detach`/`rebind`) or a wait for the external producer to close (`none`).
+/// The receiver reports the correlated BrowserResponse it received at the
+/// trigger request id before it reports the terminal, so the Host cannot close
+/// the peer first and leave the initiating operation without its result. Every
+/// decoded frame must belong to the admitted session, and after a fence a
+/// fresh authorized attachment must still receive media from the still-running
+/// producer.
 async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::process::Stdio;
-    anyhow::ensure!(matches!(mode, "detach" | "rebind" | "none"), "unsupported terminal mode {mode}");
+    anyhow::ensure!(matches!(mode, "detach" | "rebind" | "none" | "wss-detach" | "wss-rebind"),
+        "unsupported terminal mode {mode}");
+    let (trigger, transport) = match mode {
+        "wss-detach" | "wss-rebind" => (&mode[4..], "wss"),
+        other => (other, "data-channel"),
+    };
     let root = PathBuf::from("/tmp").join(format!("ow-terminal-{}", uuid::Uuid::new_v4().simple()));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
     let raw_root = raw_webrtc_root(&format!("terminal-{mode}"));
@@ -500,10 +523,11 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
     receiver_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
         .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
         .arg("--frames").arg("3").arg("--skip-click")
-        .arg("--terminal-trigger").arg(mode).arg("--ready-file").arg(&ready_file)
+        .arg("--terminal-trigger").arg(trigger).arg("--terminal-transport").arg(transport)
+        .arg("--ready-file").arg(&ready_file)
         .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let receiver = receiver_command.spawn()?;
-    if mode == "none" {
+    if trigger == "none" {
         // The receiver writes the ready marker only after decoding its first
         // frame; only then does the external producer close.
         wait_file(&ready_file, Duration::from_secs(60)).await?;
@@ -528,13 +552,13 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
         anyhow::ensure!(frame["session_id"].as_str() == Some(session_id.as_str()),
             "terminal stream carried a non-admitted frame: {frame}");
     }
-    if mode == "detach" {
+    if trigger == "detach" {
         let receipt = &report["trigger_receipt"];
         anyhow::ensure!(receipt["type"] == "result" && receipt["id"] == 200, "detach produced no correlated result receipt: {report}");
         anyhow::ensure!(receipt["value"]["attachment_id"].is_null(),
             "detach receipt still reports an attachment: {receipt}");
     }
-    if mode == "rebind" {
+    if trigger == "rebind" {
         let receipt = &report["trigger_receipt"];
         anyhow::ensure!(receipt["type"] == "result" && receipt["id"] == 200, "rebind produced no correlated result receipt: {report}");
         let rebound = receipt["value"]["binding"]["session_id"].as_str().unwrap_or("");
@@ -542,7 +566,7 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
             "rebind receipt did not move the attachment to a new session: {receipt}");
     }
 
-    if mode != "none" {
+    if trigger != "none" {
         // The fence terminal must not have consumed the endpoint: a fresh
         // authorized attachment still receives the live producer stream.
         let fresh = run_receiver(&receiver_bin, address, &root, &raw_root, &format!("after-{mode}"), true, false, false).await?;
