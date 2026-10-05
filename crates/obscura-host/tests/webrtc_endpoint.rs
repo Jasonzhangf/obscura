@@ -16,12 +16,30 @@ async fn real_receiver_gets_typed_encoder_unavailable_error() {
     tokio::time::timeout(Duration::from_secs(180), exercise(true)).await.expect("WebRTC encoder failure integration timed out").unwrap();
 }
 
+#[tokio::test]
+async fn same_content_new_sequence_publishes_each_frame() {
+    tokio::time::timeout(Duration::from_secs(180), run_scripted_lifecycle("same-content"))
+        .await.expect("same-content lifecycle timed out").unwrap();
+}
+
+#[tokio::test]
+async fn foreign_session_then_matching_a_is_held_until_admitted() {
+    tokio::time::timeout(Duration::from_secs(180), run_scripted_lifecycle("foreign-then-a"))
+        .await.expect("foreign-session lifecycle timed out").unwrap();
+}
+
+#[tokio::test]
+async fn initial_none_waits_for_first_admitted_frame() {
+    tokio::time::timeout(Duration::from_secs(180), run_scripted_lifecycle("initial-none"))
+        .await.expect("initial-None lifecycle timed out").unwrap();
+}
+
 async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = PathBuf::from("/tmp").join(format!("ow-{}", uuid::Uuid::new_v4().simple()));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
     let raw_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/runs/m1-public-gate-close-r3-20261004/raw/webrtc")
+        .join("../../docs/runs/m1-frame-forwarding-impl-r1-20261005/raw/webrtc")
         .join(format!("ow-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&raw_root)?;
     std::fs::write(raw_root.join("command.env"), format!(
@@ -148,6 +166,203 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
 
     let mut endpoint = endpoint;
     let mut host = host;
+    let _ = endpoint.kill().await;
+    let _ = endpoint.wait().await;
+    let _ = host.kill().await;
+    let _ = host.wait().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+/// Typed `AccessUnit` for the endpoint's declared shared-encoded-frame ABI
+/// (`--media-bin` writes `VideoPacket` headers plus payload to `encoded.sock`).
+fn scripted_access_unit(session_id: &str, sequence: u64, access_unit_bytes: u64) -> obscura_host_protocol::VideoPacket {
+    let source_byte_length = 160u64 * 120 * 4;
+    obscura_host_protocol::VideoPacket::AccessUnit {
+        source: obscura_host_protocol::FrameInfo {
+            session_id: session_id.to_owned(),
+            tab_id: "scripted-tab".into(),
+            sequence,
+            presentation_revision: 1,
+            document_revision: 1,
+            viewport_revision: 1,
+            width: 160,
+            height: 120,
+            stride: 640,
+            byte_length: source_byte_length,
+            pixel_format: obscura_host_protocol::PixelFormat::PremultipliedRgba8,
+        },
+        encoder_id: "scripted-encoder".into(),
+        pts_us: sequence,
+        coded_width: 160,
+        coded_height: 120,
+        codec: obscura_host_protocol::VideoCodec::H264AnnexB,
+        keyframe: true,
+        byte_length: access_unit_bytes,
+    }
+}
+
+/// Opaque premultiplied RGBA scene used once to produce a real H.264 IDR.
+fn scripted_scene(width: u32, height: u32) -> Vec<u8> {
+    let mut rgba = vec![0u8; (width * height * 4) as usize];
+    for (index, pixel) in rgba.chunks_exact_mut(4).enumerate() {
+        let x = index as u32 % width;
+        let y = index as u32 / width;
+        let band = ((x / 20) + (y / 20)) % 2 == 0;
+        pixel[0] = if band { 200 } else { 40 };
+        pixel[1] = if band { 40 } else { 160 };
+        pixel[2] = 80;
+        pixel[3] = 255;
+    }
+    rgba
+}
+
+async fn send_video_packet(stream: &mut tokio::net::UnixStream, packet: &obscura_host_protocol::VideoPacket, bytes: &[u8]) -> anyhow::Result<()> {
+    let mut header = serde_json::to_vec(packet)?;
+    anyhow::ensure!(header.len() < 4096, "scripted shared-encoded-frame header exceeds endpoint budget");
+    header.push(b'\n');
+    stream.write_all(&header).await?;
+    stream.write_all(bytes).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Drive the endpoint's declared `--media-bin` / `encoded.sock` shared-encoded
+/// frame ABI with a scripted producer while a real independent receiver decodes
+/// the Host H.264 over real WebRTC. This injects the exact typed source
+/// sequences (foreign session, identical bytes with a new sequence, initially
+/// empty source) that the real single-session adapter cannot produce on its own.
+async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::process::Stdio;
+    let root = PathBuf::from("/tmp").join(format!("ow-scripted-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let raw_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/runs/m1-frame-forwarding-impl-r1-20261005/raw/webrtc")
+        .join(format!("scripted-{scenario}-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&raw_root)?;
+    std::fs::write(raw_root.join("command.env"), format!(
+        "scenario={scenario}\nUTC={}\n",
+        std::process::Command::new("/bin/date").arg("-u").arg("+%Y-%m-%dT%H:%M:%SZ").output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    ))?;
+    let bind_ip = "127.0.0.1";
+    let ca_key = rcgen::KeyPair::generate()?;
+    let mut ca_params = rcgen::CertificateParams::new(vec![])?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Obscura WebRTC scripted CA");
+    let ca = ca_params.self_signed(&ca_key)?;
+    let server_key = rcgen::KeyPair::generate()?;
+    let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
+        .signed_by(&server_key, &ca, &ca_key)?;
+    let client_key = rcgen::KeyPair::generate()?;
+    let mut client_params = rcgen::CertificateParams::new(vec![])?;
+    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let client = client_params.signed_by(&client_key, &ca, &ca_key)?;
+    std::fs::write(root.join("server.der"), server.der())?;
+    std::fs::write(root.join("server.key"), server_key.serialize_der())?;
+    std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(root.join("ca.der"), ca.der())?;
+    std::fs::write(root.join("client.der"), client.der())?;
+    std::fs::write(root.join("client.key"), client_key.serialize_der())?;
+    std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
+    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"), root.join("profiles"), &client.der().to_vec())?;
+
+    let mut host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+        .arg("--socket-dir").arg(root.join("host"))
+        .arg("--profile-root").arg(root.join("profiles"))
+        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .stdout(std::fs::File::create(raw_root.join("host.stdout"))?)
+        .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
+        .kill_on_drop(true).spawn()?;
+    std::fs::write(raw_root.join("host.pid"), host.id().expect("Host child pid").to_string())?;
+    wait_socket(root.join("host/host.sock")).await;
+    let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await?;
+    let mut local = BufReader::new(local);
+    let mut line = String::new(); local.read_line(&mut line).await?;
+    let mut state = local_request(&mut local, serde_json::json!({"id":1,"command":{"type":"attach","mode":"agent"}})).await?;
+    let session_id = state["session_id"].as_str().ok_or_else(|| anyhow::anyhow!("Host session identity missing"))?.to_owned();
+    state = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state),"command":{"type":"resize","width":160,"height":120}})).await?;
+    let html = "data:text/html,<style>body{margin:0;background:white}</style><div style='width:160px;height:120px;background:white'></div>";
+    let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state),"command":{"type":"navigate","url":html}})).await?;
+    drop(local);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let reservation = TcpListener::bind((bind_ip, 0)).await?;
+    let address = reservation.local_addr()?; drop(reservation);
+    let receiver_bin = release_binary("obscura-webrtc-receiver");
+    anyhow::ensure!(receiver_bin.is_file(), "Build target/release/obscura-webrtc-receiver with --features webrtc first");
+    let mut endpoint_command = Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"));
+    endpoint_command
+        .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
+        .arg("--socket-dir").arg(root.join("endpoint"))
+        .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
+        .arg("--client-ca").arg(root.join("ca.der"))
+        // The test itself owns the shared-encoded-frame producer on `encoded.sock`;
+        // a no-op `--media-bin` leaves the socket to the scripted producer.
+        .arg("--media-bin").arg("/usr/bin/true")
+        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
+        .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
+    endpoint_command
+        .stdout(std::fs::File::create(raw_root.join("endpoint.stdout"))?)
+        .stderr(std::fs::File::create(raw_root.join("endpoint.stderr"))?);
+    let endpoint = endpoint_command.kill_on_drop(true).spawn()?;
+    std::fs::write(raw_root.join("endpoint.pid"), endpoint.id().expect("endpoint child pid").to_string())?;
+    wait_socket(root.join("endpoint/encoded.sock")).await;
+    let mut producer = tokio::net::UnixStream::connect(root.join("endpoint/encoded.sock")).await?;
+
+    let mut receiver_command = Command::new(&receiver_bin);
+    receiver_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
+        .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
+        .arg("--frames").arg("3").arg("--skip-click")
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let receiver = receiver_command.spawn()?;
+
+    let bytes = obscura_media::encode(std::path::Path::new("ffmpeg"), 160, 120, scripted_scene(160, 120)).await?;
+    anyhow::ensure!(!bytes.is_empty(), "scripted producer got no H.264 access unit");
+    let foreign_session = format!("{session_id}-foreign");
+    if scenario == "initial-none" {
+        // Hold the shared source empty until the attachment filter is admitted
+        // and running with no matching frame; a `None`-as-fence bug fails here.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    } else {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    }
+    for sequence in 1..=12u64 {
+        if scenario == "foreign-then-a" {
+            let foreign = scripted_access_unit(&foreign_session, sequence, bytes.len() as u64);
+            send_video_packet(&mut producer, &foreign, &bytes).await?;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let packet = scripted_access_unit(&session_id, sequence, bytes.len() as u64);
+        send_video_packet(&mut producer, &packet, &bytes).await?;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+    }
+
+    let output = receiver.wait_with_output().await?;
+    let phase_dir = raw_root.join("scripted");
+    std::fs::create_dir_all(&phase_dir)?;
+    std::fs::write(phase_dir.join("stdout.txt"), &output.stdout)?;
+    std::fs::write(phase_dir.join("stderr.txt"), &output.stderr)?;
+    std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", output.status.code()))?;
+    anyhow::ensure!(output.status.success(), "scripted receiver failed at {}: {}", raw_root.display(), String::from_utf8_lossy(&output.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(report["pass"] == true && report["browser_path"] == "webrtc_data_channel", "scripted WebRTC path missing: {report}");
+    anyhow::ensure!(report["session_id"].as_str() == Some(session_id.as_str()), "scripted receiver session changed: {report}");
+    let frames = report["frames"].as_array().ok_or_else(|| anyhow::anyhow!("scripted frame evidence missing: {report}"))?;
+    anyhow::ensure!(frames.len() >= 3, "scripted WebRTC evidence has fewer than three frames: {report}");
+    for frame in frames {
+        anyhow::ensure!(frame["session_id"].as_str() == Some(session_id.as_str())
+            && frame["width"] == 160 && frame["height"] == 120 && frame["stride"] == 640
+            && frame["codec"] == "h264_annex_b" && frame["keyframe"] == true,
+            "incomplete scripted frame descriptor: {frame}");
+    }
+    let sequences: Vec<u64> = frames.iter().map(|frame| frame["sequence"].as_u64().unwrap_or(0)).collect();
+    anyhow::ensure!(sequences.windows(2).all(|pair| pair[1] > pair[0]), "scripted sequence did not increase: {report}");
+
+    drop(producer);
+    let mut endpoint = endpoint;
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;
     let _ = host.kill().await;

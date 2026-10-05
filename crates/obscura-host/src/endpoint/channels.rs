@@ -113,7 +113,7 @@ pub async fn control(
                                 ensure!(authorized_capability == capability, "Host returned a different WebRTC capability");
                                 let (browser_request_tx, browser_request_rx) = mpsc::channel(16);
                                 let (browser_response_tx, browser_response_rx) = mpsc::channel(16);
-                                let (webrtc_latest, filter) = exact_session_stream(latest.clone(), active.subscribe());
+                                let (filtered_latest, webrtc_latest) = watch::channel(None);
                                 let (answer_sdp, endpoint) = obscura_media::webrtc_endpoint::accept_offer(
                                     sdp, capability.clone(), binding.clone(), webrtc_latest,
                                     browser_request_tx, browser_response_rx, bind).await?;
@@ -121,6 +121,10 @@ pub async fn control(
                                     Command::ConsumeWebRtc { binding: binding.clone(), capability: capability.clone() }).await?;
                                 ensure!(matches!(consumed, Response::Result { value: ResultValue::WebRtcConsumed { .. }, .. }),
                                     "Host did not consume WebRTC authorization");
+                                let admitted = active.borrow().clone();
+                                ensure!(admitted.attached && admitted.session_id.as_deref() == Some(binding.session_id.as_str()),
+                                    "WebRTC admitted session changed before binding commit");
+                                let filter = exact_session_stream(filtered_latest, latest.clone(), active.subscribe(), admitted);
                                 let answer = WebRtcSignal::Answer { id, capability, binding, sdp: answer_sdp };
                                 send(&mut remote, Message::text(serde_json::to_string(&answer)?)).await?;
                                 browser_requests = Some(browser_request_rx);
@@ -193,28 +197,106 @@ pub async fn control(
     Ok(())
 }
 
+/// Typed identity used for publish-once filtering. It intentionally contains
+/// no encoded bytes, Arc identity, or raw frame payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PacketIdentity {
+    Waiting { session_id: String },
+    AccessUnit {
+        session_id: String,
+        tab_id: String,
+        sequence: u64,
+        presentation_revision: u64,
+        document_revision: u64,
+        viewport_revision: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+        byte_length: u64,
+        pixel_format_premultiplied_rgba8: bool,
+        encoder_id: String,
+        pts_us: u64,
+        coded_width: u32,
+        coded_height: u32,
+        codec_h264_annex_b: bool,
+        keyframe: bool,
+        descriptor_byte_length: u64,
+    },
+    Unavailable { session_id: String, message: String },
+    EncoderUnavailable { session_id: String, message: String },
+    Closed { session_id: String },
+}
+
+fn packet_identity(packet: &VideoPacket) -> PacketIdentity {
+    match packet {
+        VideoPacket::Waiting { session_id } => PacketIdentity::Waiting { session_id: session_id.clone() },
+        VideoPacket::AccessUnit { source, encoder_id, pts_us, coded_width, coded_height, codec, keyframe, byte_length } => {
+            PacketIdentity::AccessUnit {
+                session_id: source.session_id.clone(),
+                tab_id: source.tab_id.clone(),
+                sequence: source.sequence,
+                presentation_revision: source.presentation_revision,
+                document_revision: source.document_revision,
+                viewport_revision: source.viewport_revision,
+                width: source.width,
+                height: source.height,
+                stride: source.stride,
+                byte_length: source.byte_length,
+                pixel_format_premultiplied_rgba8: matches!(source.pixel_format, obscura_host_protocol::PixelFormat::PremultipliedRgba8),
+                encoder_id: encoder_id.clone(),
+                pts_us: *pts_us,
+                coded_width: *coded_width,
+                coded_height: *coded_height,
+                codec_h264_annex_b: matches!(codec, obscura_host_protocol::VideoCodec::H264AnnexB),
+                keyframe: *keyframe,
+                descriptor_byte_length: *byte_length,
+            }
+        }
+        VideoPacket::Unavailable { session_id, message } => PacketIdentity::Unavailable {
+            session_id: session_id.clone(),
+            message: message.clone(),
+        },
+        VideoPacket::EncoderUnavailable { session_id, message } => PacketIdentity::EncoderUnavailable {
+            session_id: session_id.clone(),
+            message: message.clone(),
+        },
+        VideoPacket::Closed { session_id } => PacketIdentity::Closed { session_id: session_id.clone() },
+    }
+}
+
 /// Derive an exact-session view of the endpoint encoded stream for one admitted
 /// attachment. It never forwards a frame that does not belong to the
 /// connection's current admitted session, so the shared encoded stream cannot
 /// leak another profile's media to this peer. The task ends when the
 /// attachment detaches or either watch closes.
 fn exact_session_stream(
+    filtered: watch::Sender<Option<Arc<EncodedFrame>>>,
     mut source: watch::Receiver<Option<Arc<EncodedFrame>>>,
     mut state: watch::Receiver<MediaState>,
-) -> (watch::Receiver<Option<Arc<EncodedFrame>>>, tokio::task::JoinHandle<()>) {
-    let (filtered, receiver) = watch::channel(None);
+    admitted: MediaState,
+) -> tokio::task::JoinHandle<()> {
     let task = tokio::spawn(async move {
+        let Some(admitted_session) = admitted.session_id.clone().filter(|_| admitted.attached) else {
+            filtered.send_replace(None);
+            return;
+        };
+        let mut last_published = None;
         loop {
             let current = state.borrow().clone();
-            let session = match (current.attached, current.session_id) {
-                (true, Some(session)) => session,
-                _ => { filtered.send_replace(None); return; }
-            };
-            match source.borrow_and_update().clone() {
-                Some(frame) if packet_session(&frame.packet).as_deref() == Some(session.as_str()) => {
-                    filtered.send_replace(Some(frame));
+            if current != admitted {
+                if !current.attached {
+                    filtered.send_replace(None);
                 }
-                _ => { filtered.send_replace(None); }
+                return;
+            }
+            if let Some(frame) = source.borrow_and_update().clone() {
+                if packet_session(&frame.packet).as_deref() == Some(admitted_session.as_str()) {
+                    let identity = packet_identity(&frame.packet);
+                    if last_published.as_ref() != Some(&identity) {
+                        filtered.send_replace(Some(frame));
+                        last_published = Some(identity);
+                    }
+                }
             }
             tokio::select! {
                 changed = source.changed() => { if changed.is_err() { return; } }
@@ -222,7 +304,7 @@ fn exact_session_stream(
             }
         }
     });
-    (receiver, task)
+    task
 }
 
 /// Forward a raw browser request over the already-admitted stream. The endpoint
