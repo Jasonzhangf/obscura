@@ -161,8 +161,14 @@ pub async fn control(
                 let detached = update_media_state(&active, &result);
                 send(&mut remote, Message::text(serde_json::to_string(&result)?)).await?;
                 if detached {
-                    if let Some(task) = webrtc_task.take() { task.abort(); }
                     if let Some(task) = webrtc_filter.take() { task.abort(); }
+                    // Drop the endpoint handle without aborting it. Aborting
+                    // here tears down the peer with no observable terminal for
+                    // the remote, while keeping the handle would block a later
+                    // offer on this attachment. The aborted filter drops the
+                    // filtered sender, so the endpoint ends and closes its peer
+                    // on its own.
+                    webrtc_task = None;
                     browser_requests = None;
                     browser_responses = None;
                 }
@@ -184,8 +190,11 @@ pub async fn control(
                 let response_tx = browser_responses.as_ref().context("WebRTC browser response pump unavailable")?;
                 response_tx.send(result).await.context("WebRTC browser response receiver ended")?;
                 if detached {
-                    if let Some(task) = webrtc_task.take() { task.abort(); }
                     if let Some(task) = webrtc_filter.take() { task.abort(); }
+                    // See the WSS path above: detach the endpoint handle so the
+                    // peer closes with an observable terminal and a later offer
+                    // is not blocked.
+                    webrtc_task = None;
                     browser_requests = None;
                     browser_responses = None;
                 }

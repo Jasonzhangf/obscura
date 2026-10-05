@@ -34,13 +34,29 @@ async fn initial_none_waits_for_first_admitted_frame() {
         .await.expect("initial-None lifecycle timed out").unwrap();
 }
 
+#[tokio::test]
+async fn active_receiver_observes_detach_terminal_and_reconnect() {
+    tokio::time::timeout(Duration::from_secs(240), run_terminal_lifecycle("detach"))
+        .await.expect("detach terminal lifecycle timed out").unwrap();
+}
+
+#[tokio::test]
+async fn active_receiver_observes_rebind_terminal_without_leak() {
+    tokio::time::timeout(Duration::from_secs(240), run_terminal_lifecycle("rebind"))
+        .await.expect("rebind terminal lifecycle timed out").unwrap();
+}
+
+#[tokio::test]
+async fn active_receiver_observes_source_close_terminal() {
+    tokio::time::timeout(Duration::from_secs(240), run_terminal_lifecycle("none"))
+        .await.expect("source-close terminal lifecycle timed out").unwrap();
+}
+
 async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = PathBuf::from("/tmp").join(format!("ow-{}", uuid::Uuid::new_v4().simple()));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
-    let raw_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/runs/m1-frame-forwarding-impl-r1-20261005/raw/webrtc")
-        .join(format!("ow-{}", uuid::Uuid::new_v4().simple()));
+    let raw_root = raw_webrtc_root("ow");
     std::fs::create_dir_all(&raw_root)?;
     std::fs::write(raw_root.join("command.env"), format!(
         "encoder_failure={encoder_failure}\nUTC={}\n",
@@ -237,9 +253,7 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
     use std::process::Stdio;
     let root = PathBuf::from("/tmp").join(format!("ow-scripted-{}", uuid::Uuid::new_v4().simple()));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
-    let raw_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../docs/runs/m1-frame-forwarding-impl-r1-20261005/raw/webrtc")
-        .join(format!("scripted-{scenario}-{}", uuid::Uuid::new_v4().simple()));
+    let raw_root = raw_webrtc_root(&format!("scripted-{scenario}"));
     std::fs::create_dir_all(&raw_root)?;
     std::fs::write(raw_root.join("command.env"), format!(
         "scenario={scenario}\nUTC={}\n",
@@ -371,6 +385,193 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Keep a real receiver authenticated and active across the terminal the old
+/// harness never reached. `mode` selects the fence the receiver itself triggers
+/// after the first decoded frame (`detach`/`rebind`) or a wait for the external
+/// producer to close (`none`). Every decoded frame must belong to the admitted
+/// session, and after a fence a fresh authorized attachment must still receive
+/// media from the still-running producer.
+async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::process::Stdio;
+    anyhow::ensure!(matches!(mode, "detach" | "rebind" | "none"), "unsupported terminal mode {mode}");
+    let root = PathBuf::from("/tmp").join(format!("ow-terminal-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let raw_root = raw_webrtc_root(&format!("terminal-{mode}"));
+    std::fs::create_dir_all(&raw_root)?;
+    std::fs::write(raw_root.join("command.env"), format!(
+        "scenario=terminal-{mode}\nUTC={}\n",
+        std::process::Command::new("/bin/date").arg("-u").arg("+%Y-%m-%dT%H:%M:%SZ").output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    ))?;
+    let bind_ip = "127.0.0.1";
+    let ca_key = rcgen::KeyPair::generate()?;
+    let mut ca_params = rcgen::CertificateParams::new(vec![])?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Obscura WebRTC terminal CA");
+    let ca = ca_params.self_signed(&ca_key)?;
+    let server_key = rcgen::KeyPair::generate()?;
+    let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
+        .signed_by(&server_key, &ca, &ca_key)?;
+    let client_key = rcgen::KeyPair::generate()?;
+    let mut client_params = rcgen::CertificateParams::new(vec![])?;
+    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let client = client_params.signed_by(&client_key, &ca, &ca_key)?;
+    std::fs::write(root.join("server.der"), server.der())?;
+    std::fs::write(root.join("server.key"), server_key.serialize_der())?;
+    std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(root.join("ca.der"), ca.der())?;
+    std::fs::write(root.join("client.der"), client.der())?;
+    std::fs::write(root.join("client.key"), client_key.serialize_der())?;
+    std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
+    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"), root.join("profiles"), &client.der().to_vec())?;
+
+    let mut host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+        .arg("--socket-dir").arg(root.join("host"))
+        .arg("--profile-root").arg(root.join("profiles"))
+        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .stdout(std::fs::File::create(raw_root.join("host.stdout"))?)
+        .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
+        .kill_on_drop(true).spawn()?;
+    std::fs::write(raw_root.join("host.pid"), host.id().expect("Host child pid").to_string())?;
+    wait_socket(root.join("host/host.sock")).await;
+    let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await?;
+    let mut local = BufReader::new(local);
+    let mut line = String::new(); local.read_line(&mut line).await?;
+    let mut state = local_request(&mut local, serde_json::json!({"id":1,"command":{"type":"attach","mode":"agent"}})).await?;
+    let session_id = state["session_id"].as_str().ok_or_else(|| anyhow::anyhow!("Host session identity missing"))?.to_owned();
+    state = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state),"command":{"type":"resize","width":160,"height":120}})).await?;
+    let html = "data:text/html,<style>body{margin:0;background:white}</style><div style='width:160px;height:120px;background:white'></div>";
+    let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state),"command":{"type":"navigate","url":html}})).await?;
+    drop(local);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let reservation = TcpListener::bind((bind_ip, 0)).await?;
+    let address = reservation.local_addr()?; drop(reservation);
+    let receiver_bin = release_binary("obscura-webrtc-receiver");
+    anyhow::ensure!(receiver_bin.is_file(), "Build target/release/obscura-webrtc-receiver with --features webrtc first");
+    let mut endpoint_command = Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"));
+    endpoint_command
+        .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
+        .arg("--socket-dir").arg(root.join("endpoint"))
+        .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
+        .arg("--client-ca").arg(root.join("ca.der"))
+        // The test owns the shared-encoded-frame producer on `encoded.sock`.
+        .arg("--media-bin").arg("/usr/bin/true")
+        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
+        .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
+    endpoint_command
+        .stdout(std::fs::File::create(raw_root.join("endpoint.stdout"))?)
+        .stderr(std::fs::File::create(raw_root.join("endpoint.stderr"))?);
+    let endpoint = endpoint_command.kill_on_drop(true).spawn()?;
+    std::fs::write(raw_root.join("endpoint.pid"), endpoint.id().expect("endpoint child pid").to_string())?;
+    wait_socket(root.join("endpoint/encoded.sock")).await;
+    let producer = tokio::net::UnixStream::connect(root.join("endpoint/encoded.sock")).await?;
+
+    let bytes = obscura_media::encode(std::path::Path::new("ffmpeg"), 160, 120, scripted_scene(160, 120)).await?;
+    anyhow::ensure!(!bytes.is_empty(), "terminal producer got no H.264 access unit");
+    // The producer stays live across the fence so a stream that fails to
+    // terminate keeps delivering admitted-session frames and trips the
+    // receiver's finite deadline instead of silently passing.
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let producer_task = {
+        let session_id = session_id.clone();
+        let bytes = bytes.clone();
+        tokio::spawn(async move {
+            let mut producer = producer;
+            let mut sequence = 0u64;
+            loop {
+                sequence += 1;
+                let packet = scripted_access_unit(&session_id, sequence, bytes.len() as u64);
+                if send_video_packet(&mut producer, &packet, &bytes).await.is_err() { break; }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(300)) => {}
+                    changed = stop_rx.changed() => { if changed.is_err() || *stop_rx.borrow() { break; } }
+                }
+                if *stop_rx.borrow() { break; }
+            }
+            drop(producer);
+        })
+    };
+
+    let ready_file = root.join("ready.json");
+    let mut receiver_command = Command::new(&receiver_bin);
+    receiver_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
+        .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
+        .arg("--frames").arg("3").arg("--skip-click")
+        .arg("--terminal-trigger").arg(mode).arg("--ready-file").arg(&ready_file)
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let receiver = receiver_command.spawn()?;
+    if mode == "none" {
+        // The receiver writes the ready marker only after decoding its first
+        // frame; only then does the external producer close.
+        wait_file(&ready_file, Duration::from_secs(60)).await?;
+        let _ = stop_tx.send(true);
+    }
+
+    let output = receiver.wait_with_output().await?;
+    let phase_dir = raw_root.join("terminal");
+    std::fs::create_dir_all(&phase_dir)?;
+    std::fs::write(phase_dir.join("stdout.txt"), &output.stdout)?;
+    std::fs::write(phase_dir.join("stderr.txt"), &output.stderr)?;
+    std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", output.status.code()))?;
+    anyhow::ensure!(output.status.success(), "terminal receiver failed at {}: {}", raw_root.display(), String::from_utf8_lossy(&output.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(report["pass"] == true, "terminal report not passing: {report}");
+    anyhow::ensure!(report["session_id"].as_str() == Some(session_id.as_str()), "terminal session changed: {report}");
+    let terminal = report["terminal"]["kind"].as_str().ok_or_else(|| anyhow::anyhow!("terminal kind missing: {report}"))?;
+    anyhow::ensure!(!terminal.is_empty(), "terminal kind empty: {report}");
+    let frames = report["frames"].as_array().ok_or_else(|| anyhow::anyhow!("terminal frame evidence missing: {report}"))?;
+    anyhow::ensure!(!frames.is_empty(), "terminal evidence decoded no frames: {report}");
+    for frame in frames {
+        anyhow::ensure!(frame["session_id"].as_str() == Some(session_id.as_str()),
+            "terminal stream carried a non-admitted frame: {frame}");
+    }
+    if mode == "detach" {
+        let receipt = &report["trigger_receipt"];
+        anyhow::ensure!(receipt["type"] == "result" && receipt["id"] == 200, "detach produced no correlated result receipt: {report}");
+        anyhow::ensure!(receipt["value"]["attachment_id"].is_null(),
+            "detach receipt still reports an attachment: {receipt}");
+    }
+    if mode == "rebind" {
+        let receipt = &report["trigger_receipt"];
+        anyhow::ensure!(receipt["type"] == "result" && receipt["id"] == 200, "rebind produced no correlated result receipt: {report}");
+        let rebound = receipt["value"]["binding"]["session_id"].as_str().unwrap_or("");
+        anyhow::ensure!(!rebound.is_empty() && rebound != session_id,
+            "rebind receipt did not move the attachment to a new session: {receipt}");
+    }
+
+    if mode != "none" {
+        // The fence terminal must not have consumed the endpoint: a fresh
+        // authorized attachment still receives the live producer stream.
+        let fresh = run_receiver(&receiver_bin, address, &root, &raw_root, &format!("after-{mode}"), true, false, false).await?;
+        anyhow::ensure!(fresh.status.success(), "fresh authorized attachment failed after {mode}: {}", String::from_utf8_lossy(&fresh.stderr));
+        let fresh_report: serde_json::Value = serde_json::from_slice(&fresh.stdout)?;
+        anyhow::ensure!(fresh_report["pass"] == true && fresh_report["session_id"].as_str() == Some(session_id.as_str()),
+            "fresh authorized attachment evidence missing after {mode}: {fresh_report}");
+    }
+
+    let _ = stop_tx.send(true);
+    let _ = producer_task.await;
+    let mut endpoint = endpoint;
+    let _ = endpoint.kill().await;
+    let _ = endpoint.wait().await;
+    let _ = host.kill().await;
+    let _ = host.wait().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+async fn wait_file(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !path.exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "ready marker was not written: {}", path.display());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
 async fn run_receiver(binary: &PathBuf, address: std::net::SocketAddr, root: &PathBuf, raw_root: &PathBuf, phase: &str, skip_click: bool, bad_binding: bool, expect_encoder_error: bool) -> anyhow::Result<std::process::Output> {
     let mut command = Command::new(binary);
     command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
@@ -445,15 +646,20 @@ fn write_authorized(registry_path: PathBuf, projection_path: PathBuf, profile_ro
     std::fs::write(&projection_path, serde_json::to_vec(&projection)?)?;
     let members = serde_json::json!(["local", "test-device"]);
     let catalog = serde_json::json!({
-        "catalog_revision": 1,
+        "catalog_revision": 2,
         "profiles": [{
             "profile_id": "default",
             "display_name": "Default",
             "default": true,
             "access": {"owner_device_id": "local", "members": members}
+        }, {
+            "profile_id": "p1",
+            "display_name": "Rebind Target",
+            "default": false,
+            "access": {"owner_device_id": "local", "members": members}
         }],
         "default_profile_id": "default",
-        "next_id": 1
+        "next_id": 2
     });
     std::fs::create_dir_all(&profile_root)?;
     std::fs::write(profile_root.join("catalog.json"), serde_json::to_string_pretty(&catalog)?)?;
@@ -465,6 +671,19 @@ fn release_binary(name: &str) -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/release"))
         .join(name)
+}
+
+/// Root for per-case raw WebRTC evidence. `OBSCURA_WEBRTC_RAW_DIR` redirects
+/// generated fixtures to an external record directory; the default keeps the
+/// historical public evidence path for the original harness.
+fn raw_webrtc_root(prefix: &str) -> PathBuf {
+    std::env::var_os("OBSCURA_WEBRTC_RAW_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../docs/runs/m1-frame-forwarding-impl-r1-20261005/raw/webrtc")
+        })
+        .join(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()))
 }
 
 async fn local_request(socket: &mut BufReader<tokio::net::UnixStream>, request: serde_json::Value) -> anyhow::Result<serde_json::Value> {

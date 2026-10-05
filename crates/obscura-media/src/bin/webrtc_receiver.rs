@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use std::{collections::BTreeMap, net::{IpAddr, SocketAddr}, path::PathBuf, sync::Arc, time::{Duration, Instant}};
+use std::{collections::BTreeMap, net::{IpAddr, SocketAddr}, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, Instant}};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
@@ -18,7 +18,7 @@ use tokio_rustls::{TlsConnector, rustls::{self, pki_types::{CertificateDer, Priv
 use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}, WebSocketStream};
 use webrtc_rs::{data_channel::{DataChannel, DataChannelEvent}, media_stream::track_remote::{TrackRemote, TrackRemoteEvent},
     peer_connection::{PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfiguration,
-        RTCIceGatheringState, RTCSessionDescription}};
+        RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription}};
 
 use obscura_media::webrtc::h264_media_engine;
 
@@ -26,6 +26,8 @@ const DEADLINE: Duration = Duration::from_secs(20);
 const H264_CLOCK_RATE: u32 = 90_000;
 const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 const MAX_ASSOCIATIONS: usize = 64;
+/// Correlated request id for the one fence the receiver triggers in terminal mode.
+const TRIGGER_REQUEST_ID: u64 = 200;
 const INPUT_FIXTURE: &str = "data:text/html,<style>body{margin:0}button{position:absolute;left:10px;top:10px;width:120px;height:50px;background:red}input{position:absolute;left:10px;top:80px;width:130px;height:30px}.space{height:3000px;margin-top:150px}</style><button id='target' onclick=\"window.clicks=(window.clicks||0)+1;this.style.background='lime'\">target</button><input id='text'><div class='space'></div>";
 
 #[derive(Parser)]
@@ -43,6 +45,16 @@ struct Args {
     #[arg(long, default_value_t = false)] skip_click: bool,
     #[arg(long, default_value_t = false)] bad_binding: bool,
     #[arg(long, default_value_t = false)] expect_encoder_error: bool,
+    /// Keep the authenticated attachment active and observe a terminal instead
+    /// of exiting after `frames`. `off` preserves the historical behavior.
+    /// `none` waits for the producer/source to close; `detach` and `rebind`
+    /// trigger a typed Host fence after the first decoded frame.
+    #[arg(long, default_value = "off")] terminal_trigger: String,
+    /// Written once the first frame is decoded, so an external producer can
+    /// close the source at a known active point.
+    #[arg(long)] ready_file: Option<PathBuf>,
+    /// Finite seconds to wait for the terminal after the trigger.
+    #[arg(long)] terminal_timeout: Option<f64>,
 }
 
 type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -75,11 +87,16 @@ async fn main() -> Result<()> {
     };
     let gather = Arc::new(Notify::new());
     let (track_tx, mut track_rx) = mpsc::channel(1);
+    let terminal = Arc::new(Notify::new());
+    let terminal_state = Arc::new(Mutex::new(None::<String>));
     let peer: Arc<dyn PeerConnection> = Arc::new(
         PeerConnectionBuilder::new()
             .with_configuration(RTCConfiguration::default())
             .with_media_engine(h264_media_engine()?)
-            .with_handler(Arc::new(ReceiverHandler { gather: Arc::clone(&gather), track_tx }))
+            .with_handler(Arc::new(ReceiverHandler {
+                gather: Arc::clone(&gather), track_tx,
+                terminal: Arc::clone(&terminal), terminal_state: Arc::clone(&terminal_state),
+            }))
             .with_udp_addrs(vec![SocketAddr::new(args.bind_ip, 0)])
             .build()
             .await
@@ -148,6 +165,10 @@ async fn main() -> Result<()> {
     wait_for_pong(&mut control_rx, &mut media, &session_id, 3).await?;
     let track = timeout(DEADLINE, track_rx.recv()).await.context("timed out waiting for Host H.264 track")?
         .context("Host WebRTC track ended before media")?;
+    if args.terminal_trigger != "off" {
+        return run_terminal_mode(&args, &mut control, &mut control_rx, &track, &mut media,
+            &session_id, attachment_id, &attached, terminal, terminal_state).await;
+    }
     let mut evidence = Vec::new();
     let mut browser_path_done = args.skip_click;
     let mut status = attached;
@@ -349,31 +370,173 @@ async fn main() -> Result<()> {
         },
         "session_id": session_id,
         "attachment_id": attachment_id,
-        "frames": evidence.iter().map(|frame| serde_json::json!({
-            "sequence": frame.descriptor.source.sequence,
-            "document_revision": frame.descriptor.source.document_revision,
-            "viewport_revision": frame.descriptor.source.viewport_revision,
-            "session_id": frame.descriptor.source.session_id,
-            "width": frame.descriptor.source.width,
-            "height": frame.descriptor.source.height,
-            "stride": frame.descriptor.source.stride,
-            "source_byte_length": frame.descriptor.source.byte_length,
-            "encoder_id": frame.descriptor.encoder_id,
-            "rtp_timestamp": frame.descriptor.rtp_timestamp,
-            "codec": frame.descriptor.codec,
-            "keyframe": frame.descriptor.keyframe,
-            "access_unit_bytes": frame.descriptor.access_unit_bytes,
-            "coded_width": frame.descriptor.coded_width,
-            "coded_height": frame.descriptor.coded_height,
-            "pts_us": frame.descriptor.pts_us,
-            "checksum": frame.checksum,
-            "rtp_packets": frame.rtp_packets,
-            "changed": frame.changed,
-        })).collect::<Vec<_>>(),
+        "frames": evidence.iter().map(frame_json).collect::<Vec<_>>(),
     }));
     control_reader.abort();
     let _ = control_reader.await;
     let _ = peer.close().await;
+    Ok(())
+}
+
+fn frame_json(frame: &FrameEvidence) -> serde_json::Value {
+    serde_json::json!({
+        "sequence": frame.descriptor.source.sequence,
+        "document_revision": frame.descriptor.source.document_revision,
+        "viewport_revision": frame.descriptor.source.viewport_revision,
+        "session_id": frame.descriptor.source.session_id,
+        "width": frame.descriptor.source.width,
+        "height": frame.descriptor.source.height,
+        "stride": frame.descriptor.source.stride,
+        "source_byte_length": frame.descriptor.source.byte_length,
+        "encoder_id": frame.descriptor.encoder_id,
+        "rtp_timestamp": frame.descriptor.rtp_timestamp,
+        "codec": frame.descriptor.codec,
+        "keyframe": frame.descriptor.keyframe,
+        "access_unit_bytes": frame.descriptor.access_unit_bytes,
+        "coded_width": frame.descriptor.coded_width,
+        "coded_height": frame.descriptor.coded_height,
+        "pts_us": frame.descriptor.pts_us,
+        "checksum": frame.checksum,
+        "rtp_packets": frame.rtp_packets,
+        "changed": frame.changed,
+    })
+}
+
+/// Observed end of an authenticated WebRTC stream. Recorded as public evidence
+/// instead of being treated as a transport error.
+enum Terminal {
+    ControlError { code: String, message: String },
+    DataChannelClosed { detail: String },
+    TrackEnded,
+    PeerState(String),
+}
+
+impl Terminal {
+    fn json(&self) -> serde_json::Value {
+        match self {
+            Terminal::ControlError { code, message } => serde_json::json!({"kind": "control_error", "code": code, "message": message}),
+            Terminal::DataChannelClosed { detail } => serde_json::json!({"kind": "data_channel_closed", "detail": detail}),
+            Terminal::TrackEnded => serde_json::json!({"kind": "track_ended"}),
+            Terminal::PeerState(state) => serde_json::json!({"kind": "peer_state", "state": state}),
+        }
+    }
+}
+
+/// Stay authenticated and active while a typed Host fence or the encoded
+/// producer closes. The receiver triggers the fence itself (detach/rebind) only
+/// after the first decoded frame, or waits for the external producer to close
+/// (`none`), then reports the terminal it actually observed. Every decoded
+/// frame must belong to the admitted session, so a replacement binding cannot
+/// leak into the old stream.
+async fn run_terminal_mode(
+    args: &Args,
+    control: &mut Socket,
+    control_rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
+    track: &Arc<dyn TrackRemote>,
+    media: &mut MediaAssociations,
+    session_id: &str,
+    attachment_id: u64,
+    status: &SessionStatus,
+    terminal: Arc<Notify>,
+    terminal_state: Arc<Mutex<Option<String>>>,
+) -> Result<()> {
+    let trigger = args.terminal_trigger.as_str();
+    let wait_secs = args.terminal_timeout.unwrap_or(DEADLINE.as_secs_f64()).max(1.0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(wait_secs);
+    let mut evidence: Vec<FrameEvidence> = Vec::new();
+    let mut last_sequence = None;
+    let mut last_pts = None;
+    let mut last_encoder_id = None;
+    let mut last_dimensions = None;
+    let mut last_checksum = None;
+    let mut triggered = false;
+    let mut frames_at_trigger = 0usize;
+    let mut trigger_receipt: Option<serde_json::Value> = None;
+    let observed = loop {
+        while let Some((rtp_timestamp, descriptor, sample)) = media.take_matching() {
+            validate_video_frame(&descriptor, &sample, rtp_timestamp, session_id, &mut last_sequence, &mut last_pts,
+                &mut last_encoder_id, &mut last_dimensions)?;
+            let decoded = decode_sample(&sample.data, descriptor.coded_width, descriptor.coded_height).await?;
+            let changed = last_checksum.is_some_and(|checksum| checksum != decoded.checksum);
+            last_checksum = Some(decoded.checksum);
+            evidence.push(FrameEvidence { descriptor, checksum: decoded.checksum, rtp_packets: sample.packet_count, changed });
+        }
+        if !triggered && !evidence.is_empty() {
+            triggered = true;
+            frames_at_trigger = evidence.len();
+            if let Some(path) = &args.ready_file {
+                std::fs::write(path, serde_json::to_vec(&serde_json::json!({
+                    "ready": true, "session_id": session_id, "attachment_id": attachment_id, "frames": evidence.len(),
+                }))?)?;
+            }
+            match trigger {
+                "none" => {}
+                "detach" => {
+                    send_json(control, &Request { id: TRIGGER_REQUEST_ID, command: Command::Detach {}, operation: None }).await?;
+                    trigger_receipt = Some(serde_json::to_value(
+                        read_control_response(control, TRIGGER_REQUEST_ID, deadline).await?)?);
+                }
+                "rebind" => {
+                    send_json(control, &Request {
+                            id: TRIGGER_REQUEST_ID,
+                            command: Command::ProfileSelect { profile_id: "p1".into() },
+                            operation: Some(operation_for(status)?),
+                    }).await?;
+                    trigger_receipt = Some(serde_json::to_value(
+                        read_control_response(control, TRIGGER_REQUEST_ID, deadline).await?)?);
+                }
+                other => bail!("unknown terminal trigger {other:?}"),
+            }
+        }
+        if let Some(state) = terminal_state.lock().expect("terminal state").clone() {
+            break Terminal::PeerState(state);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                bail!("terminal not observed before deadline (trigger={trigger}, triggered={triggered}, frames={}, samples={})",
+                    evidence.len(), media.samples.len());
+            }
+            _ = terminal.notified() => {
+                if let Some(state) = terminal_state.lock().expect("terminal state").clone() {
+                    break Terminal::PeerState(state);
+                }
+            }
+            message = control_rx.recv() => match message {
+                None => break Terminal::DataChannelClosed { detail: "WebRTC DataChannel reader ended".into() },
+                Some(Err(error)) => break Terminal::DataChannelClosed { detail: error.to_string() },
+                Some(Ok(WebRtcControlMessage::VideoFrame { descriptor })) => media.accept_descriptor(descriptor, session_id)?,
+                Some(Ok(WebRtcControlMessage::Pong { .. })) => {},
+                // The fence request is issued on the mTLS control socket, so its
+                // correlated result never arrives on the WebRTC DataChannel.
+                Some(Ok(WebRtcControlMessage::BrowserResponse { .. })) => {},
+                Some(Ok(WebRtcControlMessage::Error { code, message })) => break Terminal::ControlError { code, message },
+                Some(Ok(other)) => bail!("unexpected Host WebRTC control message while observing terminal: {other:?}"),
+            },
+            event = track.poll() => match event {
+                Some(TrackRemoteEvent::OnRtpPacket(packet)) => media.accept_track_event(TrackRemoteEvent::OnRtpPacket(packet))?,
+                Some(TrackRemoteEvent::OnError) | Some(TrackRemoteEvent::OnEnded) => break Terminal::TrackEnded,
+                Some(other) => media.accept_track_event(other)?,
+                None => break Terminal::TrackEnded,
+            },
+        }
+    };
+    let leaked: Vec<String> = evidence.iter()
+        .filter(|frame| frame.descriptor.source.session_id != session_id)
+        .map(|frame| frame.descriptor.source.session_id.clone())
+        .collect();
+    ensure!(leaked.is_empty(), "replacement binding frame leaked to the old authenticated stream: {leaked:?}");
+    println!("{}", serde_json::json!({
+        "pass": true,
+        "browser_path": "webrtc_data_channel",
+        "session_id": session_id,
+        "attachment_id": attachment_id,
+        "trigger": trigger,
+        "frames_at_trigger": frames_at_trigger,
+        "frames_after_trigger": evidence.len().saturating_sub(frames_at_trigger),
+        "terminal": observed.json(),
+        "trigger_receipt": trigger_receipt,
+        "frames": evidence.iter().map(frame_json).collect::<Vec<_>>(),
+    }));
     Ok(())
 }
 
@@ -673,6 +836,20 @@ async fn next_response(socket: &mut Socket) -> Result<Response> {
     }
 }
 
+/// Read the correlated Host result for a fence request sent on the mTLS control
+/// socket. The control socket is independent of the WebRTC peer, so a
+/// detach/rebind receipt is delivered even when the fence tears the old media
+/// stream down.
+async fn read_control_response(socket: &mut Socket, request_id: u64, deadline: tokio::time::Instant) -> Result<Response> {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        ensure!(!remaining.is_zero(), "control response for request {request_id} not observed before deadline");
+        let response = timeout(remaining, next_response(socket)).await
+            .context("timed out waiting for correlated control response")??;
+        if response_id(&response) == Some(request_id) { return Ok(response); }
+    }
+}
+
 async fn next_signal(socket: &mut Socket) -> Result<WebRtcSignal> {
     loop {
         match socket.next().await.context("signaling socket ended")?? {
@@ -743,12 +920,28 @@ async fn decode_sample(data: &[u8], width: u32, height: u32) -> Result<Decoded> 
     Ok(Decoded { checksum })
 }
 
-struct ReceiverHandler { gather: Arc<Notify>, track_tx: mpsc::Sender<Arc<dyn TrackRemote>> }
+struct ReceiverHandler {
+    gather: Arc<Notify>,
+    track_tx: mpsc::Sender<Arc<dyn TrackRemote>>,
+    terminal: Arc<Notify>,
+    terminal_state: Arc<Mutex<Option<String>>>,
+}
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for ReceiverHandler {
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
         if state == RTCIceGatheringState::Complete { self.gather.notify_one(); }
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        let name = match state {
+            RTCPeerConnectionState::Failed => "failed",
+            RTCPeerConnectionState::Closed => "closed",
+            RTCPeerConnectionState::Disconnected => "disconnected",
+            _ => return,
+        };
+        *self.terminal_state.lock().expect("terminal state") = Some(name.to_string());
+        self.terminal.notify_one();
     }
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
