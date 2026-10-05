@@ -24,6 +24,7 @@ Sole target lease: /Volumes/Intel/playground/obscura/m1-engine-reconcile-2026100
 | 2026-10-05T00:00:02Z | full workspace gate | partial | raw/full/stderr.txt exit 100: 1775 run, 1774 passed (4 leaky), 1 failed, 4 skipped; single FAIL line is the known WebRTC product failure, confirmed by grepping raw/full/stderr.txt. raw/webrtc/ow-c0471fef01df42d7a8c05d9a416dea1d/endpoint.stderr still has exactly 1 "regressed or repeated" | cargo nextest run --locked --release --features render --no-fail-fast | release build + obstacle course |
 | 2026-10-05T00:02:00Z | release build host+cli | done | raw/build/stderr.txt exit 0, Finished release profile in 0.88s | cargo build --locked --release --features render -p obscura-host -p obscura-cli --bins | obstacle course |
 | 2026-10-05T00:04:00Z | obstacle course | done | raw/obstacle/stdout.txt exit 0: correctness 33/33 stages passed, median latency 3022.8ms | cwd /Volumes/Intel/playground/obscura-benchmark/m1-io-serial-repair-20261002 at 8bd11ade523fd7358c7b1fddc398b48e9040c3c9; OBSCURA_BIN=sole target/release/obscura sha256 b56c9a0d047b3672283f0967ddda7f23c82dee1e7917d3896ee1bb6b811ef521 | commit + cleanup |
+| 2026-10-05T00:07:00Z | commit | done | HEAD c60c68755515965189e67c4b0a8e37490593f7ab, tree 40aa8d9866de8ea2371bdf1c2f6e5f1fb07e173e; working tree clean; base-to-head only allowed paths | git commit -m "test: public gate r3 fixtures and WebRTC diagnosis" | final report |
 
 ## Artifact receipts
 
@@ -35,6 +36,17 @@ All under /Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/
 | obscura-endpoint | eb29958e9415cdaf0a2695b0eabfc7ab11563aad3abf9c10d83dc0462b96465d | Oct  4 15:48:28 2026 |
 | obscura-media | a7a65f21b65aacac2c6ce87aabae6be192bfd28c7339661658cbbc0fc3305961 | Oct  4 16:06:46 2026 |
 | obscura-webrtc-receiver | 5b6ae487b773c57ed837f95dcc6940316e78f66ed82c14a638659fa2245cec8f | Oct  4 16:06:57 2026 |
+
+Final receipts after the full gate rebuild (source unchanged; host/endpoint/test deps rebuilt
+from the same tree).
+
+| Binary | sha256 | mtime |
+|---|---|---|
+| obscura | b56c9a0d047b3672283f0967ddda7f23c82dee1e7917d3896ee1bb6b811ef521 | Oct  4 16:50:16 2026 |
+| obscura-host | 1ccaec7c2809b1bf6e8b4080b7206152566f69421060724b9bbbb069f94a4249 | Oct  4 16:53:58 2026 |
+| obscura-endpoint | aed448149635227b12d4a74660fd570173f049c677c8efa03adc82e5b1fab9e4 | Oct  4 16:54:39 2026 |
+| obscura-media | c674ae0e0a96cfff0a6708b8878635d804ace5a9adcb40442f19b6a0dd409b13 | Oct  4 16:56:17 2026 |
+| obscura-webrtc-receiver | c23390faac5b963389f0f25ecf5e884f409900d2443f21f439fadd16512c70fc | Oct  4 16:56:33 2026 |
 
 ## Owned process state
 
