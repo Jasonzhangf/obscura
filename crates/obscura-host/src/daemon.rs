@@ -1165,6 +1165,9 @@ fn handle_admin(
             if let Some(attempt_id) = request.attempt_id.as_deref() {
                 if let Some((stored, response)) = state.replay.get(attempt_id) {
                     if stored.same_attempt(&request) {
+                        if response.catalog_revision != Some(catalog.catalog_revision()) {
+                            return admin_error(id, "CATALOG_REVISION_CONFLICT", "attempt replay is stale relative to the committed catalog");
+                        }
                         let mut replayed = response.clone();
                         replayed.id = id;
                         return replayed;

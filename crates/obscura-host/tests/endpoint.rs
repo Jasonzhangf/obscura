@@ -263,6 +263,438 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// Minimal endpoint fixtures for the applied-receipt cases: a self-signed CA,
+/// one server certificate and one authorized client. The receipt cases never
+/// admit a peer, so no Host is required.
+struct ReceiptFixtures {
+    root: PathBuf,
+}
+
+impl ReceiptFixtures {
+    fn create() -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let root = PathBuf::from("/tmp").join(format!("oer-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        std::fs::create_dir_all(&root).unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Obscura endpoint receipt test CA");
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap()
+            .signed_by(&server_key, &ca, &ca_key).unwrap();
+        let client_key = rcgen::KeyPair::generate().unwrap();
+        let mut client_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
+        std::fs::write(root.join("server.der"), server.der()).unwrap();
+        std::fs::write(root.join("server.key"), server_key.serialize_der()).unwrap();
+        std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(root.join("ca.der"), ca.der()).unwrap();
+        let projection = serde_json::json!({
+            "schema_version": 2,
+            "authorization_revision": 7,
+            "registry_sha256": "cc".repeat(32),
+            "clients": [{
+                "device_id": "receipt-device",
+                "client_certificate_sha256": hex(&Sha256::digest(client.der())),
+                "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
+                "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 7}
+            }]
+        });
+        std::fs::write(root.join("authorized-clients.json"), serde_json::to_vec_pretty(&projection).unwrap()).unwrap();
+        Self { root }
+    }
+
+    fn endpoint_command(&self, address: std::net::SocketAddr, receipt: &std::path::Path, generation: u64) -> tokio::process::Command {
+        let media = PathBuf::from(env!("CARGO_BIN_EXE_obscura-host")).with_file_name("obscura-media");
+        assert!(media.is_file(), "Build obscura-media before endpoint acceptance");
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"));
+        command.arg("--listen").arg(address.to_string())
+            .arg("--host-dir").arg(self.root.join("host"))
+            .arg("--socket-dir").arg(self.root.join("endpoint"))
+            .arg("--server-cert").arg(self.root.join("server.der"))
+            .arg("--server-key").arg(self.root.join("server.key"))
+            .arg("--client-ca").arg(self.root.join("ca.der"))
+            .arg("--authorized-clients").arg(self.root.join("authorized-clients.json"))
+            .arg("--media-bin").arg(media)
+            .arg("--applied-receipt-path").arg(receipt)
+            .arg("--endpoint-generation").arg(generation.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        command
+    }
+}
+
+impl Drop for ReceiptFixtures {
+    fn drop(&mut self) {
+        if self.root.exists() { let _ = std::fs::remove_dir_all(&self.root); }
+    }
+}
+
+async fn wait_absent(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while path.exists() {
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+#[tokio::test]
+async fn applied_receipt_is_written_after_bind_with_v1_shape_and_0600() {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let fixtures = ReceiptFixtures::create();
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let receipt_path = fixtures.root.join("endpoint-applied").join("3.json");
+        let mut endpoint = fixtures.endpoint_command(address, &receipt_path, 3).spawn().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while !receipt_path.exists() {
+            assert!(endpoint.try_wait().unwrap().is_none(), "endpoint exited before writing the receipt");
+            assert!(tokio::time::Instant::now() < deadline, "applied receipt did not appear");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mode = std::fs::metadata(&receipt_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "applied receipt must be owner-only");
+        let raw = std::fs::read_to_string(&receipt_path).unwrap();
+        let receipt: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(receipt["schema_version"], 1);
+        assert_eq!(receipt["endpoint_generation"], 3);
+        assert!(receipt.get("status").is_none(), "applied receipt must not carry a status field: {receipt}");
+        assert_eq!(receipt["authorization_revision"], 7);
+        assert_eq!(receipt["registry_sha256"], "cc".repeat(32));
+        assert_eq!(receipt["projection_sha256"].as_str().unwrap().len(), 64);
+        let bound: std::net::SocketAddr = receipt["bound_address"].as_str().unwrap().parse().unwrap();
+        assert_eq!(bound, address);
+        let pid = receipt["endpoint_pid"].as_u64().unwrap() as u32;
+        assert_eq!(Some(pid), endpoint.id(), "receipt pid must be the real endpoint process");
+        // Safety: signal 0 is an existence check on the explicit endpoint pid.
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0, "receipt pid is not live");
+        assert!(!receipt_path.with_extension("json.tmp").exists(), "temp file must be renamed away");
+        // Terminate only the endpoint this test spawned.
+        let _ = unsafe { libc::kill(endpoint.id().unwrap() as i32, libc::SIGTERM) };
+        let _ = endpoint.wait().await;
+    }).await.expect("applied receipt case timed out");
+}
+
+#[tokio::test]
+async fn applied_receipt_is_absent_when_listener_bind_fails() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let fixtures = ReceiptFixtures::create();
+        // Hold the port so the endpoint's bind fails before any receipt write.
+        let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = occupied.local_addr().unwrap();
+        let receipt_path = fixtures.root.join("endpoint-applied").join("4.json");
+        let mut endpoint = fixtures.endpoint_command(address, &receipt_path, 4).spawn().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if endpoint.try_wait().unwrap().is_some() { break; }
+            assert!(tokio::time::Instant::now() < deadline, "endpoint did not exit after a bind failure");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!receipt_path.exists(), "a failed bind must not publish an applied receipt");
+        drop(occupied);
+    }).await.expect("bind-failure receipt case timed out");
+}
+
+// ---------------------------------------------------------------------------
+// BB-EX-MEDIA-35
+//
+// Healthy final-reference release reaches the finalizer before the reader is
+// stopped and joined. Two exact sessions A and B run through the real Host and
+// endpoint. The case releases A's final control reference while A's
+// encoder-control reader is live, then observes only A's public media consumer,
+// A's adapter process and exit status, the wrapper group state, and the
+// per-session socket/directory listing.
+// ---------------------------------------------------------------------------
+
+fn media_packet_header(bytes: &[u8]) -> serde_json::Value {
+    assert!(bytes.len() >= 4, "media frame header is truncated");
+    let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+    assert!(bytes.len() >= 4 + length, "media frame payload is truncated");
+    serde_json::from_slice(&bytes[4..4 + length]).unwrap()
+}
+
+/// Read one media frame that belongs to the expected exact session, skipping
+/// `waiting` placeholders for other sessions.
+async fn media_frame(
+    video: &mut (impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+    expected_session: &str,
+) -> serde_json::Value {
+    loop {
+        let message = video.next().await.expect("media channel ended before a frame").expect("media read failed");
+        let Message::Binary(bytes) = message else { continue; };
+        let header = media_packet_header(&bytes);
+        if header["type"] == "waiting" { continue; }
+        if let Some(session) = header["source"]["session_id"].as_str() {
+            assert_eq!(session, expected_session, "media consumer observed a foreign session: {header}");
+        }
+        return header;
+    }
+}
+
+async fn wait_dir(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !path.exists() {
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+/// Read A's public media consumer to its explicit terminal. Returns the
+/// terminal header (`closed` or `unavailable`).
+async fn media_terminal(
+    video: &mut (impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin),
+) -> serde_json::Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(!remaining.is_zero(), "A's media consumer did not reach a terminal");
+        let message = match tokio::time::timeout(remaining, video.next()).await {
+            Ok(Some(Ok(message))) => message,
+            Ok(Some(Err(_))) | Ok(None) => return serde_json::json!({"type": "transport_end"}),
+            Err(_) => panic!("A's media consumer did not reach a terminal within the bound"),
+        };
+        let Message::Binary(bytes) = message else { continue; };
+        let header = media_packet_header(&bytes);
+        if matches!(header["type"].as_str(), Some("closed") | Some("unavailable")) { return header; }
+    }
+}
+
+async fn connect_endpoint_control(
+    connector: &tokio_rustls::TlsConnector,
+    address: std::net::SocketAddr,
+) -> (tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String) {
+    let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
+    let (control, response) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await.unwrap();
+    let token = response.headers()["x-obscura-media-token"].to_str().unwrap().to_string();
+    (control, token)
+}
+
+async fn endpoint_ready(control: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>) -> serde_json::Value {
+    let message = control.next().await.unwrap().unwrap();
+    let text = message.into_text().unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+async fn open_media_consumer(
+    connector: &tokio_rustls::TlsConnector,
+    address: std::net::SocketAddr,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>> {
+    let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
+    let mut request = format!("wss://localhost:{}/media", address.port()).into_client_request().unwrap();
+    request.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+    let (video, _) = client_async(request, tls).await.unwrap();
+    video
+}
+
+async fn write_two_session_fixtures(root: &std::path::Path, client_a: &[u8], client_b: &[u8]) {
+    let fingerprint_a = hex(&Sha256::digest(client_a));
+    let fingerprint_b = hex(&Sha256::digest(client_b));
+    let scopes = serde_json::json!(["observe_human_control", "profile_read", "profile_create", "profile_select"]);
+    let registry = serde_json::json!({
+        "schema_version": 2,
+        "authorization_revision": 1,
+        "host_id": "host-bb35",
+        "devices": [
+            {
+                "device_id": "device-a", "device_label": "session a",
+                "client_certificate_sha256": fingerprint_a, "scopes": scopes,
+                "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 1},
+                "scope_revision": 1, "status": "active",
+                "not_before_unix": 0, "not_after_unix": 4102444800i64,
+                "created_at_unix": 0, "revoked_at_unix": null
+            },
+            {
+                "device_id": "device-b", "device_label": "session b",
+                "client_certificate_sha256": fingerprint_b, "scopes": scopes,
+                "initial_profile_grant": {"selection": {"profile_id": "p1"}, "authorization_revision": 1},
+                "scope_revision": 1, "status": "active",
+                "not_before_unix": 0, "not_after_unix": 4102444800i64,
+                "created_at_unix": 0, "revoked_at_unix": null
+            }
+        ]
+    });
+    std::fs::write(root.join("registry.json"), serde_json::to_vec(&registry).unwrap()).unwrap();
+    let projection = serde_json::json!({
+        "schema_version": 2,
+        "authorization_revision": 1,
+        "registry_sha256": "dd".repeat(32),
+        "clients": [
+            {
+                "device_id": "device-a", "client_certificate_sha256": fingerprint_a, "scopes": scopes,
+                "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 1}
+            },
+            {
+                "device_id": "device-b", "client_certificate_sha256": fingerprint_b, "scopes": scopes,
+                "initial_profile_grant": {"selection": {"profile_id": "p1"}, "authorization_revision": 1}
+            }
+        ]
+    });
+    std::fs::write(root.join("authorized-clients.json"), serde_json::to_vec(&projection).unwrap()).unwrap();
+    let members = serde_json::json!(["local", "device-a", "device-b"]);
+    let catalog = serde_json::json!({
+        "catalog_revision": 2,
+        "profiles": [
+            {"profile_id": "default", "display_name": "Default", "default": true,
+             "access": {"owner_device_id": "local", "members": members}},
+            {"profile_id": "p1", "display_name": "Secondary", "default": false,
+             "access": {"owner_device_id": "local", "members": members}}
+        ],
+        "default_profile_id": "default",
+        "next_id": 2
+    });
+    std::fs::create_dir_all(root.join("profiles")).unwrap();
+    std::fs::write(root.join("profiles/catalog.json"), serde_json::to_string_pretty(&catalog).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn exact_session_final_release_runs_finalizer_before_reader_join() {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    tokio::time::timeout(Duration::from_secs(180), async {
+        let root = PathBuf::from("/tmp").join(format!("ob35-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Obscura bb35 CA");
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap()
+            .signed_by(&server_key, &ca, &ca_key).unwrap();
+        let client_a_key = rcgen::KeyPair::generate().unwrap();
+        let client_b_key = rcgen::KeyPair::generate().unwrap();
+        let mut client_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+        let client_a = client_params.clone().signed_by(&client_a_key, &ca, &ca_key).unwrap();
+        let client_b = client_params.clone().signed_by(&client_b_key, &ca, &ca_key).unwrap();
+        std::fs::write(root.join("server.der"), server.der()).unwrap();
+        std::fs::write(root.join("server.key"), server_key.serialize_der()).unwrap();
+        std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(root.join("ca.der"), ca.der()).unwrap();
+        write_two_session_fixtures(&root, &client_a.der().to_vec(), &client_b.der().to_vec()).await;
+
+        let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+            .arg("--socket-dir").arg(root.join("host"))
+            .arg("--profile-root").arg(root.join("profiles"))
+            .arg("--authorization-registry").arg(root.join("registry.json"))
+            .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        wait_socket(root.join("host/host.sock")).await;
+        let mut local = BufReader::new(tokio::net::UnixStream::connect(root.join("host/host.sock")).await.unwrap());
+        let mut line = String::new(); local.read_line(&mut line).await.unwrap();
+        let mut state_a = local_request(&mut local, serde_json::json!({"id":1,"command":{"type":"attach","mode":"agent"}})).await;
+        let session_a = state_a["session_id"].as_str().unwrap().to_string();
+        let html = "data:text/html,<style>body{margin:0;background:white}button{width:80px;height:80px;border:0;background:red}</style><button id='t'>t</button>";
+        state_a = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state_a),"command":{"type":"resize","width":160,"height":120}})).await;
+        let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state_a),"command":{"type":"navigate","url":html}})).await;
+        let bound = local_request(&mut local, serde_json::json!({"id":4,"operation":identity(&state_a),"command":{"type":"profile_select","profile_id":"p1"}})).await;
+        let session_b = bound["status"]["session_id"].as_str().unwrap().to_string();
+        assert_ne!(session_a, session_b, "two profiles must resolve to two sessions");
+        // p1 is materialized as its own exact session; the observer rebind gives
+        // it a live page and a frame source for the second adapter.
+        drop(local);
+
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = reservation.local_addr().unwrap();
+        drop(reservation);
+        let media_bin = PathBuf::from(env!("CARGO_BIN_EXE_obscura-host")).with_file_name("obscura-media");
+        assert!(media_bin.is_file(), "Build obscura-media before endpoint acceptance");
+        let mut endpoint = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"))
+            .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
+            .arg("--socket-dir").arg(root.join("endpoint"))
+            .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
+            .arg("--client-ca").arg(root.join("ca.der")).arg("--authorized-clients").arg(root.join("authorized-clients.json"))
+            .arg("--media-bin").arg(&media_bin)
+            .stdout(Stdio::null()).stderr(std::fs::File::create(root.join("endpoint.err")).unwrap()).kill_on_drop(true).spawn().unwrap();
+        wait_socket(root.join("endpoint")).await;
+
+        let mut roots = rustls::RootCertStore::empty(); roots.add(ca.der().clone()).unwrap();
+        let client_a_config = rustls::ClientConfig::builder().with_root_certificates(roots.clone())
+            .with_client_auth_cert(vec![client_a.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_a_key.serialize_der()))).unwrap();
+        let client_b_config = rustls::ClientConfig::builder().with_root_certificates(roots)
+            .with_client_auth_cert(vec![client_b.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_b_key.serialize_der()))).unwrap();
+        let connector_a = tokio_rustls::TlsConnector::from(Arc::new(client_a_config));
+        let connector_b = tokio_rustls::TlsConnector::from(Arc::new(client_b_config));
+
+        let (mut control_a, token_a) = connect_endpoint_control(&connector_a, address).await;
+        let ready_a = endpoint_ready(&mut control_a).await;
+        assert_eq!(ready_a["version"], 11);
+        assert_eq!(ready_a["session_id"].as_str(), Some(session_a.as_str()));
+        let (mut control_b, token_b) = connect_endpoint_control(&connector_b, address).await;
+        let ready_b = endpoint_ready(&mut control_b).await;
+        assert_eq!(ready_b["version"], 11);
+        assert_eq!(ready_b["session_id"].as_str(), Some(session_b.as_str()));
+
+        control_a.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await.unwrap();
+        let attached_a: serde_json::Value = serde_json::from_str(control_a.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(attached_a["value"]["mode"], "observe");
+        control_b.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await.unwrap();
+        let attached_b: serde_json::Value = serde_json::from_str(control_b.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+        assert_eq!(attached_b["value"]["mode"], "observe");
+
+        let mut video_a = open_media_consumer(&connector_a, address, &token_a).await;
+        let mut video_b = open_media_consumer(&connector_b, address, &token_b).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let header = media_frame(&mut video_a, &session_a).await;
+            if header["type"] == "access_unit" { break; }
+            assert!(tokio::time::Instant::now() < deadline, "A never produced an access unit: {header}");
+        }
+        loop {
+            let header = media_frame(&mut video_b, &session_b).await;
+            if header["type"] == "access_unit" { break; }
+            assert!(tokio::time::Instant::now() < deadline, "B never produced an access unit: {header}");
+        }
+
+        let dir_a = root.join(format!("endpoint/session-{session_a}"));
+        let dir_b = root.join(format!("endpoint/session-{session_b}"));
+        assert!(wait_dir(&dir_a, Duration::from_secs(10)).await, "A per-session directory was never bound");
+        assert!(wait_dir(&dir_b, Duration::from_secs(10)).await, "B per-session directory was never bound");
+        assert!(dir_a.join("encoded.sock").exists(), "A encoded socket missing while healthy");
+        assert!(dir_a.join("encoder-control.sock").exists(), "A encoder-control socket missing while healthy");
+
+        // Release A's final control reference while its reader is live.
+        drop(control_a);
+        let terminal = media_terminal(&mut video_a).await;
+        assert!(
+            matches!(terminal["type"].as_str(), Some("closed") | Some("unavailable") | Some("transport_end")),
+            "A did not reach an explicit media terminal: {terminal}"
+        );
+        eprintln!("BB35 endpoint.err:\n{}", std::fs::read_to_string(root.join("endpoint.err")).unwrap_or_default());
+        assert!(
+            wait_absent(&dir_a, Duration::from_secs(20)).await,
+            "A's adapter/socket directory was not removed after final release"
+        );
+        assert!(!dir_a.join("encoded.sock").exists(), "A encoded socket survived finalization");
+        assert!(!dir_a.join("encoder-control.sock").exists(), "A encoder-control socket survived finalization");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let header = media_frame(&mut video_b, &session_b).await;
+            if header["type"] == "access_unit" { break; }
+            assert!(tokio::time::Instant::now() < deadline, "B stopped decoding after A finalized: {header}");
+        }
+        assert!(dir_b.exists(), "A's release must not remove B's session directory");
+
+        let _ = unsafe { libc::kill(endpoint.id().unwrap() as i32, libc::SIGTERM) };
+        let _ = endpoint.wait().await;
+        let _ = unsafe { libc::kill(host.id().unwrap() as i32, libc::SIGTERM) };
+        let _ = host.wait().await;
+        drop(video_a);
+        drop(video_b);
+        drop(control_b);
+        let err = std::fs::read_to_string(root.join("endpoint.err")).unwrap_or_default();
+        std::fs::write("/tmp/bb35-endpoint.err", err).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }).await.expect("BB-EX-MEDIA-35 case timed out");
+}
+
 fn write_catalog(root: &std::path::Path, members: &[String]) {
     let members: Vec<serde_json::Value> = members.iter().cloned().map(serde_json::Value::String).collect();
     let access = serde_json::json!({

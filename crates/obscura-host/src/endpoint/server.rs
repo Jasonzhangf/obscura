@@ -106,11 +106,13 @@ impl SessionDurable {
     /// every accepted or in-flight group, reaps the adapter while the healthy
     /// reader is still active, then stops the reader and removes resources.
     async fn finalize(&self) -> Result<()> {
+        eprintln!("bb35 finalize: enter {}", self.session_id);
         let settlement = {
             let mut state = self.encoded_control.state.lock().await;
             state.close_admission();
             state.take_settlement_receiver()
         };
+        eprintln!("bb35 finalize: settlement taken {}", self.session_id);
         if let Some((_registration_id, receiver)) = settlement {
             match tokio::time::timeout(Duration::from_secs(5), receiver).await {
                 Ok(Ok(obscura_media::encoder_owner::EncoderSettlement::Armed { pgid })) => {
@@ -133,15 +135,18 @@ impl SessionDurable {
             }
         }
         self.stop_armed_encoder_group().await?;
+        eprintln!("bb35 finalize: armed group stopped {}", self.session_id);
         if let Some(mut child) = self.child.lock().await.take() {
             child.finalize().await?;
         }
+        eprintln!("bb35 finalize: adapter reaped {}", self.session_id);
         // Only after adapter escalation does the reader stop. The supervisor
         // joins it after this finalizer returns.
         self.encoded_control.stop_reader();
         let _ = std::fs::remove_file(&self.encoded_path);
         let _ = std::fs::remove_file(&self.encoded_control.path);
         let _ = std::fs::remove_dir(&self.media_dir);
+        eprintln!("bb35 finalize: resources removed {}", self.session_id);
         Ok(())
     }
 }
@@ -482,9 +487,13 @@ impl SessionGrant {
     pub async fn release(&self, durable: &Arc<SessionDurable>) {
         let mut registry = self.registry.lock().await;
         if registry.release(durable) {
+            eprintln!("bb35 release: final reference for session {}", durable.session_id);
             let supervisor = { durable.supervisor.lock().expect("supervisor owner").take() };
             durable.cancel.send_replace(true);
-            if let Some(supervisor) = supervisor { let _ = supervisor.await; }
+            if let Some(supervisor) = supervisor {
+                let outcome = supervisor.await;
+                eprintln!("bb35 release: supervisor joined for session {}: {:?}", durable.session_id, outcome.is_ok());
+            }
             registry.entries.remove(&durable.session_id);
         }
     }

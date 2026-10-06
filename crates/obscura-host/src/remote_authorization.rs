@@ -303,6 +303,21 @@ impl EndpointStatusReceipt {
             projection_sha256: encode_hex(&projection.projection_sha256),
         }
     }
+
+    /// Strict typed consumer for the endpoint-applied receipt. Every field is
+    /// required, unknown fields are refused, and `schema_version` must be 1.
+    /// A partial, malformed, missing-field or unknown-field receipt is refused
+    /// here and never mapped to an applied result.
+    pub fn load_applied(path: &Path) -> Result<Self> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Read endpoint applied receipt {path:?}"))?;
+        let receipt: Self = serde_json::from_slice(&bytes)
+            .context("Decode endpoint applied receipt")?;
+        if receipt.schema_version != 1 {
+            bail!("endpoint applied receipt schema_version must be 1");
+        }
+        Ok(receipt)
+    }
 }
 
 pub fn sha256(data: &[u8]) -> [u8; 32] {
@@ -353,5 +368,68 @@ fn unix_now() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => duration.as_secs() as i64,
         Err(_) => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EndpointStatusReceipt;
+
+    fn valid_receipt() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "endpoint_generation": 3,
+            "endpoint_pid": 4242,
+            "bound_address": "127.0.0.1:8443",
+            "authorization_revision": 7,
+            "registry_sha256": "aa".repeat(32),
+            "projection_sha256": "bb".repeat(32)
+        })
+    }
+
+    fn load(value: &serde_json::Value) -> anyhow::Result<EndpointStatusReceipt> {
+        let dir = std::env::temp_dir().join(format!("ear-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("applied.json");
+        std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        let result = EndpointStatusReceipt::load_applied(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+        result
+    }
+
+    #[test]
+    fn applied_receipt_accepts_exact_v1_shape() {
+        let receipt = load(&valid_receipt()).expect("exact v1 shape must parse");
+        assert_eq!(receipt.schema_version, 1);
+        assert_eq!(receipt.endpoint_generation, 3);
+        assert_eq!(receipt.endpoint_pid, 4242);
+        assert_eq!(receipt.bound_address, "127.0.0.1:8443");
+        assert_eq!(receipt.authorization_revision, 7);
+        assert_eq!(receipt.registry_sha256, "aa".repeat(32));
+        assert_eq!(receipt.projection_sha256, "bb".repeat(32));
+    }
+
+    #[test]
+    fn applied_receipt_refuses_missing_unknown_and_malformed_fields() {
+        let mut missing = valid_receipt();
+        missing.as_object_mut().unwrap().remove("projection_sha256");
+        assert!(load(&missing).is_err(), "missing field must be refused");
+
+        let mut unknown = valid_receipt();
+        unknown["status"] = serde_json::json!("ready");
+        assert!(load(&unknown).is_err(), "unknown status field must be refused");
+
+        let mut wrong_schema = valid_receipt();
+        wrong_schema["schema_version"] = serde_json::json!(2);
+        assert!(load(&wrong_schema).is_err(), "non-v1 schema_version must be refused");
+
+        let dir = std::env::temp_dir().join(format!("ear-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("applied.json");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(EndpointStatusReceipt::load_applied(&path).is_err(), "malformed JSON must be refused");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
