@@ -8,7 +8,7 @@ use std::{
 };
 
 use obscura_media::encoder_owner::EncoderChildOwner;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 #[tokio::test]
@@ -103,15 +103,17 @@ async fn serve_control(
     }
 }
 
-/// Accept one real `EncoderChildOwner` connection, grant Acquire, and signal
-/// when Register arrives without answering it. The test then drops the
-/// in-flight encode borrow and drives the same owner's pre-registration
-/// interrupt finalizer.
-async fn serve_control_until_register(
+/// Accept one real `EncoderChildOwner` connection and grant Acquire. On
+/// Register it records the bound pgid and *commits* the registration as the
+/// real endpoint does, signals the test, then holds the typed acknowledgement
+/// until the test releases it. That models the exact window where the endpoint
+/// has accepted `Register` but the adapter has not yet consumed the answer.
+async fn serve_control_pending_registration(
     listener: UnixListener,
     requests: Arc<Mutex<Vec<serde_json::Value>>>,
     bound_pgid: Arc<Mutex<Option<i32>>>,
     register_seen: tokio::sync::oneshot::Sender<()>,
+    mut ack_gate: tokio::sync::oneshot::Receiver<()>,
 ) {
     let Ok((stream, _)) = listener.accept().await else { return; };
     let (read, mut write) = stream.into_split();
@@ -130,11 +132,11 @@ async fn serve_control_until_register(
                     *bound_pgid.lock().expect("pgid owner") = Some(pgid as i32);
                 }
                 if let Some(signal) = register_seen.take() { let _ = signal.send(()); }
-                // Keep the registration unanswered while the test drives the
-                // local refused-group finalizer; return on transport EOF.
-                let mut rest = Vec::new();
-                let _ = reader.read_to_end(&mut rest).await;
-                return;
+                // Endpoint committed `Armed`; hold the acknowledgement so the
+                // adapter sees a pending registration until the test releases
+                // it. The next request (Revoke) is read only after this.
+                let _ = (&mut ack_gate).await;
+                serde_json::json!({"op":"register","refused":false})
             }
             "revoke" => serde_json::json!({"op":"revoke","refused":false}),
             "settle" => serde_json::json!({"op":"settle"}),
@@ -143,6 +145,56 @@ async fn serve_control_until_register(
         let mut bytes = serde_json::to_vec(&response).expect("serialize control response");
         bytes.push(b'\n');
         if write.write_all(&bytes).await.is_err() { return; }
+    }
+}
+
+/// Accept one real `EncoderChildOwner` connection, grant Acquire and Register,
+/// then hold every revoke acknowledgement until the test releases it. Models an
+/// endpoint finalizer that still owns signal authority when the adapter asks to
+/// revoke, exactly the window the adapter must not treat as permission to reap.
+async fn serve_control_delayed_revoke(
+    listener: UnixListener,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    bound_pgid: Arc<Mutex<Option<i32>>>,
+    register_acked: tokio::sync::oneshot::Sender<()>,
+    revoke_seen: tokio::sync::oneshot::Sender<()>,
+    mut revoke_gate: tokio::sync::oneshot::Receiver<()>,
+) {
+    let Ok((stream, _)) = listener.accept().await else { return; };
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let mut register_acked = Some(register_acked);
+    let mut revoke_seen = Some(revoke_seen);
+    loop {
+        let mut line = String::new();
+        let count = match reader.read_line(&mut line).await { Ok(count) => count, Err(_) => return };
+        if count == 0 { return; }
+        let request: serde_json::Value = match serde_json::from_str(line.trim_end()) { Ok(value) => value, Err(_) => return };
+        requests.lock().expect("requests owner").push(request.clone());
+        let response = match request["op"].as_str().unwrap_or("") {
+            "acquire" => serde_json::json!({"op":"acquire","permit":"granted"}),
+            "register" => {
+                if let Some(pgid) = request["pgid"].as_i64() {
+                    *bound_pgid.lock().expect("pgid owner") = Some(pgid as i32);
+                }
+                serde_json::json!({"op":"register","refused":false})
+            }
+            "revoke" => {
+                if let Some(signal) = revoke_seen.take() { let _ = signal.send(()); }
+                // Endpoint signal authority is still held; the acknowledgement
+                // is withheld until the test releases it.
+                let _ = (&mut revoke_gate).await;
+                serde_json::json!({"op":"revoke","refused":false})
+            }
+            "settle" => serde_json::json!({"op":"settle"}),
+            _ => return,
+        };
+        let mut bytes = serde_json::to_vec(&response).expect("serialize control response");
+        bytes.push(b'\n');
+        if write.write_all(&bytes).await.is_err() { return; }
+        if request["op"] == "register" {
+            if let Some(signal) = register_acked.take() { let _ = signal.send(()); }
+        }
     }
 }
 
@@ -304,24 +356,28 @@ async fn encoder_owner_refused_registration_reaps_without_revoked() {
     assert_eq!(owner_settlement(&requests), serde_json::json!("refused_group_stopped"), "refusal must settle with GroupStopped");
 }
 
-/// The adapter's pre-registration interrupt path: the group is spawned and
-/// Register is in flight, but the endpoint has not acknowledged `Armed`. A
-/// signal branch drops the encode borrow and calls the same owner's finalize;
-/// because `armed` is false it must run the local refused-group cleanup without
-/// sending `RevokeEncoder`.
+/// G2: a pending registration is distinct from a confirmed refusal. The real
+/// control peer accepts `Register` (endpoint signal authority is now held) but
+/// withholds the acknowledgement while the test drops the encode borrow and
+/// drives the retained owner's finalizer. Before a revoke may reap, the owner
+/// must resolve the outstanding registration, send `RevokeEncoder`, receive
+/// `Revoked`, and only then reap. Left unresolved, the endpoint still owns a
+/// `Revoked`-pending pgid and the adapter must not signal it.
 #[tokio::test]
-async fn encoder_owner_pre_registration_interrupt_reaps_locally_without_revoked() {
-    let root = OwnerRoot::new("pre-reg-interrupt");
+async fn encoder_owner_pending_registration_resolves_revokes_and_only_then_reaps() {
+    let root = OwnerRoot::new("pending-reg");
     let control = root.control_path();
     let listener = UnixListener::bind(&control).expect("bind control peer");
     let requests = Arc::new(Mutex::new(Vec::new()));
     let bound = Arc::new(Mutex::new(None));
     let (register_seen_tx, register_seen_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(serve_control_until_register(
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(serve_control_pending_registration(
         listener,
         Arc::clone(&requests),
         Arc::clone(&bound),
         register_seen_tx,
+        ack_rx,
     ));
     let wrapper = write_wrapper(&root, "blocking.sh", WRAPPER_BLOCKING);
     let mut owner = EncoderChildOwner::open(&wrapper, &control).await.expect("open owner");
@@ -333,15 +389,101 @@ async fn encoder_owner_pre_registration_interrupt_reaps_locally_without_revoked(
             seen = register_seen_rx => seen.expect("register request signal"),
         }
     }
-    let stop = owner.finalize().await.expect("pre-registration interrupt must reap locally");
+    // The peer has already accepted the registration; the adapter-side read of
+    // the acknowledgement is still pending. Release the typed answer so the
+    // owner resolves the registration before deciding how to settle it.
+    let _ = ack_tx.send(());
+    let stop = owner.finalize().await.expect("pending registration must resolve to revoke and reap");
     assert!(matches!(
         stop,
         obscura_media::encoder_owner::EncoderStop::KilledAndReaped(_)
             | obscura_media::encoder_owner::EncoderStop::Exited(_)
     ));
     let pgid = bound.lock().expect("pgid owner").expect("register bound a pgid");
-    assert!(wait_group_gone(pgid).await, "pre-registration interrupt must reap the spawned wrapper group");
-    assert!(!owner.has_live_child(), "pre-registration interrupt must leave no live child");
+    assert!(wait_group_gone(pgid).await, "G2 finalize must reap the pending-registration wrapper group");
+    assert!(!owner.has_live_child(), "G2 finalize must leave no live child");
     let ops = owner_ops(&requests);
-    assert!(!ops.contains(&"revoke".to_string()), "pre-registration interrupt must not send RevokeEncoder: {ops:?}");
+    assert_eq!(ops, vec!["acquire", "register", "revoke"],
+        "G2 must resolve the pending registration through the typed revoke path: {ops:?}");
+}
+
+/// G3: the adapter must require the typed non-refused revoke acknowledgement
+/// before reaping a registered leader. A healthy endpoint finalizer may still
+/// own signal authority while the adapter's revoke request is pending. Dropping
+/// that pending revoke must be an explicit ownership failure, not permission to
+/// address the group.
+#[tokio::test]
+async fn encoder_owner_revoke_ack_is_required_before_reaping_registered_leader() {
+    let root = OwnerRoot::new("revoke-ack");
+    let control = root.control_path();
+    let listener = UnixListener::bind(&control).expect("bind control peer");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let bound = Arc::new(Mutex::new(None));
+    let (register_tx, register_rx) = tokio::sync::oneshot::channel();
+    let (revoke_seen_tx, revoke_seen_rx) = tokio::sync::oneshot::channel();
+    let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(serve_control_delayed_revoke(
+        listener,
+        Arc::clone(&requests),
+        Arc::clone(&bound),
+        register_tx,
+        revoke_seen_tx,
+        ack_rx,
+    ));
+    let wrapper = write_wrapper(&root, "blocking.sh", WRAPPER_BLOCKING);
+    let mut owner = EncoderChildOwner::open(&wrapper, &control).await.expect("open owner");
+    {
+        let encode = owner.encode_frame(160, 120, solid_rgba(160, 120));
+        tokio::pin!(encode);
+        tokio::select! {
+            result = &mut encode => panic!("encode unexpectedly completed before the revoke-ack test: {result:?}"),
+            seen = register_rx => seen.expect("register acknowledgement signal"),
+        }
+    }
+    // The registration is fully `Armed`. Drive the finalizer into the revoke
+    // path; the peer withholds `Revoked` while endpoint signal authority is
+    // still held.
+    let mut finalize = Box::pin(owner.finalize());
+    tokio::select! {
+        result = &mut finalize => panic!("finalize completed before its revoke request was observed: {result:?}"),
+        seen = revoke_seen_rx => seen.expect("revoke request signal"),
+    }
+    let pgid = bound.lock().expect("pgid owner").expect("register bound a pgid");
+    // Keep polling the finalizer while the acknowledgement is withheld for
+    // longer than the previous two-second exchange deadline. A finalizer that
+    // discarded the revoke result reaps the group inside this window; the fixed
+    // finalizer keeps waiting for the typed acknowledgement.
+    let mut completed_early = false;
+    {
+        let hold = tokio::time::sleep(Duration::from_secs(6));
+        tokio::pin!(hold);
+        tokio::select! {
+            _ = &mut finalize => completed_early = true,
+            _ = &mut hold => {}
+        }
+    }
+    let alive_at_deadline = group_alive(pgid);
+    // Release the withheld acknowledgement so the fixed finalizer can finish.
+    let _ = ack_tx.send(());
+    let stop = if completed_early { None } else { Some((&mut finalize).await) };
+    drop(finalize);
+    if !alive_at_deadline {
+        // A reverted (pre-fix) run reaped the leader while endpoint signal
+        // authority was pending. Keep the test-owned wrapper subtree from
+        // leaking.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+    assert!(alive_at_deadline,
+        "G3 must not reap a registered leader before its revoke acknowledgement");
+    let stop = stop.expect("the fixed finalizer must complete after the revoke acknowledgement")
+        .expect("G3 finalizer must succeed once the revoke is acknowledged");
+    assert!(matches!(
+        stop,
+        obscura_media::encoder_owner::EncoderStop::Exited(_)
+            | obscura_media::encoder_owner::EncoderStop::KilledAndReaped(_)
+    ));
+    assert!(!owner.has_live_child(), "G3 finalizer must reap the leader after the revoke acknowledgement");
+    assert!(wait_group_gone(pgid).await, "G3 finalizer must settle the wrapper group");
+    assert_eq!(owner_ops(&requests), vec!["acquire", "register", "revoke"],
+        "G3 must resolve the registered leader through the typed revoke before reap");
 }

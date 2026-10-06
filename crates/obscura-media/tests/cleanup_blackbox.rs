@@ -113,6 +113,57 @@ fn write_executable(path: &Path, body: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Write a wrapper encoder that exits with `exit_code` and emits no access unit,
+/// plus a same-process-group descendant that records whether the wrapper leader
+/// is still present when the group is signalled. The leader closes its
+/// stdout/stderr so the adapter's bounded reads complete while the leader is
+/// still alive, then exits on its own after a bounded delay. A finalizer that
+/// reaps the leader before it signals the group leaves `gone` in the marker; a
+/// finalizer that signals while the leader identity is still pinned leaves
+/// `present`.
+fn write_post_reap_probe(root: &Path, name: &str, exit_code: u32, marker: &Path) -> PathBuf {
+    let observer = root.join(format!("{name}-observer.sh"));
+    let ready = root.join(format!("{name}.ready"));
+    write_executable(&observer, &format!(
+        "#!/bin/sh\nleader=\"$1\"\nmarker=\"$2\"\nready=\"$3\"\ntrap 'if kill -0 \"$leader\" 2>/dev/null; then echo present > \"$marker\"; else echo gone > \"$marker\"; fi; exit 0' TERM\n: > \"$ready\"\nwhile :; do sleep 0.1; done\n"
+    ));
+    let wrapper = root.join(format!("{name}.sh"));
+    write_executable(&wrapper, &format!(
+        "#!/bin/sh\nleader=$$\nsh '{observer}' \"$leader\" '{marker}' '{ready}' </dev/null >/dev/null 2>&1 &\nwhile [ ! -f '{ready}' ]; do sleep 0.02; done\nexec 1>&- 2>&-\ntrap 'sleep 0.3; exit {exit_code}' TERM\nsleep 0.5\nexit {exit_code}\n",
+        observer = observer.display(),
+        marker = marker.display(),
+        ready = ready.display(),
+    ));
+    wrapper
+}
+
+/// Drive one real standalone adapter invocation with `wrapper` as `--ffmpeg`,
+/// send a single raw frame, and return the emitted video packet plus the
+/// adapter's exit status.
+async fn run_standalone_failure(dir: &Directory, wrapper: &Path) -> (VideoPacket, std::process::ExitStatus) {
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let control = UnixListener::bind(dir.0.join("encoder-control.sock")).unwrap();
+    std::fs::set_permissions(dir.0.join("encoder-control.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    drop(tokio::spawn(serve_control(control)));
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw"))
+        .arg("--video-socket").arg(dir.0.join("video"))
+        .arg("--ffmpeg").arg(wrapper);
+    let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (mut source, _) = raw.accept().await.unwrap();
+    let mut receiver = BufReader::new(video.accept().await.unwrap().0);
+
+    let (packet, pixels) = frame(64, 48);
+    write_frame(&mut source, &packet, &pixels).await;
+    let (reply, _) = tokio::time::timeout(Duration::from_secs(15), read_video(&mut receiver)).await
+        .expect("the adapter never emitted a packet for the failing frame");
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await
+        .expect("adapter did not exit after the encode failure").unwrap();
+    (reply, output.status)
+}
+
 /// F2: a real standalone adapter whose configured `--ffmpeg` wrapper spawns a
 /// descendant and then floods stdout past the bounded access-unit limit must
 /// report the failure and leave no encoder subtree behind. The descendant is in
@@ -195,4 +246,83 @@ async fn standalone_adapter_releases_its_control_socket_for_reuse() {
         assert!(!dir.0.join("encoder-control.sock").exists(),
             "the {attempt} standalone invocation left its control socket path behind");
     }
+}
+
+/// G4: a configured encoder that exits nonzero is already reaped by the time
+/// `run_encode` inspects its status. The retained owner must signal and settle
+/// the group while the leader identity is still pinned, so no group signal is
+/// ever addressed to a reaped (and reusable) pgid. The same-group descendant
+/// records whether the leader was still present when the group was signalled.
+#[tokio::test]
+async fn standalone_adapter_retires_group_authority_before_reaping_nonzero_encoder() {
+    let dir = Directory::new();
+    let marker = dir.0.join("nonzero.marker");
+    let wrapper = write_post_reap_probe(&dir.0, "nonzero", 7, &marker);
+    let (reply, status) = run_standalone_failure(&dir, &wrapper).await;
+    assert!(matches!(reply, VideoPacket::EncoderUnavailable { .. }),
+        "a nonzero encoder exit must emit EncoderUnavailable, got {reply:?}");
+    assert!(!status.success(), "a nonzero encoder exit must fail the adapter process");
+    let observed = std::fs::read_to_string(&marker)
+        .expect("the encoder descendant must record the group-signal ordering");
+    assert_eq!(observed.trim(), "present",
+        "G4: the encoder leader identity must still be pinned when the group is signalled, not reaped first");
+}
+
+/// G4: the empty-output branch has the same requirement. A successful encoder
+/// that produces no access unit is already reaped, so its retained pgid must
+/// not be signalled after the reap.
+#[tokio::test]
+async fn standalone_adapter_retires_group_authority_before_reaping_empty_encoder_output() {
+    let dir = Directory::new();
+    let marker = dir.0.join("empty.marker");
+    let wrapper = write_post_reap_probe(&dir.0, "empty", 0, &marker);
+    let (reply, status) = run_standalone_failure(&dir, &wrapper).await;
+    assert!(matches!(reply, VideoPacket::EncoderUnavailable { .. }),
+        "empty encoder output must emit EncoderUnavailable, got {reply:?}");
+    assert!(!status.success(), "empty encoder output must fail the adapter process");
+    let observed = std::fs::read_to_string(&marker)
+        .expect("the encoder descendant must record the group-signal ordering");
+    assert_eq!(observed.trim(), "present",
+        "G4: the encoder leader identity must still be pinned when the group is signalled, not reaped first");
+}
+
+/// G5: the standalone adapter must honour SIGTERM while it is idle, waiting on a
+/// raw frame header. Before the fix SIGTERM was queued until the next encode, so
+/// the process ignored it indefinitely and retained its control socket. The
+/// adapter must exit within a bounded window and remove the socket path.
+#[tokio::test]
+async fn standalone_adapter_exits_on_sigterm_while_waiting_for_frames() {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw"))
+        .arg("--video-socket").arg(dir.0.join("video"));
+    let mut child = command.stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+    let (_source, _) = raw.accept().await.unwrap();
+    let (_receiver, _) = video.accept().await.unwrap();
+    // The standalone adapter binds its own control socket in the consumer
+    // directory; wait until it exists before signalling.
+    let control = dir.0.join("encoder-control.sock");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !control.exists() {
+        assert!(tokio::time::Instant::now() < deadline, "standalone control socket was never bound");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let pid = child.id().expect("standalone adapter pid") as i32;
+    // Safety: signaling the one adapter process this test spawned.
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "SIGTERM the standalone adapter");
+    // The raw source stays idle: no frame is ever sent. The adapter must still
+    // observe the lifetime signal and exit within its bounded window.
+    let exited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    let socket_removed = !control.exists();
+    if exited.is_err() {
+        // Keep a pre-fix run from leaking the still-running fixture adapter.
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+    assert!(exited.is_ok(),
+        "G5: the idle standalone adapter ignored SIGTERM and did not exit within its bounded window");
+    assert!(socket_removed,
+        "G5: the interrupted standalone adapter must remove its encoder-control socket path");
 }

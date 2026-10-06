@@ -1,21 +1,23 @@
 {
-  "task": "m1-host-p3-implementation-r9-20261005",
-  "worker": "gcm-host-p3-r9",
+  "task": "m1-host-p3-implementation-r10-20261005",
+  "worker": "gcm-host-p3-r10",
   "role": "fresh GCM standalone author (not controller or reviewer)",
   "status": "COMPLETE",
-  "reason": "Closed the four r8 implementation-review P1 findings F1-F4 with public-surface discriminating before/after pairs and preserved the earlier r7/r8 regressions. No commit, merge, install, restart, OTA, device, or runtime operation was performed.",
+  "reason": "Closed the five r3 implementation-review P1 findings G1-G5 with public-surface discriminating before/after pairs and preserved the earlier r7/r8/r9 regressions. No commit, merge, install, restart, OTA, device, or runtime operation was performed.",
   "branch": "codex/m1-host-p3-implementation-20261005",
-  "start_head": "6b7710c6c44c1af1e6f061d7df325b398d627ccf",
-  "start_tree": "ddf2f4cca3b939455e6950dca15380d77d53e17f",
-  "end_head": "6b7710c6c44c1af1e6f061d7df325b398d627ccf",
-  "end_tree": "uncommitted working tree; controller owns the candidate commit",
+  "start_head": "9be2f0826b6d90ad44838420cd27f4b3864fe6f4",
+  "start_tree": "bcd4b99f4627f8257b4dae0a18af0439bab04e54",
+  "end_head": "9be2f0826b6d90ad44838420cd27f4b3864fe6f4",
+  "end_tree": "5d09df94a0c5428d230b3d5945e2a8234ed36fc7",
+  "end_tree_product_source": "8456479543ebb3308efc42d06b58137610c86428",
+  "end_tree_note": "working tree applied over HEAD, computed with a temporary GIT_INDEX_FILE; the real index was not touched. end_tree covers crates/**, Cargo.toml, Cargo.lock and the run docs; end_tree_product_source covers crates/**, Cargo.toml, Cargo.lock only.",
   "task_base": "9d02931f24631e3680b3038601f4e3efe288c0ab",
   "previous_terminal": {
-    "task": "m1-host-p3-implementation-r8-20261005",
-    "worker": "gcm-host-p3-r8",
-    "committed_candidate": "6b7710c6c44c1af1e6f061d7df325b398d627ccf",
-    "review_task": "m1-host-p3-implementation-20261005-r2",
-    "review_result": "FAIL: 4 P1, 0 P0"
+    "task": "m1-host-p3-implementation-r9-20261005",
+    "worker": "gcm-host-p3-r9",
+    "committed_candidate": "9be2f0826b6d90ad44838420cd27f4b3864fe6f4",
+    "review_task": "m1-host-p3-implementation-20261005-r3",
+    "review_result": "FAIL: 5 P1, 0 P0"
   },
   "target_dir": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target",
   "env": {
@@ -23,128 +25,108 @@
     "CARGO_BUILD_JOBS": "2",
     "CARGO_TARGET_DIR": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target",
     "OBSCURA_TEST_BINARY_DIR": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/debug",
-    "OBSCURA_WEBRTC_RAW_DIR": "/Volumes/Intel/playground/obscura/.worker-runs/m1-host-p3-implementation-r9-20261005/gcm-host-p3-r9/raw/webrtc"
+    "OBSCURA_WEBRTC_RAW_DIR": "/Volumes/Intel/playground/obscura/.worker-runs/m1-host-p3-implementation-r10-20261005/gcm-host-p3-r10/raw/webrtc"
   },
   "changed_files_local": [
     "crates/obscura-host/src/endpoint/server.rs",
-    "crates/obscura-host/tests/blackbox_b8_shutdown_join.rs",
+    "crates/obscura-host/src/endpoint/channels.rs",
     "crates/obscura-host/tests/blackbox_b9_unsettled_permit.rs",
     "crates/obscura-media/src/encoder_owner.rs",
     "crates/obscura-media/src/main.rs",
     "crates/obscura-media/tests/cleanup_blackbox.rs",
     "crates/obscura-media/tests/encoder.rs",
+    "crates/obscura-media/tests/registration_blackbox.rs",
     "docs/runs/m1-host-p3-implementation-20261005/notes.md",
     "docs/runs/m1-host-p3-implementation-20261005/report.md",
     "docs/runs/m1-host-p3-implementation-20261005/result.json"
   ],
-  "product_source_touched": true,
-  "final_source_sha256": {
-    "crates/obscura-host/src/endpoint/server.rs": "aa1cf71ce7af09f03f5ea7e5cddb837550405125fcf41debeecbd1fd5bb6c712",
-    "crates/obscura-host/src/endpoint/channels.rs": "cee3452160e0ad9089e35464915760d808397972760a4bc248e0200b67faa502",
-    "crates/obscura-host/src/endpoint/encoder_control.rs": "f9b60b05d473bf1705c182c40044271a946d765059c6173895bfe8e21477b512",
-    "crates/obscura-media/src/encoder_owner.rs": "ee160e7ab371216f11412a68129b5f23ea3d5f718ddb804c3070fa92f61b32bd",
-    "crates/obscura-media/src/main.rs": "7ec02f98f143fffc64ae240b308548a50c3097de415c3c53b96e56d2298efb8b",
-    "crates/obscura-media/src/lib.rs": "49666d57a3dbdb64ea9b8e633ef07bf2a57c934bac42e4fe52f22035f496a7f8",
-    "crates/obscura-host/tests/blackbox_b8_shutdown_join.rs": "aab9bd43f0ccac4b909c8d6724899bd595030eb9b1edce650df526f650b38683",
-    "crates/obscura-host/tests/blackbox_b9_unsettled_permit.rs": "313b7ca03d5b5aaa5843ec7e8d6f2ca2c70ab1342d3d4131b9ec924a07e85741",
-    "crates/obscura-media/tests/cleanup_blackbox.rs": "62f740835afb33dcf04cb356687b9ad4c4aa5ed666c682f4651a209f2a14c5a3",
-    "crates/obscura-media/tests/encoder.rs": "a86f42614c60722d018a00c0de4b19fc83a6d7840d1cfd453c54aceb39c2dbad"
+  "protocol_version_unchanged": true,
+  "host_protocol_version": 11,
+  "delta_sha256": {
+    "crates/obscura-host/src/endpoint/server.rs": "9ca032c0d87df83d2b8ead12e322f5359820edf5008a7296cb4da3da406859e0",
+    "crates/obscura-host/src/endpoint/channels.rs": "2b5ac717aacbd3f490c852d997bccc620f67c6369f09bfb4c59de3dc6590ca40",
+    "crates/obscura-host/tests/blackbox_b9_unsettled_permit.rs": "a7501428ffb954cfe1e72b0c2e2e4a825114635649850b2b0695d5e5b5f2f5ff",
+    "crates/obscura-media/src/encoder_owner.rs": "6b425e5d086138bd2d52a5b35bed91b5813a3e441bf776bbc7ea5936f5bc9f9f",
+    "crates/obscura-media/src/main.rs": "216213861b0a7ebf50940ffc9460ffcf7847f2fd8c255a0d76dcd298e50dc1a0",
+    "crates/obscura-media/tests/cleanup_blackbox.rs": "3183165d444a34b07cd1c8de3b2e7f3e907c58bc15e8b5726016c30204bf5ed1",
+    "crates/obscura-media/tests/encoder.rs": "a41d79f96175f86eda152ff3b87cae8c170c713c7da5598ba4d5d58420637fc9",
+    "crates/obscura-media/tests/registration_blackbox.rs": "c4d16e655578943e7fbde3c5ef5b7b9db6395aa5c356964c283c40efffc5dc4f"
   },
-  "findings": {
-    "F1": {
-      "verdict": "BLACK_BOX_DISCRIMINATING",
-      "test": "blackbox_b8_shutdown_join.rs::endpoint_shutdown_joins_in_progress_final_release",
-      "surface": "real mTLS endpoint + real adapter, SIGTERM during final-reference release",
-      "before_exit": 100,
-      "after_exit": 0,
-      "before_detail": "endpoint returned in 1.638 ms while the release was still in progress",
-      "after_detail": "endpoint waited for the finalizer and reaped the adapter",
-      "evidence": ["raw/f1-before.log", "raw/f1-before.exit", "raw/f1-after.log", "raw/f1-after.exit"]
-    },
-    "F2": {
-      "verdict": "BLACK_BOX_DISCRIMINATING",
-      "test": "cleanup_blackbox.rs::standalone_adapter_settles_encoder_group_on_bounded_output_failure",
-      "surface": "real standalone adapter + configured --ffmpeg wrapper + real process group",
-      "before_exit": 100,
-      "after_exit": 0,
-      "before_detail": "wrapper group still alive after the bounded-output terminal failure",
-      "after_detail": "group stop/kill/reap completed before adapter exit",
-      "evidence": ["raw/f2-before.log", "raw/f2-before.exit", "raw/f2-after.log", "raw/f2-after.exit"]
-    },
-    "F3": {
-      "verdict": "BLACK_BOX_DISCRIMINATING",
-      "test": "blackbox_b9_unsettled_permit.rs::unsettled_encoder_permit_is_an_explicit_terminal",
-      "surface": "real mTLS endpoint + real adapter control socket; acquired permit with Register withheld",
-      "before_exit": 100,
-      "after_exit": 0,
-      "before_detail": "endpoint exited without SESSION_ENCODER_PERMIT_UNSETTLED",
-      "after_detail": "terminal emitted with registration id 41",
-      "supporting_test": "obscura-media::encoder::encoder_owner_pre_registration_interrupt_reaps_locally_without_revoked",
-      "evidence": ["raw/f3-before.log", "raw/f3-before.exit", "raw/f3-after.log", "raw/f3-after.exit", "raw/f3-prereg-interrupt.log", "raw/f3-prereg-interrupt.exit"]
-    },
-    "F4": {
-      "verdict": "BLACK_BOX_DISCRIMINATING",
-      "test": "cleanup_blackbox.rs::standalone_adapter_releases_its_control_socket_for_reuse",
-      "surface": "two consecutive real standalone adapter invocations in one consumer directory",
-      "before_exit": 100,
-      "after_exit": 0,
-      "before_detail": "first invocation left encoder-control.sock behind",
-      "after_detail": "both invocations succeeded and the path was removed after each",
-      "evidence": ["raw/f4-before.log", "raw/f4-before.exit", "raw/f4-after.log", "raw/f4-after.exit"]
-    }
-  },
-  "milestones": {
-    "A1_admission": "PASS",
-    "A2_f1_pair": "PASS",
-    "A3_f2_pair": "PASS",
-    "A4_f3_pair": "PASS",
-    "A5_f4_pair": "PASS",
-    "A5_focused_green": "PASS",
-    "A6_three_release_builds": "PASS",
-    "A7_full_gate_twice": "PASS",
-    "A8_obstacle_reuse": "NOT_RUN",
-    "A9_docs": "COMPLETE"
-  },
-  "focused_suites": [
-    {"suite": "obscura-host", "command": "cargo nextest run -p obscura-host --features render -j 4 --no-fail-fast", "passed": 122, "total": 122, "exit": 0, "evidence": "raw/a5-host-focused.{log,exit}"},
-    {"suite": "obscura-media", "command": "cargo nextest run -p obscura-media --features webrtc -j 4 --no-fail-fast", "passed": 23, "total": 23, "exit": 0, "evidence": "raw/a5-media-focused.{log,exit}"}
-  ],
-  "builds": [
-    {"name": "media", "command": "cargo build --release -p obscura-media --features webrtc", "exit": 0, "evidence": "raw/a6-build-media.{log,exit}"},
-    {"name": "host", "command": "cargo build --release -p obscura-host --bins", "exit": 0, "evidence": "raw/a6-build-host.{log,exit}"},
-    {"name": "cli", "command": "cargo build --release -p obscura-cli --bins --features render", "exit": 0, "evidence": "raw/a6-build-cli.{log,exit}"}
-  ],
-  "full_gate": [
-    {"run": 1, "command": "cargo nextest run --workspace --features render --no-fail-fast -j 4", "passed": 1816, "failed": 0, "skipped": 4, "exit": 0, "evidence": "raw/a7-full-gate-1.{log,exit}"},
-    {"run": 2, "command": "cargo nextest run --workspace --features render --no-fail-fast -j 4", "passed": 1816, "failed": 0, "skipped": 4, "exit": 0, "evidence": "raw/a7-full-gate-2.{log,exit}"}
-  ],
-  "a8": {
-    "obstacle_course": "NOT_RUN",
-    "cli_tree_command": "cargo tree -p obscura-cli --features render --locked",
-    "cli_tree_exit": 0,
-    "obscura_host_edges": 0,
-    "obscura_media_edges": 0,
-    "cli_sha256_rebuilt": "4ee9e2dce274ef1d8c1a163f557ca215dbe2be8ef3957513364e5bfdde208f45",
-    "release_binary_sha256": {
-      "obscura-media": "a1aa106f5d23a1bd9a5c875b477286990836ca3914d0465056390dcd39ca1439",
-      "obscura-host": "6335a174287c917f7947f080a6087f7dcb8f613de361baf11db325cb59b23dab",
-      "obscura-endpoint": "feeead5ee5969839a5927a9ca9df8d36334aff6689debe62f6464b865cfae1e1"
-    },
-    "evidence": ["raw/a8-cli-tree.{log,exit}"]
-  },
-  "disclosed_non_gate_runs": [
+  "findings": [
     {
-      "evidence": "raw/probe-b8-iso.{log,exit}, raw/probe-b9-iso.{log,exit}",
-      "exit": 0,
-      "reason": "Earlier probes of the F1/F3 fixed tree, superseded by the final f1-after/f3-after runs after the completion-state and owner changes. Retained as history; not used as verdict evidence."
+      "id": "G1",
+      "title": "unsettled encoder permit must retain resource owner and failure result through release and shutdown",
+      "owner": "crates/obscura-host/src/endpoint/server.rs (+ crates/obscura-host/src/endpoint/channels.rs)",
+      "public_test": "obscura-host::blackbox_b9_unsettled_permit::unsettled_encoder_permit_is_an_explicit_terminal",
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
+    },
+    {
+      "id": "G2",
+      "title": "cancellation during registration must not equate an unread acknowledgment with an unregistered encoder group",
+      "owner": "crates/obscura-media/src/encoder_owner.rs",
+      "public_test": "obscura-media::registration_blackbox::standalone_adapter_resolves_pending_registration_before_reaping",
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
+    },
+    {
+      "id": "G3",
+      "title": "the adapter must receive a successful revoke acknowledgment before reaping a registered leader",
+      "owner": "crates/obscura-media/src/encoder_owner.rs",
+      "public_test": "obscura-media::registration_blackbox::standalone_adapter_requires_revoke_ack_before_reaping_registered_leader",
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
+    },
+    {
+      "id": "G4",
+      "title": "terminal encode cleanup must not signal an encoder identity after its leader has already been reaped",
+      "owner": "crates/obscura-media/src/encoder_owner.rs",
+      "public_test": [
+        "obscura-media::cleanup_blackbox::standalone_adapter_retires_group_authority_before_reaping_nonzero_encoder",
+        "obscura-media::cleanup_blackbox::standalone_adapter_retires_group_authority_before_reaping_empty_encoder_output"
+      ],
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
+    },
+    {
+      "id": "G5",
+      "title": "the adapter cancellation endpoint must remain reachable while waiting for frames",
+      "owner": "crates/obscura-media/src/main.rs",
+      "public_test": "obscura-media::cleanup_blackbox::standalone_adapter_exits_on_sigterm_while_waiting_for_frames",
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
     }
   ],
-  "failures": [],
-  "not_executed": [
-    "obstacle-course (CLI surface unaffected; cargo tree shows zero obscura-host/obscura-media edges)"
+  "gates": {
+    "host_focused": {"command": "cargo nextest run -p obscura-host --features render -j 4 --no-fail-fast", "result": "122 passed, 0 skipped", "exit": 0},
+    "media_focused": {"command": "cargo nextest run -p obscura-media --features webrtc -j 4 --no-fail-fast", "result": "29 passed, 0 skipped", "exit": 0},
+    "build_media": {"command": "cargo build --release -p obscura-media --features webrtc", "exit": 0},
+    "build_host": {"command": "cargo build --release -p obscura-host --bins", "exit": 0},
+    "build_cli": {"command": "cargo build --release -p obscura-cli --bins --features render", "exit": 0},
+    "full_gate_1": {"command": "cargo nextest run --workspace --features render -j 4 --no-fail-fast", "result": "1822 passed, 4 skipped", "exit": 0},
+    "full_gate_2": {"command": "cargo nextest run --workspace --features render -j 4 --no-fail-fast", "result": "1822 passed, 4 skipped", "exit": 0},
+    "cli_tree": {"command": "cargo tree -p obscura-cli --features render --locked", "host_edges": 0, "media_edges": 0, "exit": 0},
+    "diff_check": {"command": "git diff --check", "exit": 0}
+  },
+  "red_runs_retained": [
+    {
+      "log": "raw/a7-full-gate-1-red-continuous-timeout.log",
+      "exit": 100,
+      "reason": "obscura-host::webrtc_endpoint::real_receiver_gets_continuous_host_media_and_rejects_stale_binding hit its hard 180s fixture timeout under host load",
+      "disposition": "load-induced fixture timeout; passes isolated in 15.5s and in both green gates"
+    }
+  ],
+  "disclosures": [
+    "The webrtc_endpoint integration fixture defaults its raw output root into the protected untracked docs/runs/m1-frame-forwarding-impl-r1-20261005/ tree. This task's first host focused run and first full gate wrote 37 UUID fixture directories there before OBSCURA_WEBRTC_RAW_DIR was set. Only those task-owned directories were removed, restoring the tree to its 70-entry pre-task state; no pre-existing entry was removed.",
+    "This task's five /tmp/ob9-* fixture roots and one /tmp/ow-* root were removed with exact-path find -delete; no other owner's resources were touched."
   ],
   "controller_next": [
-    "Commit the working tree as the r9 candidate (no rebase, squash, or history rewrite).",
-    "Run the independent architecture review on the exact committed candidate and re-run the required gates on that exact candidate."
+    "Re-run the independent implementation review on the r10 working tree at end tree 5d09df94a0c5428d230b3d5945e2a8234ed36fc7 (product-source tree 8456479543ebb3308efc42d06b58137610c86428).",
+    "On PASS, commit, merge to clean main, push to origin/main, and verify the remote receipt."
   ]
 }

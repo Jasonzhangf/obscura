@@ -63,14 +63,43 @@ pub enum EncoderSettlement {
 /// Whole-encode window. It covers input write, bounded stdout/stderr reads,
 /// revoke acknowledgement and the leader reap. It is the only encode timeout.
 pub const ENCODE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounded exchange window for the short control messages that do not wait on
+/// endpoint signal authority (`Acquire`, `Register`, `Settle`).
+const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
+/// Bounded window the adapter waits for the endpoint's typed revoke
+/// acknowledgement. It must cover the endpoint's own signal-completion path:
+/// SIGTERM grace plus SIGKILL grace (`stop_armed_encoder_group` bounds each at
+/// two seconds) plus scheduling slack. A response that does not arrive inside
+/// this window is an explicit ownership failure, never an implicit
+/// acknowledgement.
+const REVOKE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cooperative group stop grace before escalation to SIGKILL.
 const GROUP_GRACE: Duration = Duration::from_secs(1);
 /// Bounded leader reap deadline after group stop/kill.
 const REAP_DEADLINE: Duration = Duration::from_secs(3);
 
+#[derive(Debug)]
 pub enum EncoderStop {
     Exited(std::process::ExitStatus),
     KilledAndReaped(std::process::ExitStatus),
+}
+
+/// The endpoint registration state of the current child. A registration is
+/// `Pending` from the moment `Register` is sent until its typed acknowledgement
+/// is read, so a cancellation in that window never mistakes an unread
+/// acknowledgement for an unregistered group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistrationState {
+    /// No child is bound to the endpoint for the current registration.
+    Unregistered,
+    /// `Register` was sent; the acknowledgement has not been read yet.
+    Pending,
+    /// The endpoint acknowledged `Registered`; it holds signal authority and a
+    /// `RevokeEncoder` is owed before the leader is reaped.
+    Armed,
+    /// The endpoint confirmed a refusal; the group is adapter-owned and is
+    /// stopped locally without `RevokeEncoder`/`Revoked`.
+    Refused,
 }
 
 /// One adapter's retained encoder child owner. It survives cancellation of an
@@ -81,11 +110,7 @@ pub struct EncoderChildOwner {
     child: Option<tokio::process::Child>,
     control: EncoderControlClient,
     registration_id: u64,
-    /// True once the endpoint has acknowledged `Register` for the current
-    /// child, so the endpoint holds signal authority and a `RevokeEncoder` is
-    /// owed before the leader is reaped. A pre-registration interrupt leaves
-    /// this false and uses local refused-group cleanup instead.
-    armed: bool,
+    registration: RegistrationState,
 }
 
 impl EncoderChildOwner {
@@ -99,7 +124,7 @@ impl EncoderChildOwner {
             child: None,
             control: EncoderControlClient { reader: BufReader::new(read), writer: write },
             registration_id: 0,
-            armed: false,
+            registration: RegistrationState::Unregistered,
         })
     }
 
@@ -146,22 +171,40 @@ impl EncoderChildOwner {
         ensure!(pgid > 0, "Encoder process group identity must be positive");
         self.group = Some(pgid);
         self.child = Some(child);
+        // From here the `Register` request may reach the endpoint before the
+        // acknowledgement is read. Record that pending state first so a
+        // cancellation cannot mistake the unread acknowledgement for an
+        // unregistered group.
+        self.registration = RegistrationState::Pending;
         let registered = self.control.register(registration_id, pgid).await;
         match registered {
-            Ok(EncoderControlResponse::Register { refused: false }) => self.armed = true,
+            Ok(EncoderControlResponse::Register { refused: false }) => self.registration = RegistrationState::Armed,
             Ok(EncoderControlResponse::Register { refused: true }) => {
+                self.registration = RegistrationState::Refused;
                 self.finalize_local_refused().await.context("Local refused encoder cleanup")?;
                 self.control.settle(registration_id, EncoderSettlement::RefusedGroupStopped).await
                     .context("Report refused encoder settlement")?;
                 bail!("ENCODER_ADMISSION_FINALIZED: Host session finalizer refused encoder registration");
             }
             Err(error) => {
-                self.finalize_local_refused().await.context("Local refused encoder cleanup")?;
-                return Err(error);
+                // The typed acknowledgement was not received. Endpoint signal
+                // authority may or may not exist, so the group is never reaped
+                // blind: resolve the outstanding acknowledgement through the
+                // same typed control resource, then revoke or refuse before any
+                // local reap. An unresolved acknowledgement is surfaced as an
+                // explicit ownership failure.
+                return match self.finalize().await {
+                    Ok(_) => Err(error.context("Encoder registration acknowledgement not received")),
+                    Err(cleanup) => Err(error.context(format!(
+                        "ENCODER_REGISTRATION_UNRESOLVED: registration {registration_id} unresolved: {cleanup}"
+                    ))),
+                };
             }
             Ok(other) => {
-                self.finalize_local_refused().await.context("Local refused encoder cleanup")?;
-                bail!("Unexpected encoder control response: {other:?}");
+                // A response that is neither `Register` outcome is a protocol
+                // violation. The endpoint state is unknown, so never reap
+                // blind; surface the ownership failure.
+                bail!("ENCODER_REGISTRATION_UNRESOLVED: unexpected encoder control response: {other:?}");
             }
         }
         let outcome = tokio::time::timeout(ENCODE_TIMEOUT, self.run_encode(registration_id, rgba)).await
@@ -169,24 +212,27 @@ impl EncoderChildOwner {
         match outcome {
             Ok(Ok(bytes)) => Ok(bytes),
             Ok(Err(error)) => {
-                // Every terminal encode error still owns the retained subtree.
-                // Settle the group through the same owner before returning, and
-                // surface a cleanup failure instead of discarding it.
-                match self.finalize().await {
-                    Ok(_) => Err(error),
-                    Err(cleanup) => Err(error.context(format!(
-                        "encoder group cleanup failed for registration {registration_id}: {cleanup}"
-                    ))),
-                }
+                self.finalize_after_terminal_error(error, registration_id).await
             }
             Err(error) => {
-                match self.finalize().await {
-                    Ok(_) => Err(error),
-                    Err(cleanup) => Err(error.context(format!(
-                        "encoder group cleanup failed for registration {registration_id}: {cleanup}"
-                    ))),
-                }
+                self.finalize_after_terminal_error(error, registration_id).await
             }
+        }
+    }
+
+    /// A terminal encode error still owns the retained subtree. `run_encode`
+    /// settles the group through the same owner on every path that reaches its
+    /// reap, so this only finalizes when a live child is still retained (the
+    /// encode future was cancelled or dropped before that settle).
+    async fn finalize_after_terminal_error(&mut self, error: anyhow::Error, registration_id: u64) -> Result<Vec<u8>> {
+        if !self.has_live_child() {
+            return Err(error);
+        }
+        match self.finalize().await {
+            Ok(_) => Err(error),
+            Err(cleanup) => Err(error.context(format!(
+                "encoder group cleanup failed for registration {registration_id}: {cleanup}"
+            ))),
         }
     }
 
@@ -211,15 +257,16 @@ impl EncoderChildOwner {
             }
             other => bail!("Unexpected encoder control response: {other:?}"),
         }
-        let status = {
-            let child = self.child.as_mut().context("Encoder child missing")?;
-            child.wait().await.context("Wait for encoder leader")?
+        // Settle the group through the same retained owner while the leader
+        // identity is still pinned. `stop_kill_reap` signals the group before
+        // it reaps the leader and retires signal authority when the leader is
+        // reaped, so no group signal can address a reused numeric pgid after
+        // `child.wait()` has completed. It returns the leader status.
+        let status = match self.stop_kill_reap().await? {
+            EncoderStop::Exited(status) | EncoderStop::KilledAndReaped(status) => status,
         };
         ensure!(status.success(), "H.264 encoder failed: {}", String::from_utf8_lossy(&errors));
         ensure!(!bytes.is_empty(), "H.264 encoder produced no access unit");
-        self.group = None;
-        self.child = None;
-        self.armed = false;
         Ok(bytes)
     }
 
@@ -233,19 +280,52 @@ impl EncoderChildOwner {
     /// before reaping the leader so the endpoint signal cannot address a
     /// reused process id.
     pub async fn finalize(&mut self) -> Result<EncoderStop> {
-        // Only an endpoint-acknowledged registration owes `RevokeEncoder`. A
-        // pre-registration interrupt (the fence flipped before `Registered`)
-        // has no Armed registration to revoke, so it runs the same local
-        // refused-group cleanup without sending a `RevokeEncoder` the endpoint
-        // would refuse.
-        if self.armed {
-            let registration_id = self.registration_id;
-            // Wait for the endpoint's typed acknowledgement before addressing
-            // the group. The acknowledgement is ordered after endpoint signal
-            // authority is complete (B4), so it is safe to stop the group here.
-            let _ = self.control.revoke(registration_id).await;
+        match self.registration {
+            // An endpoint-acknowledged registration owes a `RevokeEncoder` and
+            // a successful typed acknowledgement before the leader is reaped.
+            RegistrationState::Armed => {
+                self.revoke_registered().await?;
+                self.stop_kill_reap().await
+            }
+            // The `Register` request was sent but its acknowledgement was not
+            // read. Resolve it before deciding: an acknowledged registration
+            // still owes a revoke; a confirmed refusal runs the adapter-owned
+            // local cleanup. An unresolved acknowledgement is an explicit
+            // ownership failure and the group is never reaped blind.
+            RegistrationState::Pending => {
+                match self.control.read_response(REVOKE_ACK_TIMEOUT).await {
+                    Ok(EncoderControlResponse::Register { refused: false }) => {
+                        self.registration = RegistrationState::Armed;
+                        self.revoke_registered().await?;
+                        self.stop_kill_reap().await
+                    }
+                    Ok(EncoderControlResponse::Register { refused: true }) => {
+                        self.registration = RegistrationState::Refused;
+                        self.stop_kill_reap().await
+                    }
+                    Ok(other) => bail!("Unexpected encoder control response while resolving registration: {other:?}"),
+                    Err(error) => bail!("ENCODER_REGISTRATION_UNRESOLVED: {error:#}"),
+                }
+            }
+            // A confirmed refusal (or a group with no endpoint registration)
+            // is adapter-owned and is stopped locally.
+            RegistrationState::Refused | RegistrationState::Unregistered => self.stop_kill_reap().await,
         }
-        self.stop_kill_reap().await
+    }
+
+    /// Send `RevokeEncoder` and require the typed non-refused acknowledgement
+    /// before the group is addressed. A refused or unresolved revoke is an
+    /// explicit ownership failure; the caller must not treat it as
+    /// acknowledgement or proceed to reap.
+    async fn revoke_registered(&mut self) -> Result<()> {
+        let registration_id = self.registration_id;
+        match self.control.revoke(registration_id).await? {
+            EncoderControlResponse::Revoke { refused: false } => Ok(()),
+            EncoderControlResponse::Revoke { refused: true } => {
+                bail!("ENCODER_REVOKE_REFUSED: endpoint refused revoke for registration {registration_id}")
+            }
+            other => bail!("Unexpected encoder control response: {other:?}"),
+        }
     }
 
     /// Refused-permit local cleanup. The endpoint never stored this group, so
@@ -294,7 +374,7 @@ impl EncoderChildOwner {
         .context("Encoder leader reap deadline exceeded")??;
         self.group = None;
         self.child = None;
-        self.armed = false;
+        self.registration = RegistrationState::Unregistered;
         Ok(status)
     }
 }
@@ -333,34 +413,41 @@ struct EncoderControlClient {
 }
 
 impl EncoderControlClient {
-    async fn exchange(&mut self, request: &EncoderControlRequest) -> Result<EncoderControlResponse> {
+    async fn exchange(&mut self, request: &EncoderControlRequest, timeout: Duration) -> Result<EncoderControlResponse> {
         let mut bytes = serde_json::to_vec(request)?;
         bytes.push(b'\n');
-        tokio::time::timeout(Duration::from_secs(2), self.writer.write_all(&bytes)).await??;
+        tokio::time::timeout(timeout, self.writer.write_all(&bytes)).await??;
+        self.read_response(timeout).await
+    }
+
+    /// Read one bounded typed response. It is used both for a normal exchange
+    /// and to resolve an outstanding `Register` acknowledgement whose read was
+    /// interrupted by cancellation.
+    async fn read_response(&mut self, timeout: Duration) -> Result<EncoderControlResponse> {
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(2), self.reader.read_line(&mut line)).await??;
+        tokio::time::timeout(timeout, self.reader.read_line(&mut line)).await??;
         ensure!(line.ends_with('\n') && line.len() <= 4096, "Invalid bounded encoder control response");
         line.pop();
         Ok(serde_json::from_str(&line).context("Decode encoder control response")?)
     }
 
     async fn acquire(&mut self, registration_id: u64) -> Result<EncoderPermit> {
-        match self.exchange(&EncoderControlRequest::Acquire { registration_id }).await? {
+        match self.exchange(&EncoderControlRequest::Acquire { registration_id }, CONTROL_EXCHANGE_TIMEOUT).await? {
             EncoderControlResponse::Acquire { permit } => Ok(permit),
             other => bail!("Unexpected encoder control response: {other:?}"),
         }
     }
 
     async fn register(&mut self, registration_id: u64, pgid: i32) -> Result<EncoderControlResponse> {
-        self.exchange(&EncoderControlRequest::Register { registration_id, pgid }).await
+        self.exchange(&EncoderControlRequest::Register { registration_id, pgid }, CONTROL_EXCHANGE_TIMEOUT).await
     }
 
     async fn revoke(&mut self, registration_id: u64) -> Result<EncoderControlResponse> {
-        self.exchange(&EncoderControlRequest::Revoke { registration_id }).await
+        self.exchange(&EncoderControlRequest::Revoke { registration_id }, REVOKE_ACK_TIMEOUT).await
     }
 
     async fn settle(&mut self, registration_id: u64, outcome: EncoderSettlement) -> Result<()> {
-        match self.exchange(&EncoderControlRequest::Settle { registration_id, outcome }).await? {
+        match self.exchange(&EncoderControlRequest::Settle { registration_id, outcome }, CONTROL_EXCHANGE_TIMEOUT).await? {
             EncoderControlResponse::Settle => Ok(()),
             other => bail!("Unexpected encoder control response: {other:?}"),
         }

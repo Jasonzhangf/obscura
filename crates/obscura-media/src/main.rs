@@ -5,6 +5,16 @@ use clap::Parser;
 use obscura_host_protocol::{FramePacket, VideoCodec, VideoPacket};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+/// One in-flight blocking operation result, or the lifetime signal that
+/// cancelled it. Every potentially blocking await in the adapter loop competes
+/// with SIGTERM/ctrl-c through this wrapper, so the cancellation endpoint stays
+/// reachable even while the adapter waits on an idle raw socket, forwards a
+/// non-frame packet, or blocks on a stalled output consumer.
+enum Run<T> {
+    Finished(T),
+    Interrupted(&'static str),
+}
+
 /// One in-flight encode result or the signal that cancelled its borrow.
 enum EncodeRun {
     Finished(Result<Vec<u8>>),
@@ -59,13 +69,22 @@ async fn main() -> Result<()> {
         }
     };
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // One receiver pair is shared for the whole lifetime: each raced operation
+    // re-borrows it so a signal that arrives during any await is observed, not
+    // queued until the next encode.
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     let encoder_id = uuid::Uuid::new_v4().to_string();
     let start = Instant::now();
     let mut session = None;
     let mut previous: Option<(u64, u64, u64)> = None;
     loop {
         let mut header = Vec::new();
-        (&mut reader).take(4096).read_until(b'\n', &mut header).await?;
+        match race(ctrl_c.as_mut(), &mut term, async {
+            (&mut reader).take(4096).read_until(b'\n', &mut header).await
+        }).await {
+            Run::Finished(read) => { read?; }
+            Run::Interrupted(signal) => return interrupt(&mut owner, signal).await,
+        }
         ensure!(!header.is_empty(), "Host media ended without Closed");
         ensure!(header.len() < 4096 && header.last() == Some(&b'\n'), "Invalid bounded media header");
         let packet: FramePacket = serde_json::from_slice(&header).context("Decode Host media header")?;
@@ -90,7 +109,10 @@ async fn main() -> Result<()> {
                 previous = Some((info.sequence, info.document_revision, info.viewport_revision));
                 let pts_us = u64::try_from(start.elapsed().as_micros()).context("Media timestamp exhausted")?;
                 let mut rgba = vec![0; info.byte_length as usize];
-                tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut rgba)).await.context("Incomplete raw frame deadline")??;
+                match race(ctrl_c.as_mut(), &mut term, tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut rgba))).await {
+                    Run::Finished(read) => { read.context("Incomplete raw frame deadline")??; }
+                    Run::Interrupted(signal) => return interrupt(&mut owner, signal).await,
+                }
                 // The complete borrowed encode runs under one signal select.
                 // If a signal wins, the borrow ends before the same retained
                 // owner finalizes the group, so the group is never dropped
@@ -100,15 +122,14 @@ async fn main() -> Result<()> {
                     tokio::pin!(encode);
                     tokio::select! {
                         result = &mut encode => EncodeRun::Finished(result),
-                        _ = tokio::signal::ctrl_c() => EncodeRun::Interrupted("ctrl-c"),
+                        _ = ctrl_c.as_mut() => EncodeRun::Interrupted("ctrl-c"),
                         _ = term.recv() => EncodeRun::Interrupted("SIGTERM"),
                     }
                 };
                 let encoded = match outcome {
                     EncodeRun::Finished(encoded) => encoded,
                     EncodeRun::Interrupted(signal) => {
-                        owner.finalize().await.context("Finalize encoder group on interrupt")?;
-                        return Err(anyhow::anyhow!("Media adapter received {signal} before frame completion"));
+                        return interrupt(&mut owner, signal).await;
                     }
                 };
                 match encoded {
@@ -126,9 +147,38 @@ async fn main() -> Result<()> {
                 }
             }
         };
-        send(&mut output, &packet, &bytes).await?;
+        match race(ctrl_c.as_mut(), &mut term, send(&mut output, &packet, &bytes)).await {
+            Run::Finished(sent) => sent?,
+            Run::Interrupted(signal) => return interrupt(&mut owner, signal).await,
+        }
         if matches!(packet, VideoPacket::Closed { .. }) { return Ok(()); }
     }
+}
+
+/// Race one potentially blocking adapter operation with the lifetime signal.
+/// The operation future is dropped if a signal wins, so a pending header read,
+/// payload read, or output send cannot hold the adapter past SIGTERM.
+async fn race<T>(
+    ctrl_c: impl std::future::Future<Output = std::io::Result<()>> + Unpin,
+    term: &mut tokio::signal::unix::Signal,
+    operation: impl std::future::Future<Output = T>,
+) -> Run<T> {
+    tokio::select! {
+        result = operation => Run::Finished(result),
+        _ = ctrl_c => Run::Interrupted("ctrl-c"),
+        _ = term.recv() => Run::Interrupted("SIGTERM"),
+    }
+}
+
+/// Finish a lifetime interruption: finalize the retained encoder owner only
+/// when it still holds a live child, then return an error so the socket guard
+/// drops and removes the control path. With no live child there is nothing to
+/// settle and the adapter exits directly.
+async fn interrupt(owner: &mut obscura_media::encoder_owner::EncoderChildOwner, signal: &'static str) -> Result<()> {
+    if owner.has_live_child() {
+        owner.finalize().await.context("Finalize encoder group on interrupt")?;
+    }
+    Err(anyhow::anyhow!("Media adapter received {signal} before completion"))
 }
 
 /// Owns the standalone `encoder-control.sock` path this invocation bound. It

@@ -7,12 +7,16 @@
 //! real `--media-bin` adapter. It acts as the adapter on the private
 //! `encoder-control.sock`: it acquires a permit (granted) and then never sends
 //! `Register`, so the endpoint has no signal authority over any group. It then
-//! SIGTERMs the endpoint. Pre-fix the finalizer silently ignored the unsettled
-//! permit, force-killed the adapter and reported successful cleanup. Post-fix
-//! the endpoint returns the declared `SessionTerminal::EncoderPermitUnsettled`
-//! for that registration before it exits. The endpoint's own reported terminal
-//! is the external observable; the abort path that starts the release is real
-//! connection cancellation, not a private hook.
+//! closes the control attachment, which is the real final-reference release.
+//! Pre-fix the finalizer silently ignored the unsettled permit, dropped the
+//! durable (SIGKILLing the retained adapter) and reported successful cleanup, so
+//! the endpoint then shut down with status zero. Post-fix the endpoint keeps the
+//! durable resource owner and the live adapter, surfaces
+//! `SessionTerminal::EncoderPermitUnsettled` through the release, retains the
+//! entry, and reports the per-session failure again through shutdown. The
+//! external observables are the retained adapter process, the retained session
+//! directory and the endpoint's own nonzero exit status; no endpoint-private
+//! state is asserted.
 
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
@@ -77,17 +81,28 @@ async fn exercise() -> anyhow::Result<()> {
     let address = reservation.local_addr()?;
     drop(reservation);
 
-    // A real adapter that connects to the exact-session video socket and traps
-    // SIGTERM without exiting, so the endpoint's cooperative adapter grace
-    // expires while the permit is unsettled.
+    // A real adapter that connects to the exact-session video socket, records
+    // its own pid and a same-owner descendant, and traps SIGTERM without
+    // exiting, so the endpoint's cooperative adapter grace expires while the
+    // permit is unsettled. The retained owner must keep this adapter (and its
+    // descendant) alive until the endpoint itself is torn down.
     let marker = root.join("adapter-signalled");
+    let pid_file = root.join("adapter.pid");
+    let child_file = root.join("adapter-child.pid");
     let media_bin = root.join("adapter.py");
     let script = [
         "#!/usr/bin/env python3",
-        "import signal, socket, sys, time",
+        "import os, signal, socket, subprocess, sys, time",
         "args = sys.argv[1:]",
         "video = args[args.index('--video-socket') + 1]",
         &format!("marker = {mark:?}", mark = marker.display().to_string()),
+        &format!("pid_file = {pid:?}", pid = pid_file.display().to_string()),
+        &format!("child_file = {child:?}", child = child_file.display().to_string()),
+        "with open(pid_file, 'w') as handle:",
+        "    handle.write(str(os.getpid()))",
+        "descendant = subprocess.Popen(['sleep', '300'])",
+        "with open(child_file, 'w') as handle:",
+        "    handle.write(str(descendant.pid))",
         "def on_term(signum, frame):",
         "    open(marker, 'w').close()",
         "signal.signal(signal.SIGTERM, on_term)",
@@ -154,16 +169,42 @@ async fn exercise() -> anyhow::Result<()> {
     anyhow::ensure!(matches!(acquired, EncoderControlResponse::Acquire { permit: EncoderPermit::Granted }),
         "encoder acquire was not granted: {acquired:?}");
 
-    // SIGTERM the endpoint while the permit is unsettled and the adapter is
-    // non-cooperative. Shutdown must surface the declared terminal.
+    // Wait for the adapter's real identity and descendant before triggering the
+    // release, so the retained-ownership observation is grounded.
+    wait_file(&pid_file, Duration::from_secs(15)).await?;
+    wait_file(&child_file, Duration::from_secs(15)).await?;
+    let adapter_pid: i32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+    let descendant_pid: i32 = std::fs::read_to_string(&child_file)?.trim().parse()?;
+    anyhow::ensure!(process_alive(adapter_pid), "fixture adapter was not alive before the release");
+
+    // Close the control attachment. This is the final reference, so the endpoint
+    // runs the exact-session finalizer. The permit stays unsettled, so the
+    // release must remain an explicit failure that retains the durable owner.
+    drop(control);
+    wait_stderr(&stderr_path, "SESSION_ENCODER_PERMIT_UNSETTLED", Duration::from_secs(40)).await?;
+    // Give the failed release a moment to finish dropping nothing: on the fixed
+    // path the adapter must still be alive, on the reverted path kill_on_drop
+    // has already SIGKILLed it.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let adapter_retained = process_alive(adapter_pid);
+    let descendant_retained = process_alive(descendant_pid);
+    let session_dir = root.join(format!("endpoint/session-{session_id}"));
+    // The failed release must retain the durable resource owner: the session
+    // directory and its control path stay on disk while the endpoint is still
+    // alive. This observation is taken before endpoint shutdown, because the
+    // endpoint's own socket-directory guard removes the whole tree on exit.
+    let session_dir_retained = session_dir.exists();
+    let control_path_retained = session_dir.join("encoder-control.sock").exists();
+
+    // SIGTERM the endpoint. Shutdown must surface the retained per-session
+    // failure and exit nonzero. Both the release terminal and the shutdown
+    // terminal carry the registration id.
     if let Some(pid) = endpoint.id() {
         // Safety: signaling the one endpoint process this test spawned.
         let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     }
-    let _ = tokio::time::timeout(Duration::from_secs(40), endpoint.wait()).await;
-    // Keep the control socket and the dummy adapter reachable until shutdown has
-    // finished emitting its terminal.
-    drop(control);
+    let status = tokio::time::timeout(Duration::from_secs(40), endpoint.wait()).await
+        .map_err(|_| anyhow::anyhow!("endpoint did not exit after SIGTERM"))??;
     drop(write);
 
     let stderr = std::fs::read_to_string(&stderr_path)?;
@@ -171,6 +212,30 @@ async fn exercise() -> anyhow::Result<()> {
         "endpoint did not surface an unsettled-permit terminal:\n{stderr}");
     anyhow::ensure!(stderr.contains("41"),
         "unsettled-permit terminal did not carry the registration id:\n{stderr}");
+    // The core G1 resource endpoint: a failed release retains the durable
+    // owner, so the adapter and its separately spawned group stay alive and
+    // the session directory and control path stay on disk. Pre-fix the release
+    // removed the entry, dropped the owner, SIGKILLed the adapter and published
+    // successful cleanup.
+    anyhow::ensure!(adapter_retained,
+        "G1: the failed release dropped the durable owner and SIGKILLed the retained adapter");
+    anyhow::ensure!(descendant_retained,
+        "G1: the retained adapter's separately spawned group was not retained with its owner");
+    anyhow::ensure!(session_dir_retained,
+        "G1: the failed release removed the retained session directory instead of preserving it");
+    anyhow::ensure!(control_path_retained,
+        "G1: the failed release removed the retained encoder-control path");
+    anyhow::ensure!(!status.success(),
+        "endpoint shutdown returned success while an encoder permit was unsettled: {status}");
+    anyhow::ensure!(stderr.contains("ENDPOINT_SESSION_FINALIZE_FAILED"),
+        "shutdown did not surface the retained per-session finalize failure:\n{stderr}");
+
+    // The fixture adapter and its descendant are test-owned. Endpoint teardown
+    // drops the retained owner and SIGKILLs the adapter direct child; the
+    // descendant is not the endpoint's resource, so reap it by explicit pid.
+    unsafe { libc::kill(descendant_pid, libc::SIGKILL); }
+    let _ = wait_pid_gone(adapter_pid, Duration::from_secs(5)).await;
+    let _ = wait_pid_gone(descendant_pid, Duration::from_secs(5)).await;
 
     let _ = host.kill().await;
     let _ = host.wait().await;
@@ -216,6 +281,41 @@ async fn wait_socket(path: PathBuf) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+async fn wait_file(path: &std::path::Path, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !path.exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "file never appeared: {}", path.display());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+async fn wait_stderr(path: &std::path::Path, needle: &str, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if text.contains(needle) { return Ok(()); }
+        }
+        anyhow::ensure!(tokio::time::Instant::now() < deadline,
+            "endpoint never reported {needle}:\n{}", std::fs::read_to_string(path).unwrap_or_default());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn process_alive(pid: i32) -> bool {
+    // Safety: signal 0 performs an existence/permission check only.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+async fn wait_pid_gone(pid: i32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while process_alive(pid) {
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
 }
 
 fn identity(state: &serde_json::Value) -> serde_json::Value {

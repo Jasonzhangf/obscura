@@ -1,5 +1,5 @@
 use std::{collections::HashMap, net::SocketAddr, os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt}, path::{Path, PathBuf}, process::Stdio, sync::{Arc, Mutex}, time::Duration};
-use anyhow::{ensure, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use obscura_media::EncodedFrame;
 use tokio::{net::{TcpListener, UnixListener}, process::Child, sync::{watch, oneshot, Mutex as AsyncMutex, Semaphore}};
 use tokio_rustls::{TlsAcceptor, rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}}};
@@ -267,27 +267,39 @@ struct SessionMediaEntry {
     references: usize,
     finalizing: bool,
     /// Present from the moment `finalizing` is set. The finalizer task owns the
-    /// sender and signals `true` when it finishes (supervisor join plus entry
-    /// removal). A closed channel also releases awaiters if that task ends
-    /// without signalling, so shutdown can await an in-progress finalizer
-    /// instead of only newly initiated ones.
-    completion: Option<watch::Receiver<bool>>,
+    /// sender and publishes the terminal result when it finishes. It publishes
+    /// `Succeeded` only after the session's resources are actually removed; a
+    /// failed finalization publishes `Failed` and leaves the entry (and its
+    /// durable resource owner, live adapter child and paths) retained, so
+    /// release and shutdown can never convert an unsettled encoder permit into
+    /// successful cleanup. Awaiters subscribe to this sender.
+    completion: Option<watch::Sender<CompletionState>>,
+}
+
+/// The terminal result of one session finalization. `Running` is the initial
+/// value; `Succeeded` means every resource was removed; `Failed` retains the
+/// durable owner and carries the exact terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletionState {
+    Running,
+    Succeeded,
+    Failed(String),
 }
 
 enum Release {
     Absent,
     Referenced,
-    Ready(Arc<SessionDurable>, watch::Sender<bool>),
-    Finalizing,
+    Ready(Arc<SessionDurable>, watch::Sender<CompletionState>),
+    Finalizing(watch::Receiver<CompletionState>),
 }
 
 /// Outcome of asking the registry to finalize one entry. A fresh entry yields
-/// the supervisor handle and a completion sender to signal; an entry that is
-/// already finalizing yields its in-progress completion receiver to await.
+/// the supervisor handle and a completion sender to publish on; an entry that
+/// is already finalizing yields its in-progress completion receiver to await.
 enum FinalizeAction {
     Absent,
-    InProgress(Option<watch::Receiver<bool>>),
-    Start(Option<tokio::task::JoinHandle<Result<()>>>, watch::Sender<bool>),
+    InProgress(watch::Receiver<CompletionState>),
+    Start(Option<tokio::task::JoinHandle<Result<()>>>, watch::Sender<CompletionState>),
 }
 
 /// The endpoint's per-session registry. It owns every `SessionDurable` and the
@@ -366,12 +378,18 @@ impl SessionMediaRegistry {
 
     fn release(&mut self, durable: &Arc<SessionDurable>) -> Release {
         let Some(entry) = self.entries.get_mut(&durable.session_id) else { return Release::Absent; };
-        if entry.finalizing { return Release::Finalizing; }
+        if entry.finalizing {
+            let receiver = entry.completion.as_ref().map(|completion| completion.subscribe());
+            return match receiver {
+                Some(receiver) => Release::Finalizing(receiver),
+                None => Release::Absent,
+            };
+        }
         entry.references = entry.references.saturating_sub(1);
         if entry.references == 0 {
             entry.finalizing = true;
-            let (completion, completion_rx) = watch::channel(false);
-            entry.completion = Some(completion_rx);
+            let (completion, _completion_rx) = watch::channel(CompletionState::Running);
+            entry.completion = Some(completion.clone());
             Release::Ready(Arc::clone(&entry.durable), completion)
         } else {
             Release::Referenced
@@ -381,11 +399,14 @@ impl SessionMediaRegistry {
     fn begin_finalize(&mut self, durable: &Arc<SessionDurable>) -> FinalizeAction {
         let Some(entry) = self.entries.get_mut(&durable.session_id) else { return FinalizeAction::Absent; };
         if entry.finalizing {
-            return FinalizeAction::InProgress(entry.completion.clone());
+            return match entry.completion.as_ref() {
+                Some(completion) => FinalizeAction::InProgress(completion.subscribe()),
+                None => FinalizeAction::Absent,
+            };
         }
         entry.finalizing = true;
-        let (completion, completion_rx) = watch::channel(false);
-        entry.completion = Some(completion_rx);
+        let (completion, _completion_rx) = watch::channel(CompletionState::Running);
+        entry.completion = Some(completion.clone());
         let supervisor = entry.durable.supervisor.lock().expect("supervisor owner").take();
         FinalizeAction::Start(supervisor, completion)
     }
@@ -412,13 +433,20 @@ impl SessionMediaRegistry {
     }
 }
 
-/// Await one entry's finalization completion. A closed channel means the
-/// completion task ended (or panicked) without signalling; either way the
-/// finalizer is no longer running, so shutdown may proceed.
-async fn await_completion(receiver: Option<watch::Receiver<bool>>) {
-    let Some(mut receiver) = receiver else { return; };
-    while !*receiver.borrow() {
-        if receiver.changed().await.is_err() { break; }
+/// Await one entry's finalization completion and report its terminal result.
+/// `Succeeded` means resources were removed; `Failed` carries the exact
+/// terminal and the entry is retained. A closed channel means the completion
+/// sender was dropped without publishing, which is itself a failure.
+async fn await_completion(mut receiver: watch::Receiver<CompletionState>) -> Result<()> {
+    loop {
+        match receiver.borrow().clone() {
+            CompletionState::Running => {}
+            CompletionState::Succeeded => return Ok(()),
+            CompletionState::Failed(failure) => return Err(anyhow::anyhow!(failure)),
+        }
+        if receiver.changed().await.is_err() {
+            bail!("SESSION_FINALIZE_ABANDONED: session finalizer ended without a terminal result");
+        }
     }
 }
 
@@ -504,37 +532,55 @@ impl EndpointOwner {
         let action = { self.registry.lock().await.begin_finalize(durable) };
         match action {
             FinalizeAction::Absent => Ok(()),
-            FinalizeAction::InProgress(completion) => {
-                await_completion(completion).await;
-                Ok(())
-            }
+            FinalizeAction::InProgress(completion) => await_completion(completion).await,
             FinalizeAction::Start(supervisor, completion) => {
                 durable.cancel.send_replace(true);
                 let joined = match supervisor {
                     Some(supervisor) => supervisor.await,
                     None => Ok(Ok(())),
                 };
-                self.registry.lock().await.remove_finalized(durable);
-                completion.send_replace(true);
-                match joined {
+                let result = match joined {
                     Ok(result) => result,
                     Err(error) => Err(anyhow::Error::new(error).context("Session supervisor panicked")),
+                };
+                match result {
+                    Ok(()) => {
+                        self.registry.lock().await.remove_finalized(durable);
+                        completion.send_replace(CompletionState::Succeeded);
+                        Ok(())
+                    }
+                    Err(error) => {
+                        // A failed finalizer retains the durable resource
+                        // owner, live adapter child and session paths. The
+                        // entry is not removed; the terminal is published so
+                        // every awaiter observes the failure, not success.
+                        completion.send_replace(CompletionState::Failed(error.to_string()));
+                        Err(error)
+                    }
                 }
             }
         }
     }
 
     /// Actual endpoint shutdown: sets the shutdown watch, then finalizes every
-    /// session through the same session-local owner.
+    /// session through the same session-local owner. A per-session failure is
+    /// kept scoped to that session and surfaced, not converted into a
+    /// successful endpoint shutdown.
     async fn finalize_all(&mut self) -> Result<()> {
         self.shutdown.send_replace(true);
         let snapshots = self.registry.lock().await.snapshots();
+        let mut failures = Vec::new();
         for durable in snapshots {
             if let Err(error) = self.finalize_session(&durable).await {
                 eprintln!("endpoint session finalize: {error}");
+                failures.push(error.to_string());
             }
         }
-        Ok(())
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            bail!("ENDPOINT_SESSION_FINALIZE_FAILED: {}", failures.join("; "))
+        }
     }
 }
 
@@ -686,8 +732,10 @@ impl SessionBindingGuard {
         let durable = self.bound.lock().expect("grant binding owner").take();
         if let Some(durable) = durable {
             let registry = Arc::clone(&self.registry);
-            let completion = tokio::spawn(async move { release_exact_session(&registry, &durable).await; });
-            let _ = completion.await;
+            let completion = tokio::spawn(async move { release_exact_session(&registry, &durable).await });
+            if let Ok(Err(error)) = completion.await {
+                eprintln!("session media finalize terminal: {error}");
+            }
         }
     }
 }
@@ -697,7 +745,11 @@ impl Drop for SessionBindingGuard {
         let Some(durable) = self.bound.lock().expect("grant binding owner").take() else { return; };
         let registry = Arc::clone(&self.registry);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move { release_exact_session(&registry, &durable).await; });
+            runtime.spawn(async move {
+                if let Err(error) = release_exact_session(&registry, &durable).await {
+                    eprintln!("session media finalize terminal: {error}");
+                }
+            });
         }
     }
 }
@@ -743,8 +795,8 @@ impl SessionGrant {
     }
 
     /// Lose one control reference for the exact binding. At zero references it
-    /// finalizes only that session.
-    pub async fn release(&self, durable: &Arc<SessionDurable>) {
+    /// finalizes only that session and returns its terminal result.
+    pub async fn release(&self, durable: &Arc<SessionDurable>) -> Result<()> {
         {
             let mut bound = self.bound.lock().expect("grant binding owner");
             if bound.as_ref().is_some_and(|held| Arc::ptr_eq(held, durable)) {
@@ -753,8 +805,11 @@ impl SessionGrant {
         }
         let registry = Arc::clone(&self.registry);
         let durable = Arc::clone(durable);
-        let completion = tokio::spawn(async move { release_exact_session(&registry, &durable).await; });
-        let _ = completion.await;
+        let completion = tokio::spawn(async move { release_exact_session(&registry, &durable).await });
+        match completion.await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::Error::new(error).context("session finalizer task panicked")),
+        }
     }
 }
 
@@ -768,33 +823,51 @@ impl Drop for SessionGrant {
 
 /// Drop one exact-session reference and, at zero references, join that
 /// session's supervisor. Only the exact session is finalized; other sessions
-/// and the endpoint lifetime are untouched.
-async fn release_exact_session(registry: &Arc<AsyncMutex<SessionMediaRegistry>>, durable: &Arc<SessionDurable>) {
+/// and the endpoint lifetime are untouched. A failed finalizer retains the
+/// durable resource owner and its exact terminal instead of publishing
+/// successful cleanup.
+async fn release_exact_session(registry: &Arc<AsyncMutex<SessionMediaRegistry>>, durable: &Arc<SessionDurable>) -> Result<()> {
     let released = {
         let mut registry = registry.lock().await;
         match registry.release(durable) {
             Release::Ready(durable, completion) => Some((durable, completion)),
-            Release::Absent | Release::Referenced | Release::Finalizing => None,
+            Release::Finalizing(completion) => return await_completion(completion).await,
+            Release::Absent | Release::Referenced => None,
         }
     };
-    let Some((durable, completion)) = released else { return; };
+    let Some((durable, completion)) = released else { return Ok(()); };
     let supervisor = durable.supervisor.lock().expect("supervisor owner").take();
     let registry = Arc::clone(registry);
     // The completion runs in a detached task so aborting the caller after the
     // reference reaches zero cannot strand the entry in `finalizing`.
     let task = tokio::spawn(async move {
         durable.cancel.send_replace(true);
-        if let Some(supervisor) = supervisor {
-            match supervisor.await {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => eprintln!("session media finalize terminal: {error}"),
-                Err(error) => eprintln!("session media supervisor panicked: {error}"),
+        let joined = match supervisor {
+            Some(supervisor) => match supervisor.await {
+                Ok(result) => result,
+                Err(error) => Err(anyhow::Error::new(error).context("Session supervisor panicked")),
+            },
+            None => Ok(()),
+        };
+        match joined {
+            Ok(()) => {
+                registry.lock().await.remove_finalized(&durable);
+                completion.send_replace(CompletionState::Succeeded);
+                Ok(())
+            }
+            Err(error) => {
+                // Retain the durable, the live child and the paths on failure;
+                // publish the exact terminal so a later waiter observes it.
+                eprintln!("session media finalize terminal: {error}");
+                completion.send_replace(CompletionState::Failed(error.to_string()));
+                Err(error)
             }
         }
-        registry.lock().await.remove_finalized(&durable);
-        completion.send_replace(true);
     });
-    let _ = task.await;
+    match task.await {
+        Ok(result) => result,
+        Err(error) => Err(anyhow::Error::new(error).context("session finalizer task panicked")),
+    }
 }
 
 fn write_applied_receipt(args: &Args, projection: &remote_authorization::LoadedProjection, bound: SocketAddr) -> Result<()> {

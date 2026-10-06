@@ -53,6 +53,89 @@ of the early full-suite runs and passed in the four env2-5 runs.
 `crates/obscura-browser` is untouched by the whole task delta and is outside this
 node's allowed write scope, so it was left unchanged.
 
+## P3-r10 second review-finding closure (controller admission block)
+
+Task `m1-host-p3-implementation-r10-20261005`, worker `gcm-host-p3-r10`, fresh
+standalone GCM author. Controller owns git add/commit/merge/push, review and
+installation. The author must not commit, reset, rebase, cherry-pick or override
+hooksPath, and must not launch children or register Collab.
+
+Admission facts the controller verified before writing this block:
+
+- Start HEAD: `9be2f0826b6d90ad44838420cd27f4b3864fe6f4`
+  (tree `bcd4b99f4627f8257b4dae0a18af0439bab04e54`), branch
+  `codex/m1-host-p3-implementation-20261005`.
+- Parent chain: `9d02931f` (task base) → `9f53cbe` → `baca971` → `6d64a02` →
+  `dfdf495` → `b2584ee` → `759b99a` (rejected) → `c9264e2c` (r7) →
+  `6b7710c6` (r8, review FAIL) → `9be2f082` (r9).
+- Working tree: only the pre-existing untracked
+  `docs/runs/m1-frame-forwarding-impl-r1-20261005/` is present. It must never be
+  added, modified or deleted.
+- Target grant: the sole Obscura target is
+  `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target`, held
+  by this task for build and test only, with `CARGO_INCREMENTAL=0` and
+  `CARGO_BUILD_JOBS=2`. No shared runtime, install, restart, device, OTA, merge
+  or push is granted.
+- `OBSCURA_TEST_BINARY_DIR` must point at
+  `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/debug`.
+
+Why this node exists: the independent implementation review of `9be2f082`
+(task `m1-host-p3-implementation-20261005-r3`, `mode=base`, base `9d02931f`)
+returned **FAIL with five P1 findings and zero P0**. The review record is at
+`.agent-collab/review/m1-host-p3-implementation-20261005-r3/review.final.md`.
+The r2 FAIL record is preserved beside it. The eight r7 fixes, the four r8 fixes
+and the four r9 fixes are not re-opened, and every existing regression must stay
+green.
+
+| Time / node | Conclusion or state | Evidence path | Input version and environment | Next |
+| --- | --- | --- | --- | --- |
+| 2026-10-06T21:2xZ / A0 `admission` (r10) | PREPARED by the controller. Author must confirm `git rev-parse HEAD` = `9be2f0826b6d90ad44838420cd27f4b3864fe6f4` and a clean tracked tree, then record its own A1 row. | this block; `git rev-parse HEAD`; `git status --porcelain`; `ob-shared-target-lease.json` | HEAD `9be2f082`; granted target | Close G1-G5 with black-box pairs. |
+| 2026-10-06T21:1xZ / A1 `admission` (r10) | PASS. HEAD `9be2f0826b6d90ad44838420cd27f4b3864fe6f4`, branch `codex/m1-host-p3-implementation-20261005`. Working tree clean except the controller's admission-block edit to this `notes.md` and the protected untracked `docs/runs/m1-frame-forwarding-impl-r1-20261005/` directory (never add, modify or delete). Target lease `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target` with `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`; `OBSCURA_TEST_BINARY_DIR` points at that target's `debug` dir. | record `notes.md` A1 row; `git rev-parse HEAD`; `git status --porcelain` | HEAD `9be2f082`; granted target | Close G1-G5 with black-box before/after pairs. |
+
+## P3-r10 five-finding closure rows
+
+Terminal: **COMPLETE for the r10 node**. The five P1 findings G1-G5 from the r3
+implementation review of `9be2f082` are fixed, each with a real public-surface
+discriminating before/after pair (before EXIT != 0 with the finding's assertion,
+after EXIT = 0). The r7/r8/r9 regressions stay green; the focused suites, the
+three release builds, the CLI dependency check, and two full workspace gates
+(`1822 passed, 4 skipped`) are green. No product fix outside G1-G5 was made. No
+commit, merge, install, restart, OTA, device, or runtime operation was
+performed. Per-file delta sha256 and the full raw index are in the worker record
+`gcm-host-p3-r10/report.md`, `result.json`, and `raw/`.
+
+| Time / node | Conclusion or state | Evidence path | Input version and environment | Next |
+| --- | --- | --- | --- | --- |
+| 2026-10-06T15:3xZ / A1 `admission` (r10) | PASS. HEAD `9be2f0826b6d90ad44838420cd27f4b3864fe6f4`, tree `bcd4b99f4627f8257b4dae0a18af0439bab04e54`; tracked tree clean except this admission edit; sole target lease `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target` with `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`. | record `notes.md` A1; `git rev-parse HEAD`; `git status --porcelain` | HEAD `9be2f082`; granted target | Close G1-G5. |
+| 2026-10-06T15:3xZ / G1 `unsettled-permit-retention` (r10) | FIXED. Owner `crates/obscura-host/src/endpoint/server.rs` (+ `channels.rs`). Completion state carries the finalization result; a failed release retains the registry entry, durable owner, live adapter and session paths, and shutdown surfaces the per-session failure. Pair: `blackbox_b9_unsettled_permit::unsettled_encoder_permit_is_an_explicit_terminal` before EXIT=100 (`G1: the failed release dropped the durable owner and SIGKILLed the retained adapter`) after EXIT=0. | `raw/g1-before.{log,exit}`; `raw/g1-after.{log,exit}` | HEAD `9be2f082` + r10 delta; debug nextest; real mTLS endpoint + real adapter | G2. |
+| 2026-10-06T15:4xZ / G2 `pending-registration` (r10) | FIXED. Owner `crates/obscura-media/src/encoder_owner.rs`. `RegistrationState::{Unregistered,Pending,Armed,Refused}` records `Pending` before the `Register` write; an interrupt in that window resolves the typed acknowledgement and revokes before reaping. Pair: `registration_blackbox::standalone_adapter_resolves_pending_registration_before_reaping` before EXIT=100 (no revoke reached the endpoint) after EXIT=0. | `raw/g2-before.{log,exit}`; `raw/g2-after.{log,exit}` | HEAD `9be2f082` + r10 delta; real adapter + real control socket | G3. |
+| 2026-10-06T15:4xZ / G3 `revoke-ack-before-reap` (r10) | FIXED. Owner `crates/obscura-media/src/encoder_owner.rs`. The registered path requires the typed non-refused `Revoke` acknowledgement before the group is addressed; `REVOKE_ACK_TIMEOUT` is 10s, covering the endpoint's 2s SIGTERM + 2s SIGKILL signal authority. Pair: `registration_blackbox::standalone_adapter_requires_revoke_ack_before_reaping_registered_leader` before EXIT=100 (leader reaped before ack) after EXIT=0. | `raw/g3-before.{log,exit}`; `raw/g3-after.{log,exit}` | HEAD `9be2f082` + r10 delta; real adapter + real control socket | G4. |
+| 2026-10-06T15:4xZ / G4 `post-reap-signal` (r10) | FIXED. Owner `crates/obscura-media/src/encoder_owner.rs`. `run_encode` settles the group through `stop_kill_reap` while the leader identity is still pinned and `reaped_status` retires group/child/registration, so no group signal can address a reused pgid after `child.wait()`. Pair: `cleanup_blackbox::standalone_adapter_retires_group_authority_before_reaping_nonzero_encoder` and `..._empty_encoder_output` before EXIT=100 (marker `gone`) after EXIT=0 (`present`). | `raw/g4-before.{log,exit}`; `raw/g4-after.{log,exit}` | HEAD `9be2f082` + r10 delta; real standalone adapter + real process group | G5. |
+| 2026-10-06T15:4xZ / G5 `idle-sigterm` (r10) | FIXED. Owner `crates/obscura-media/src/main.rs`. The adapter races its blocking header read, payload read, encode and output send against the lifetime SIGTERM/ctrl-c receiver; interruption finalizes only a live child and exits so the control-socket guard releases the path. Pair: `cleanup_blackbox::standalone_adapter_exits_on_sigterm_while_waiting_for_frames` before EXIT=100 (idle adapter ignored SIGTERM) after EXIT=0. | `raw/g5-before.{log,exit}`; `raw/g5-after.{log,exit}` | HEAD `9be2f082` + r10 delta; real standalone adapter + real filesystem socket | Focused suites. |
+| 2026-10-06T15:5xZ / A5 `focused-green` (r10) | PASS. `obscura-host --features render`: 122/122 EXIT=0. `obscura-media --features webrtc`: 29/29 EXIT=0. Both `-j 4`, `OBSCURA_TEST_BINARY_DIR` = lease `target/debug`, `OBSCURA_WEBRTC_RAW_DIR` = record `raw/webrtc`. | `raw/a5-host-focused.{log,exit}`; `raw/a5-media-focused.{log,exit}` | HEAD `9be2f082` + r10 delta; granted target | Builds. |
+| 2026-10-06T15:5xZ / A6 `builds` (r10) | PASS. media `--features webrtc`, host `--bins`, cli `--bins --features render`, each EXIT=0 in release. | `raw/a6-build-media.{log,exit}`; `raw/a6-build-host.{log,exit}`; `raw/a6-build-cli.{log,exit}` | HEAD `9be2f082` + r10 delta; granted target | Full gate. |
+| 2026-10-06T15:5xZ / A7 `full-gate` (r10) | PASS twice. `cargo nextest run --workspace --features render -j 4 --no-fail-fast` in debug with `OBSCURA_TEST_BINARY_DIR` = lease `target/debug`: run 1 `1822 passed, 4 skipped` EXIT=0; run 2 same EXIT=0. The 1822 is the r9 baseline 1820 plus the new G2/G4/G5 regressions. One earlier run is retained red (`raw/a7-full-gate-1-red-continuous-timeout.*`, EXIT=100): `webrtc_endpoint::real_receiver_gets_continuous_host_media_and_rejects_stale_binding` hit its hard 180s fixture timeout under load; it passes isolated in 15.5s and in both green gates. | `raw/a7-full-gate-1.{log,exit}`; `raw/a7-full-gate-2.{log,exit}`; `raw/a7-full-gate-1-red-continuous-timeout.{log,exit}`; `raw/probe-continuous-iso.{log,exit}` | HEAD `9be2f082` + r10 delta; `-j 4`; granted target | A8. |
+| 2026-10-06T15:5xZ / A8 `tree-and-diff` (r10) | PASS. `cargo tree -p obscura-cli --features render --locked` EXIT=0 with zero `obscura-host`/`obscura-media` edges. `git diff --check` EXIT=0. `protocol/browser/src/lib.rs` unchanged; `HOST_PROTOCOL_VERSION` remains 11. | `raw/a8-cli-tree.{log,exit}`; `raw/a8-diff-check.{log,exit}` | HEAD `9be2f082` + r10 delta | A9 docs. |
+| 2026-10-06T15:5xZ / A9 `docs` (r10) | COMPLETE. Whole-task notes/report/result and the worker record (`notes.md`, `report.md`, `result.json`, `handoff.md`, `raw/`) written. | this file; `report.md`; `result.json`; record dir | HEAD `9be2f082` + r10 delta | Return to controller. |
+
+### r10 disclosures
+
+- The `before` runs revert only the named finding's fix in the working tree and
+  restore the fixed source byte-for-byte afterwards (verified by sha256). The
+  same r10 tests, target and environment were used for before and after.
+- The `webrtc_endpoint` integration fixture defaults its raw output root into the
+  protected untracked `docs/runs/m1-frame-forwarding-impl-r1-20261005/` tree.
+  This task's first host focused run and first full gate wrote 37 UUID fixture
+  directories there before `OBSCURA_WEBRTC_RAW_DIR` was set. The exact list was
+  recorded (`gcm-host-p3-r10/raw/protected-dir-contamination.list`) and only
+  those task-owned directories were removed, restoring the tree to its 70-entry
+  pre-task state; all later runs used `OBSCURA_WEBRTC_RAW_DIR` under the worker
+  record. No pre-existing entry was removed.
+- Resource cleanup: this task's five `/tmp/ob9-*` fixture roots and the one
+  `/tmp/ow-*` root left by the timed-out gate run were removed with exact-path
+  `find -delete` (list: `gcm-host-p3-r10/raw/r10-fixture-dirs-cleanup.list`). No
+  other owner's `/tmp` resources or processes were touched.
+
 ## P3-r9 review-finding closure (controller admission block)
 
 Task `m1-host-p3-implementation-r9-20261005`, worker `gcm-host-p3-r9`, fresh

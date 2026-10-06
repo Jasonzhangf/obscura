@@ -410,7 +410,12 @@ async fn reconcile_binding(
     let unchanged = binding.as_ref().is_some_and(|(session_id, _, _)| Some(session_id) == wanted.as_ref());
     if unchanged { return; }
     if let Some((_, durable, _)) = binding.take() {
-        grant.release(&durable).await;
+        // A failed finalizer is retained and reported by the durable owner; it
+        // must not abort the surviving control attachment or another session's
+        // media.
+        if let Err(error) = grant.release(&durable).await {
+            eprintln!("media binding release failed: {error}");
+        }
     }
     if let Some(session_id) = wanted {
         match grant.acquire(&session_id).await {
@@ -425,7 +430,9 @@ async fn release_binding(
     binding: &mut Option<(String, Arc<SessionDurable>, watch::Receiver<Option<Arc<EncodedFrame>>>)>,
 ) {
     if let Some((_, durable, _)) = binding.take() {
-        grant.release(&durable).await;
+        if let Err(error) = grant.release(&durable).await {
+            eprintln!("media binding release failed: {error}");
+        }
     }
 }
 
