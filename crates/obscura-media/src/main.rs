@@ -35,6 +35,9 @@ async fn main() -> Result<()> {
     // socket, so no new CLI flag or ABI is introduced.
     let control_dir = args.video_socket.parent().context("Video socket has no parent directory")?;
     let control_path = control_dir.join("encoder-control.sock");
+    // Lifetime owner for the standalone control socket this invocation binds.
+    // It removes only the path this invocation created, on every exit path.
+    let mut _standalone_control: Option<ControlSocketGuard> = None;
     let mut owner = match obscura_media::encoder_owner::EncoderChildOwner::open(&args.ffmpeg, &control_path).await {
         Ok(owner) => owner,
         Err(endpoint_error) => {
@@ -44,6 +47,12 @@ async fn main() -> Result<()> {
             // sessions already bound this path, so they take the branch above.
             let listener = tokio::net::UnixListener::bind(&control_path)
                 .with_context(|| format!("Open Host encoder control ({endpoint_error})"))?;
+            // The bind above succeeds only when this invocation created the
+            // path. Own it for the whole adapter lifetime so a later invocation
+            // can bind the same consumer directory again. A pre-existing path
+            // fails the bind and is never removed.
+            _standalone_control = Some(ControlSocketGuard::new(control_path.clone())
+                .context("Record standalone encoder control socket identity")?);
             tokio::spawn(serve_standalone_control(listener));
             obscura_media::encoder_owner::EncoderChildOwner::open(&args.ffmpeg, &control_path).await
                 .context("Open standalone encoder control")?
@@ -119,6 +128,37 @@ async fn main() -> Result<()> {
         };
         send(&mut output, &packet, &bytes).await?;
         if matches!(packet, VideoPacket::Closed { .. }) { return Ok(()); }
+    }
+}
+
+/// Owns the standalone `encoder-control.sock` path this invocation bound. It
+/// removes the path on every exit so a later standalone adapter invocation can
+/// bind the same consumer directory again. Dropping a `UnixListener` does not
+/// unlink the filesystem entry, so the path needs an explicit owner.
+#[cfg(unix)]
+struct ControlSocketGuard {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+impl ControlSocketGuard {
+    fn new(path: PathBuf) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(&path)?;
+        Ok(Self { path, dev: metadata.dev(), ino: metadata.ino() })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ControlSocketGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(metadata) = std::fs::symlink_metadata(&self.path) else { return; };
+        if metadata.dev() == self.dev && metadata.ino() == self.ino {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

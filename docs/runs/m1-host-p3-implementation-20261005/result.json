@@ -1,92 +1,104 @@
 {
-  "task": "m1-host-p3-implementation-r8-20261005",
-  "worker": "gcm-host-p3-r8",
+  "task": "m1-host-p3-implementation-r9-20261005",
+  "worker": "gcm-host-p3-r9",
   "role": "fresh GCM standalone author (not controller or reviewer)",
   "status": "COMPLETE",
-  "reason": "Closed the r8 black-box evidence gap. B1, B4, B6 and B7 now have public-surface discriminating before/after regressions; B5 has a documented impossibility with two public arrangements attempted. No r7 fix was re-litigated and no product source was modified; every temporary revert was restored byte-identical.",
+  "reason": "Closed the four r8 implementation-review P1 findings F1-F4 with public-surface discriminating before/after pairs and preserved the earlier r7/r8 regressions. No commit, merge, install, restart, OTA, device, or runtime operation was performed.",
   "branch": "codex/m1-host-p3-implementation-20261005",
-  "start_head": "c9264e2cb459e791e31a7888233ba7e27cd45afd",
+  "start_head": "6b7710c6c44c1af1e6f061d7df325b398d627ccf",
+  "start_tree": "ddf2f4cca3b939455e6950dca15380d77d53e17f",
+  "end_head": "6b7710c6c44c1af1e6f061d7df325b398d627ccf",
+  "end_tree": "uncommitted working tree; controller owns the candidate commit",
   "task_base": "9d02931f24631e3680b3038601f4e3efe288c0ab",
   "previous_terminal": {
-    "task": "m1-host-p3-implementation-r7-20261005",
-    "worker": "gcm-host-p3-r7",
-    "source_head": "759b99a0c76978efbb070008dd0d21da05465025",
-    "committed_candidate": "c9264e2cb459e791e31a7888233ba7e27cd45afd"
+    "task": "m1-host-p3-implementation-r8-20261005",
+    "worker": "gcm-host-p3-r8",
+    "committed_candidate": "6b7710c6c44c1af1e6f061d7df325b398d627ccf",
+    "review_task": "m1-host-p3-implementation-20261005-r2",
+    "review_result": "FAIL: 4 P1, 0 P0"
   },
   "target_dir": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target",
   "env": {
     "CARGO_INCREMENTAL": "0",
     "CARGO_BUILD_JOBS": "2",
     "CARGO_TARGET_DIR": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target",
-    "OBSCURA_TEST_BINARY_DIR": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/release",
-    "OBSCURA_WEBRTC_RAW_DIR": "/Volumes/Intel/playground/obscura/.worker-runs/m1-host-p3-implementation-r8-20261005/gcm-host-p3-r8/raw/webrtc"
+    "OBSCURA_TEST_BINARY_DIR": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/debug",
+    "OBSCURA_WEBRTC_RAW_DIR": "/Volumes/Intel/playground/obscura/.worker-runs/m1-host-p3-implementation-r9-20261005/gcm-host-p3-r9/raw/webrtc"
   },
   "changed_files_local": [
-    "Cargo.lock",
-    "crates/obscura-host/Cargo.toml",
-    "crates/obscura-host/tests/blackbox_b1_denial_fence.rs",
-    "crates/obscura-host/tests/blackbox_b4_encoder_revoke.rs",
-    "crates/obscura-host/tests/blackbox_b5_cancel_probe.rs",
-    "crates/obscura-host/tests/blackbox_b6_registry_lock.rs",
-    "crates/obscura-host/tests/blackbox_b7_spawn_rollback.rs",
+    "crates/obscura-host/src/endpoint/server.rs",
+    "crates/obscura-host/tests/blackbox_b8_shutdown_join.rs",
+    "crates/obscura-host/tests/blackbox_b9_unsettled_permit.rs",
+    "crates/obscura-media/src/encoder_owner.rs",
+    "crates/obscura-media/src/main.rs",
+    "crates/obscura-media/tests/cleanup_blackbox.rs",
+    "crates/obscura-media/tests/encoder.rs",
     "docs/runs/m1-host-p3-implementation-20261005/notes.md",
     "docs/runs/m1-host-p3-implementation-20261005/report.md",
     "docs/runs/m1-host-p3-implementation-20261005/result.json"
   ],
-  "product_source_touched": false,
-  "restored_source_sha256": {
-    "crates/obscura-host/src/endpoint/server.rs": "2e1e0a8bcbc5e74d2a46898df44d9d871f8f2a654f92fb09c9b117987ce14624",
+  "product_source_touched": true,
+  "final_source_sha256": {
+    "crates/obscura-host/src/endpoint/server.rs": "aa1cf71ce7af09f03f5ea7e5cddb837550405125fcf41debeecbd1fd5bb6c712",
     "crates/obscura-host/src/endpoint/channels.rs": "cee3452160e0ad9089e35464915760d808397972760a4bc248e0200b67faa502",
-    "crates/obscura-host/src/endpoint/encoder_control.rs": "f9b60b05d473bf1705c182c40044271a946d765059c6173895bfe8e21477b512"
+    "crates/obscura-host/src/endpoint/encoder_control.rs": "f9b60b05d473bf1705c182c40044271a946d765059c6173895bfe8e21477b512",
+    "crates/obscura-media/src/encoder_owner.rs": "ee160e7ab371216f11412a68129b5f23ea3d5f718ddb804c3070fa92f61b32bd",
+    "crates/obscura-media/src/main.rs": "7ec02f98f143fffc64ae240b308548a50c3097de415c3c53b96e56d2298efb8b",
+    "crates/obscura-media/src/lib.rs": "49666d57a3dbdb64ea9b8e633ef07bf2a57c934bac42e4fe52f22035f496a7f8",
+    "crates/obscura-host/tests/blackbox_b8_shutdown_join.rs": "aab9bd43f0ccac4b909c8d6724899bd595030eb9b1edce650df526f650b38683",
+    "crates/obscura-host/tests/blackbox_b9_unsettled_permit.rs": "313b7ca03d5b5aaa5843ec7e8d6f2ca2c70ab1342d3d4131b9ec924a07e85741",
+    "crates/obscura-media/tests/cleanup_blackbox.rs": "62f740835afb33dcf04cb356687b9ad4c4aa5ed666c682f4651a209f2a14c5a3",
+    "crates/obscura-media/tests/encoder.rs": "a86f42614c60722d018a00c0de4b19fc83a6d7840d1cfd453c54aceb39c2dbad"
   },
   "findings": {
-    "B1": {
+    "F1": {
       "verdict": "BLACK_BOX_DISCRIMINATING",
-      "test": "blackbox_b1_denial_fence.rs::datachannel_denial_fences_only_the_denied_attachment_media",
-      "surface": "real mTLS endpoint + WSS /media DataChannel, two observers on one session",
+      "test": "blackbox_b8_shutdown_join.rs::endpoint_shutdown_joins_in_progress_final_release",
+      "surface": "real mTLS endpoint + real adapter, SIGTERM during final-reference release",
       "before_exit": 100,
       "after_exit": 0,
-      "evidence": ["raw/b1-dc-before.log", "raw/b1-dc-before.exit", "raw/b1-dc-after.log", "raw/b1-dc-after.exit"]
+      "before_detail": "endpoint returned in 1.638 ms while the release was still in progress",
+      "after_detail": "endpoint waited for the finalizer and reaped the adapter",
+      "evidence": ["raw/f1-before.log", "raw/f1-before.exit", "raw/f1-after.log", "raw/f1-after.exit"]
     },
-    "B4": {
+    "F2": {
       "verdict": "BLACK_BOX_DISCRIMINATING",
-      "test": "blackbox_b4_encoder_revoke.rs::revoke_ack_waits_for_endpoint_group_signal_authority",
-      "surface": "real per-session encoder-control.sock + real registered process group",
+      "test": "cleanup_blackbox.rs::standalone_adapter_settles_encoder_group_on_bounded_output_failure",
+      "surface": "real standalone adapter + configured --ffmpeg wrapper + real process group",
       "before_exit": 100,
       "after_exit": 0,
-      "evidence": ["raw/b4-revoke-before.log", "raw/b4-revoke-before.exit", "raw/b4-revoke-after.log", "raw/b4-revoke-after.exit"]
+      "before_detail": "wrapper group still alive after the bounded-output terminal failure",
+      "after_detail": "group stop/kill/reap completed before adapter exit",
+      "evidence": ["raw/f2-before.log", "raw/f2-before.exit", "raw/f2-after.log", "raw/f2-after.exit"]
     },
-    "B5": {
-      "verdict": "DOCUMENTED_IMPOSSIBLE",
-      "test": "blackbox_b5_cancel_probe.rs::endpoint_shutdown_reaps_bound_session_but_does_not_discriminate_b5",
-      "arrangements": [
-        {"name": "abrupt_control_close", "before_exit": 0, "after_exit": 0, "evidence": ["raw/b5-abrupt-before.exit", "raw/b5-abrupt-after.exit"]},
-        {"name": "endpoint_shutdown_sigterm", "before_exit": 0, "after_exit": 0, "evidence": ["raw/b5-shutdown-before.exit", "raw/b5-shutdown-after.exit"]}
-      ],
-      "reason": "The B5 defect fires only when the hard-coded 3600s connection-lifetime future is cancelled while the endpoint keeps running. Abrupt close uses the normal drop/drain path; endpoint shutdown aborts clients then runs finalize_all over the whole registry. Both mask the cancelled-future path and no public config changes the timeout."
-    },
-    "B6": {
+    "F3": {
       "verdict": "BLACK_BOX_DISCRIMINATING",
-      "test": "blackbox_b6_registry_lock.rs::slow_session_finalize_does_not_block_a_second_session",
-      "surface": "two real mTLS sessions, slow real-adapter finalizer on SIGTERM",
+      "test": "blackbox_b9_unsettled_permit.rs::unsettled_encoder_permit_is_an_explicit_terminal",
+      "surface": "real mTLS endpoint + real adapter control socket; acquired permit with Register withheld",
       "before_exit": 100,
       "after_exit": 0,
-      "evidence": ["raw/b6-registry-r8-before.log", "raw/b6-registry-r8-before.exit", "raw/b6-registry-r8-after.log", "raw/b6-registry-r8-after.exit"]
+      "before_detail": "endpoint exited without SESSION_ENCODER_PERMIT_UNSETTLED",
+      "after_detail": "terminal emitted with registration id 41",
+      "supporting_test": "obscura-media::encoder::encoder_owner_pre_registration_interrupt_reaps_locally_without_revoked",
+      "evidence": ["raw/f3-before.log", "raw/f3-before.exit", "raw/f3-after.log", "raw/f3-after.exit", "raw/f3-prereg-interrupt.log", "raw/f3-prereg-interrupt.exit"]
     },
-    "B7": {
+    "F4": {
       "verdict": "BLACK_BOX_DISCRIMINATING",
-      "test": "blackbox_b7_spawn_rollback.rs::failed_adapter_spawn_rolls_back_and_retry_serves_media",
-      "surface": "real adapter spawn failure via --media-bin, then retry /media upgrade",
+      "test": "cleanup_blackbox.rs::standalone_adapter_releases_its_control_socket_for_reuse",
+      "surface": "two consecutive real standalone adapter invocations in one consumer directory",
       "before_exit": 100,
       "after_exit": 0,
-      "evidence": ["raw/b7-rollback-before.log", "raw/b7-rollback-before.exit", "raw/b7-rollback-after.log", "raw/b7-rollback-after.exit"]
+      "before_detail": "first invocation left encoder-control.sock behind",
+      "after_detail": "both invocations succeeded and the path was removed after each",
+      "evidence": ["raw/f4-before.log", "raw/f4-before.exit", "raw/f4-after.log", "raw/f4-after.exit"]
     }
   },
   "milestones": {
     "A1_admission": "PASS",
-    "A2_before_after_pairs": "PASS",
-    "A3_impossibility_records": "PASS",
-    "A4_no_weakening": "PASS",
+    "A2_f1_pair": "PASS",
+    "A3_f2_pair": "PASS",
+    "A4_f3_pair": "PASS",
+    "A5_f4_pair": "PASS",
     "A5_focused_green": "PASS",
     "A6_three_release_builds": "PASS",
     "A7_full_gate_twice": "PASS",
@@ -94,21 +106,17 @@
     "A9_docs": "COMPLETE"
   },
   "focused_suites": [
-    {"suite": "endpoint", "command": "cargo nextest run --locked --release --features render -j 4 -p obscura-host --test endpoint", "passed": 5, "total": 5, "exit": 0, "evidence": "raw/a5-endpoint.{log,exit}"},
-    {"suite": "persistent", "command": "cargo nextest run --locked --release --features render -j 4 -p obscura-host --test persistent", "passed": 28, "total": 28, "exit": 0, "evidence": "raw/a5-persistent.{log,exit}"},
-    {"suite": "remote_admission_r1", "command": "cargo nextest run --locked --release --features render -j 4 -p obscura-host --test remote_admission_r1", "passed": 37, "total": 37, "exit": 0, "evidence": "raw/a5-remote-admission.{log,exit}"},
-    {"suite": "webrtc_endpoint", "command": "cargo nextest run --locked --release --features render -j 4 -p obscura-host --test webrtc_endpoint", "passed": 12, "total": 12, "exit": 0, "evidence": "raw/a5-webrtc-endpoint.{log,exit}"},
-    {"suite": "obscura-endpoint unit bin", "command": "cargo nextest run --locked --release --features render -j 4 -p obscura-host --bin obscura-endpoint", "passed": 10, "total": 10, "exit": 0, "evidence": "raw/a5-endpoint-units.{log,exit}"},
-    {"suite": "obscura-media stream", "command": "cargo nextest run --locked --release --features webrtc -j 4 -p obscura-media --test stream", "passed": 5, "total": 5, "exit": 0, "evidence": "raw/a5-media-stream.{log,exit}"}
+    {"suite": "obscura-host", "command": "cargo nextest run -p obscura-host --features render -j 4 --no-fail-fast", "passed": 122, "total": 122, "exit": 0, "evidence": "raw/a5-host-focused.{log,exit}"},
+    {"suite": "obscura-media", "command": "cargo nextest run -p obscura-media --features webrtc -j 4 --no-fail-fast", "passed": 23, "total": 23, "exit": 0, "evidence": "raw/a5-media-focused.{log,exit}"}
   ],
   "builds": [
-    {"name": "media", "command": "cargo build --release -p obscura-media --features webrtc --locked", "exit": 0, "evidence": "raw/a6-media-build.{log,exit}"},
-    {"name": "host", "command": "cargo build --release -p obscura-host --bins --locked", "exit": 0, "evidence": "raw/a6-host-build.{log,exit}"},
-    {"name": "cli", "command": "cargo build --release -p obscura-cli --bins --features render --locked", "exit": 0, "evidence": "raw/a6-cli-build.{log,exit}"}
+    {"name": "media", "command": "cargo build --release -p obscura-media --features webrtc", "exit": 0, "evidence": "raw/a6-build-media.{log,exit}"},
+    {"name": "host", "command": "cargo build --release -p obscura-host --bins", "exit": 0, "evidence": "raw/a6-build-host.{log,exit}"},
+    {"name": "cli", "command": "cargo build --release -p obscura-cli --bins --features render", "exit": 0, "evidence": "raw/a6-build-cli.{log,exit}"}
   ],
   "full_gate": [
-    {"run": 1, "command": "cargo nextest run --locked --release --features render --no-fail-fast -j 4", "passed": 1811, "failed": 0, "skipped": 4, "exit": 0, "evidence": "raw/a7-full-gate-1.{log,exit}"},
-    {"run": 2, "command": "cargo nextest run --locked --release --features render --no-fail-fast -j 4", "passed": 1811, "failed": 0, "skipped": 4, "exit": 0, "evidence": "raw/a7-full-gate-2.{log,exit}"}
+    {"run": 1, "command": "cargo nextest run --workspace --features render --no-fail-fast -j 4", "passed": 1816, "failed": 0, "skipped": 4, "exit": 0, "evidence": "raw/a7-full-gate-1.{log,exit}"},
+    {"run": 2, "command": "cargo nextest run --workspace --features render --no-fail-fast -j 4", "passed": 1816, "failed": 0, "skipped": 4, "exit": 0, "evidence": "raw/a7-full-gate-2.{log,exit}"}
   ],
   "a8": {
     "obstacle_course": "NOT_RUN",
@@ -117,24 +125,18 @@
     "obscura_host_edges": 0,
     "obscura_media_edges": 0,
     "cli_sha256_rebuilt": "4ee9e2dce274ef1d8c1a163f557ca215dbe2be8ef3957513364e5bfdde208f45",
-    "cli_sha256_accepted_r4": "23eee1832f83d53e78dfaa3cf5f81727763e2b17d6b7544ac59893b759712592",
-    "evidence": ["raw/a8-cli-tree.{log,exit}", "raw/a8-cli-sha256.log"]
+    "release_binary_sha256": {
+      "obscura-media": "a1aa106f5d23a1bd9a5c875b477286990836ca3914d0465056390dcd39ca1439",
+      "obscura-host": "6335a174287c917f7947f080a6087f7dcb8f613de361baf11db325cb59b23dab",
+      "obscura-endpoint": "feeead5ee5969839a5927a9ca9df8d36334aff6689debe62f6464b865cfae1e1"
+    },
+    "evidence": ["raw/a8-cli-tree.{log,exit}"]
   },
   "disclosed_non_gate_runs": [
     {
-      "evidence": "raw/a5-remote-admission-loadflake1.{log,exit}",
-      "exit": 100,
-      "reason": "First remote_admission_r1 run without -j 4 at host load average ~38 from unrelated tasks; three cases hit a bind-to-listen Connection refused race. Re-run at -j 4 is 37/37, EXIT=0. Load/invocation artifact, not a product result; red log retained."
-    },
-    {
-      "evidence": "raw/a7-full-gate-1-pre-bump.{log,exit}",
-      "exit": 100,
-      "reason": "First full-gate run, before the fixture socket deadline was raised; 3 cases failed with 'listener did not initialize' at the old 10s deadline (1811 tests run: 1808 passed, 3 failed, 4 skipped). Live log overwritten by the green re-run; summary recovered verbatim from the worker events.jsonl and retained as history."
-    },
-    {
-      "evidence": "raw/b1-denial-before.exit, raw/b6-registry-before.exit",
+      "evidence": "raw/probe-b8-iso.{log,exit}, raw/probe-b9-iso.{log,exit}",
       "exit": 0,
-      "reason": "r7 endpoint-level tests kept as history; they confirm those arrangements do not discriminate."
+      "reason": "Earlier probes of the F1/F3 fixed tree, superseded by the final f1-after/f3-after runs after the completion-state and owner changes. Retained as history; not used as verdict evidence."
     }
   ],
   "failures": [],
@@ -142,7 +144,7 @@
     "obstacle-course (CLI surface unaffected; cargo tree shows zero obscura-host/obscura-media edges)"
   ],
   "controller_next": [
-    "Commit the working tree as the r8 candidate (no rebase, squash, or history rewrite).",
-    "Run the independent architecture review on base..final HEAD and re-run the required gates on that exact candidate SHA."
+    "Commit the working tree as the r9 candidate (no rebase, squash, or history rewrite).",
+    "Run the independent architecture review on the exact committed candidate and re-run the required gates on that exact candidate."
   ]
 }

@@ -8,7 +8,7 @@ use std::{
 };
 
 use obscura_media::encoder_owner::EncoderChildOwner;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 #[tokio::test]
@@ -92,6 +92,49 @@ async fn serve_control(
                 if let Some(pgid) = request["pgid"].as_i64() { *bound_pgid.lock().expect("pgid owner") = Some(pgid as i32); }
                 let refused = matches!(script, ControlScript::RefuseRegistration);
                 serde_json::json!({"op":"register","refused":refused})
+            }
+            "revoke" => serde_json::json!({"op":"revoke","refused":false}),
+            "settle" => serde_json::json!({"op":"settle"}),
+            _ => return,
+        };
+        let mut bytes = serde_json::to_vec(&response).expect("serialize control response");
+        bytes.push(b'\n');
+        if write.write_all(&bytes).await.is_err() { return; }
+    }
+}
+
+/// Accept one real `EncoderChildOwner` connection, grant Acquire, and signal
+/// when Register arrives without answering it. The test then drops the
+/// in-flight encode borrow and drives the same owner's pre-registration
+/// interrupt finalizer.
+async fn serve_control_until_register(
+    listener: UnixListener,
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+    bound_pgid: Arc<Mutex<Option<i32>>>,
+    register_seen: tokio::sync::oneshot::Sender<()>,
+) {
+    let Ok((stream, _)) = listener.accept().await else { return; };
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let mut register_seen = Some(register_seen);
+    loop {
+        let mut line = String::new();
+        let count = match reader.read_line(&mut line).await { Ok(count) => count, Err(_) => return };
+        if count == 0 { return; }
+        let request: serde_json::Value = match serde_json::from_str(line.trim_end()) { Ok(value) => value, Err(_) => return };
+        requests.lock().expect("requests owner").push(request.clone());
+        let response = match request["op"].as_str().unwrap_or("") {
+            "acquire" => serde_json::json!({"op":"acquire","permit":"granted"}),
+            "register" => {
+                if let Some(pgid) = request["pgid"].as_i64() {
+                    *bound_pgid.lock().expect("pgid owner") = Some(pgid as i32);
+                }
+                if let Some(signal) = register_seen.take() { let _ = signal.send(()); }
+                // Keep the registration unanswered while the test drives the
+                // local refused-group finalizer; return on transport EOF.
+                let mut rest = Vec::new();
+                let _ = reader.read_to_end(&mut rest).await;
+                return;
             }
             "revoke" => serde_json::json!({"op":"revoke","refused":false}),
             "settle" => serde_json::json!({"op":"settle"}),
@@ -259,4 +302,46 @@ async fn encoder_owner_refused_registration_reaps_without_revoked() {
     let ops = owner_ops(&requests);
     assert!(!ops.contains(&"revoke".to_string()), "refused registration must not send RevokeEncoder: {ops:?}");
     assert_eq!(owner_settlement(&requests), serde_json::json!("refused_group_stopped"), "refusal must settle with GroupStopped");
+}
+
+/// The adapter's pre-registration interrupt path: the group is spawned and
+/// Register is in flight, but the endpoint has not acknowledged `Armed`. A
+/// signal branch drops the encode borrow and calls the same owner's finalize;
+/// because `armed` is false it must run the local refused-group cleanup without
+/// sending `RevokeEncoder`.
+#[tokio::test]
+async fn encoder_owner_pre_registration_interrupt_reaps_locally_without_revoked() {
+    let root = OwnerRoot::new("pre-reg-interrupt");
+    let control = root.control_path();
+    let listener = UnixListener::bind(&control).expect("bind control peer");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let bound = Arc::new(Mutex::new(None));
+    let (register_seen_tx, register_seen_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(serve_control_until_register(
+        listener,
+        Arc::clone(&requests),
+        Arc::clone(&bound),
+        register_seen_tx,
+    ));
+    let wrapper = write_wrapper(&root, "blocking.sh", WRAPPER_BLOCKING);
+    let mut owner = EncoderChildOwner::open(&wrapper, &control).await.expect("open owner");
+    {
+        let encode = owner.encode_frame(160, 120, solid_rgba(160, 120));
+        tokio::pin!(encode);
+        tokio::select! {
+            result = &mut encode => panic!("encode unexpectedly completed before the interrupt: {result:?}"),
+            seen = register_seen_rx => seen.expect("register request signal"),
+        }
+    }
+    let stop = owner.finalize().await.expect("pre-registration interrupt must reap locally");
+    assert!(matches!(
+        stop,
+        obscura_media::encoder_owner::EncoderStop::KilledAndReaped(_)
+            | obscura_media::encoder_owner::EncoderStop::Exited(_)
+    ));
+    let pgid = bound.lock().expect("pgid owner").expect("register bound a pgid");
+    assert!(wait_group_gone(pgid).await, "pre-registration interrupt must reap the spawned wrapper group");
+    assert!(!owner.has_live_child(), "pre-registration interrupt must leave no live child");
+    let ops = owner_ops(&requests);
+    assert!(!ops.contains(&"revoke".to_string()), "pre-registration interrupt must not send RevokeEncoder: {ops:?}");
 }

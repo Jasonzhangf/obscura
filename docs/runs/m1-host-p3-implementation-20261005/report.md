@@ -1,4 +1,102 @@
-# P3 host suite closure: run report (r6 terminal)
+# P3 host implementation r9: four P1 findings closure report
+
+Status: **COMPLETE for the r9 node**. F1-F4 are fixed with public-surface
+discriminating before/after pairs. The focused suites, the three release
+builds, the CLI dependency check, and two full workspace gates are green. No
+commit, merge, install, restart, OTA, device, or runtime operation was
+performed.
+
+## Identity
+
+- Task: `m1-host-p3-implementation-r9-20261005`
+- Worker: `gcm-host-p3-r9` (fresh standalone GCM author, not controller or
+  reviewer)
+- Worktree: `/Volumes/Intel/playground/obscura/m1-host-p3-implementation-20261005`
+- Branch: `codex/m1-host-p3-implementation-20261005`
+- Start source HEAD: `6b7710c6c44c1af1e6f061d7df325b398d627ccf`
+- Start tree: `ddf2f4cca3b939455e6950dca15380d77d53e17f`
+- Task base: `9d02931f24631e3680b3038601f4e3efe288c0ab`
+- End source HEAD: `6b7710c6c44c1af1e6f061d7df325b398d627ccf` (uncommitted r9
+  working tree; the controller owns the commit that records the final tree SHA)
+- Sole target: `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target`
+- Env: `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`,
+  `OBSCURA_TEST_BINARY_DIR=<target>/debug`,
+  `OBSCURA_WEBRTC_RAW_DIR=<record>/raw/webrtc*`
+
+## Per-finding verdicts
+
+| Finding | Owner and fix | Public test | Before | After | Verdict |
+| --- | --- | --- | --- | --- | --- |
+| F1 shutdown must join finalizing sessions | `crates/obscura-host/src/endpoint/server.rs`: per-entry completion receiver, `snapshots()` includes finalizing entries, `finalize_session` awaits in-progress completion | `obscura-host::blackbox_b8_shutdown_join::endpoint_shutdown_joins_in_progress_final_release` | EXIT=100; endpoint returned in 1.638 ms during the release | EXIT=0; endpoint waited and reaped the adapter | CLOSED |
+| F2 every terminal encode failure settles the group | `crates/obscura-media/src/encoder_owner.rs`: ordinary `run_encode` errors route through `self.finalize()`, cleanup failure surfaced | `obscura-media::cleanup_blackbox::standalone_adapter_settles_encoder_group_on_bounded_output_failure` | EXIT=100; wrapper group alive after terminal failure | EXIT=0; group gone | CLOSED |
+| F3 unsettled permit is an explicit failure | `crates/obscura-host/src/endpoint/server.rs` + `crates/obscura-media/src/encoder_owner.rs`: retain `registration_id`, cooperative adapter exit, `SessionTerminal::EncoderPermitUnsettled`, armed-flag pre-registration cleanup | `obscura-host::blackbox_b9_unsettled_permit::unsettled_encoder_permit_is_an_explicit_terminal` | EXIT=100; no terminal surfaced | EXIT=0; terminal with registration id 41 | CLOSED |
+| F4 standalone control socket is released | `crates/obscura-media/src/main.rs`: `ControlSocketGuard` owns the bound path for the process lifetime | `obscura-media::cleanup_blackbox::standalone_adapter_releases_its_control_socket_for_reuse` | EXIT=100; first invocation left the path behind | EXIT=0; two consecutive invocations succeed | CLOSED |
+
+Supporting F3 owner regression:
+`obscura-media::encoder::encoder_owner_pre_registration_interrupt_reaps_locally_without_revoked`
+EXIT=0. It holds the real `Register` in flight, drops the encode borrow, and
+verifies local group reap with no `RevokeEncoder`.
+
+## Changed paths
+
+Product source: `crates/obscura-host/src/endpoint/server.rs`,
+`crates/obscura-media/src/encoder_owner.rs`,
+`crates/obscura-media/src/main.rs`.
+
+Regressions: `crates/obscura-host/tests/blackbox_b8_shutdown_join.rs`,
+`crates/obscura-host/tests/blackbox_b9_unsettled_permit.rs`,
+`crates/obscura-media/tests/cleanup_blackbox.rs`,
+`crates/obscura-media/tests/encoder.rs`.
+
+## Per-file sha256 of the r9 delta
+
+| Path | sha256 |
+| --- | --- |
+| `crates/obscura-host/src/endpoint/server.rs` | `aa1cf71ce7af09f03f5ea7e5cddb837550405125fcf41debeecbd1fd5bb6c712` |
+| `crates/obscura-host/tests/blackbox_b8_shutdown_join.rs` | `aab9bd43f0ccac4b909c8d6724899bd595030eb9b1edce650df526f650b38683` |
+| `crates/obscura-host/tests/blackbox_b9_unsettled_permit.rs` | `313b7ca03d5b5aaa5843ec7e8d6f2ca2c70ab1342d3d4131b9ec924a07e85741` |
+| `crates/obscura-media/src/encoder_owner.rs` | `ee160e7ab371216f11412a68129b5f23ea3d5f718ddb804c3070fa92f61b32bd` |
+| `crates/obscura-media/src/main.rs` | `7ec02f98f143fffc64ae240b308548a50c3097de415c3c53b96e56d2298efb8b` |
+| `crates/obscura-media/tests/cleanup_blackbox.rs` | `62f740835afb33dcf04cb356687b9ad4c4aa5ed666c682f4651a209f2a14c5a3` |
+| `crates/obscura-media/tests/encoder.rs` | `a86f42614c60722d018a00c0de4b19fc83a6d7840d1cfd453c54aceb39c2dbad` |
+
+Unchanged read-only references:
+`channels.rs` `cee3452160e0ad9089e35464915760d808397972760a4bc248e0200b67faa502`,
+`encoder_control.rs` `f9b60b05d473bf1705c182c40044271a946d765059c6173895bfe8e21477b512`,
+`obscura-media/src/lib.rs` `49666d57a3dbdb64ea9b8e633ef07bf2a57c934bac42e4fe52f22035f496a7f8`.
+
+## Gates
+
+| Gate | Command | Result | Evidence |
+| --- | --- | --- | --- |
+| Host focused | `cargo nextest run -p obscura-host --features render -j 4 --no-fail-fast` | 122/122 passed, EXIT=0 | `raw/a5-host-focused.{log,exit}` |
+| Media focused | `cargo nextest run -p obscura-media --features webrtc -j 4 --no-fail-fast` | 23/23 passed, EXIT=0 | `raw/a5-media-focused.{log,exit}` |
+| Release builds | media `--features webrtc`; host `--bins`; cli `--bins --features render` | three EXIT=0 | `raw/a6-build-*.{log,exit}` |
+| Full workspace gate 1 | `cargo nextest run --workspace --features render --no-fail-fast -j 4` | 1816 passed, 4 skipped, EXIT=0 | `raw/a7-full-gate-1.{log,exit}` |
+| Full workspace gate 2 | same | 1816 passed, 4 skipped, EXIT=0 | `raw/a7-full-gate-2.{log,exit}` |
+| CLI dependency check | `cargo tree -p obscura-cli --features render --locked` | EXIT=0, zero `obscura-host`/`obscura-media` edges | `raw/a8-cli-tree.{log,exit}` |
+| Diff check | `git diff --check` | EXIT=0 | `notes.md` A9 row |
+
+The full workspace gate count is 1816 = r8 baseline 1811 + five new tests.
+The four earlier r8 regressions and the earlier r7 regressions remain in the
+workspace suites.
+
+## Disclosures and controller next
+
+- `raw/probe-b8-iso.*` and `raw/probe-b9-iso.*` are earlier probes superseded by
+  the final F1/F3 after runs after the completion-state and owner changes.
+  They are retained, not used as the verdict evidence.
+- The before/after runs revert only the named finding's fix and restore the
+  fixed source byte-identical afterwards.
+- No obstacle course was run. The CLI has zero `obscura-host`/`obscura-media`
+  dependency edges.
+- Controller next: commit the working tree as the r9 candidate without rebasing
+  or rewriting history, then run the independent architecture review on the
+  exact committed candidate.
+
+---
+
+# P3 host suite closure: run report (r6 terminal, retained history)
 
 Status: **COMPLETE for the r6 node**. The two open blockers are settled, the
 full nextest gate is green with zero failures on four consecutive runs, the

@@ -53,6 +53,83 @@ of the early full-suite runs and passed in the four env2-5 runs.
 `crates/obscura-browser` is untouched by the whole task delta and is outside this
 node's allowed write scope, so it was left unchanged.
 
+## P3-r9 review-finding closure (controller admission block)
+
+Task `m1-host-p3-implementation-r9-20261005`, worker `gcm-host-p3-r9`, fresh
+standalone GCM author. Controller owns git add/commit/merge/push, review and
+installation. The author must not commit, reset, rebase, cherry-pick or override
+hooksPath, and must not launch children or register Collab.
+
+Admission facts the controller verified before writing this block:
+
+- Start HEAD: `6b7710c6c44c1af1e6f061d7df325b398d627ccf`
+  (tree `ddf2f4cca3b939455e6950dca15380d77d53e17f`), branch
+  `codex/m1-host-p3-implementation-20261005`.
+- Parent chain of this candidate: `9d02931f` (task base) → `9f53cbe` →
+  `baca971` → `6d64a02` → `dfdf495` → `b2584ee` → `759b99a` (rejected) →
+  `c9264e2c` (r7) → `6b7710c6` (r8).
+- Working tree: only the pre-existing untracked
+  `docs/runs/m1-frame-forwarding-impl-r1-20261005/` is present. It must never be
+  added, modified or deleted.
+- Target grant: the sole Obscura target is
+  `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target`, held
+  by this task for build and test only, with `CARGO_INCREMENTAL=0` and
+  `CARGO_BUILD_JOBS=2`. No shared runtime, install, restart, device, OTA, merge
+  or push is granted.
+- `OBSCURA_TEST_BINARY_DIR` must point at
+  `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/debug`.
+
+Why this node exists: the independent implementation review of `6b7710c6`
+(task `m1-host-p3-implementation-20261005-r2`, `mode=base`, base `9d02931f`)
+returned **FAIL with four P1 findings and zero P0**. The review record is at
+`.agent-collab/review/m1-host-p3-implementation-20261005-r2/review.final.md`.
+The eight r7 fixes are not re-opened and the four r8 black-box regressions must
+stay green.
+
+| Time / node | Conclusion or state | Evidence path | Input version and environment | Next |
+| --- | --- | --- | --- | --- |
+| 2026-10-06T20:1xZ / A0 `admission` (r9) | PREPARED by the controller. Author must confirm `git rev-parse HEAD` = `6b7710c6c44c1af1e6f061d7df325b398d627ccf` and a clean tracked tree, then record its own A1 row. | this block; `git rev-parse HEAD`; `git status --porcelain`; `ob-shared-target-lease.json` | HEAD `6b7710c6`; granted target | Close F1-F4 with black-box pairs. |
+
+## P3-r9 four-finding closure rows
+
+Terminal: **COMPLETE for the r9 node**. The four P1 findings from the r8
+implementation review are fixed, each with a public-surface discriminating
+before/after pair. The four r8 regressions and the earlier r7 regressions stay
+green; the focused suites, the three release builds, and the full workspace gate
+(twice, 1816 passed, 4 skipped) are green. No product fix outside F1-F4 was
+made. No commit, merge, install, restart, OTA, device, or runtime operation was
+performed.
+
+| Time / node | Conclusion or state | Evidence path | Input version and environment | Next |
+| --- | --- | --- | --- | --- |
+| 2026-10-06T20:2xZ / A1 `admission` (r9) | PASS. `git rev-parse HEAD` = `6b7710c6c44c1af1e6f061d7df325b398d627ccf`; branch `codex/m1-host-p3-implementation-20261005`; `git status --porcelain` shows only the forbidden untracked `docs/runs/m1-frame-forwarding-impl-r1-20261005/` besides this node's own edits. Target lease `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target` present with `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`. | `git rev-parse HEAD`; `git status --porcelain`; controller admission block | HEAD `6b7710c6`; zsh; granted target | Close F1-F4. |
+| 2026-10-06T20:3xZ / A2 `F1 shutdown-join` (r9) | FIXED. Owner `crates/obscura-host/src/endpoint/server.rs`. `SessionMediaEntry` owns a finalization completion receiver, `snapshots()` returns finalizing entries too, and `finalize_session` awaits an in-progress completion. Public pair: `blackbox_b8_shutdown_join::endpoint_shutdown_joins_in_progress_final_release` before EXIT=100 (endpoint returned in ~1.6 ms during the release), after EXIT=0 (endpoint waited and reaped the adapter). | `raw/f1-before.{log,exit}`, `raw/f1-after.{log,exit}` | HEAD `6b7710c6` + r9 delta; debug nextest; real mTLS endpoint + real adapter | F2. |
+| 2026-10-06T20:3xZ / A3 `F2 encode cleanup` (r9) | FIXED. Owner `crates/obscura-media/src/encoder_owner.rs`. Ordinary `run_encode` errors now route through `self.finalize()`; cleanup failure is surfaced with the original error preserved. Public pair: `cleanup_blackbox::standalone_adapter_settles_encoder_group_on_bounded_output_failure` before EXIT=100 (wrapper group alive after terminal failure), after EXIT=0 (group gone). | `raw/f2-before.{log,exit}`, `raw/f2-after.{log,exit}` | HEAD `6b7710c6` + r9 delta; real standalone adapter + real process group | F3. |
+| 2026-10-06T20:4xZ / A4 `F3 unsettled permit` (r9) | FIXED. Owner `crates/obscura-host/src/endpoint/server.rs` (+ `crates/obscura-media/src/encoder_owner.rs`). An unsettled permit retains its `registration_id`, the endpoint uses cooperative adapter exit (no SIGKILL while unsettled), and returns the declared `SessionTerminal::EncoderPermitUnsettled` when settlement cannot be established. The adapter's pre-registration interrupt uses local refused-group cleanup because `armed` is false. Public pair: `blackbox_b9_unsettled_permit::unsettled_encoder_permit_is_an_explicit_terminal` before EXIT=100 (no terminal), after EXIT=0 (terminal with id 41). Supporting owner regression `encoder_owner_pre_registration_interrupt_reaps_locally_without_revoked` EXIT=0. | `raw/f3-before.{log,exit}`, `raw/f3-after.{log,exit}`, `raw/f3-prereg-interrupt.{log,exit}` | HEAD `6b7710c6` + r9 delta; real mTLS endpoint, granted permit, withheld Register | F4. |
+| 2026-10-06T20:4xZ / A5 `F4 socket reuse` (r9) | FIXED. Owner `crates/obscura-media/src/main.rs`. `ControlSocketGuard` owns the standalone `encoder-control.sock` path across the run loop and removes only the path this invocation bound on every exit; a pre-existing path still fails bind. Public pair: `cleanup_blackbox::standalone_adapter_releases_its_control_socket_for_reuse` before EXIT=100 (stale control socket after first invocation), after EXIT=0 (both consecutive invocations succeed). | `raw/f4-before.{log,exit}`, `raw/f4-after.{log,exit}` | HEAD `6b7710c6` + r9 delta; two real standalone adapter invocations | Focused suites. |
+| 2026-10-06T20:4xZ / A6 `focused-green` (r9) | PASS. `obscura-host --features render`: 122/122, EXIT=0. `obscura-media --features webrtc`: 23/23, EXIT=0. Both at `-j 4`; `OBSCURA_TEST_BINARY_DIR` = lease `target/debug`. | `raw/a5-host-focused.{log,exit}`, `raw/a5-media-focused.{log,exit}` | HEAD `6b7710c6` + r9 delta; granted target | Builds. |
+| 2026-10-06T20:4xZ / A7 `builds` (r9) | PASS. media `--features webrtc`, host `--bins`, cli `--bins --features render`, each EXIT=0 in release. | `raw/a6-build-media.{log,exit}`, `raw/a6-build-host.{log,exit}`, `raw/a6-build-cli.{log,exit}` | HEAD `6b7710c6` + r9 delta; granted target | Full gate. |
+| 2026-10-06T20:4xZ / A8 `full-gate` (r9) | PASS twice. `cargo nextest run --workspace --features render --no-fail-fast -j 4` in debug with `OBSCURA_TEST_BINARY_DIR` = lease `target/debug`: run 1 `1816 tests run: 1816 passed, 4 skipped` EXIT=0; run 2 same EXIT=0. The 1816 is the r8 baseline 1811 plus the five new public/supporting regressions. | `raw/a7-full-gate-1.{log,exit}`, `raw/a7-full-gate-2.{log,exit}` | HEAD `6b7710c6` + r9 delta; `-j 4`; granted target | A9. |
+| 2026-10-06T20:4xZ / A9 `tree-and-docs` (r9) | PASS. `cargo tree -p obscura-cli --features render --locked` EXIT=0 with zero `obscura-host`/`obscura-media` edges. `git diff --check` EXIT=0. `protocol/browser/src/lib.rs` unchanged; `HOST_PROTOCOL_VERSION` remains 11. Run docs written. | `raw/a8-cli-tree.{log,exit}`; this file; `report.md`; `result.json` | HEAD `6b7710c6` + r9 delta | Return to controller. |
+
+### r9 disclosures
+
+- Two earlier probe runs (`raw/probe-b8-iso.*`, `raw/probe-b9-iso.*`) showed the
+  fixed F1/F3 cases passing, but they were superseded by the `raw/f1-after.*`
+  and `raw/f3-after.*` runs after the completion-state and F3 owner changes.
+  The superseded probes are retained, not used as gate evidence.
+- The pre-fix (`before`) runs revert only the named finding's fix in the working
+  tree and restore byte-identical fixed source afterwards. The before runs used
+  the same r9 tests, target, and environment as the after runs.
+- The workspace gate is debug-profile because the task requires
+  `OBSCURA_TEST_BINARY_DIR` = lease `target/debug`. The r8 baseline command was
+  release; the test set is identical. Run 1 needed no fixture retry.
+- Resource cleanup: the four `/tmp` fixture directories left by the intentional
+  red before runs (`/tmp/ob8-4557810f`, `/tmp/ob8-64461887`,
+  `/tmp/ob9-1b85135c`, `/tmp/ob9-7d198a86`) were removed with exact-path
+  scoped `find -delete`. No other owner's resource was touched. `raw/webrtc`
+  and `raw/webrtc2` are retained under the worker record as evidence.
+
 ## P3-r8 black-box evidence rows
 
 Terminal: **COMPLETE**. This node closes the required black-box evidence gap for

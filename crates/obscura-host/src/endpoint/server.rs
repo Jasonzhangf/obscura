@@ -7,6 +7,39 @@ use tokio_tungstenite::{accept_hdr_async_with_config, tungstenite::{handshake::s
 use super::{Args, channels, encoder_control};
 use crate::remote_authorization::{self, EndpointStatusReceipt};
 
+/// Bounded window the session finalizer waits for an acquired encoder permit to
+/// settle through the control stream before it treats adapter exit as the
+/// remaining settle edge.
+const ENCODER_ADMISSION_SETTLE_DEADLINE: Duration = Duration::from_secs(5);
+/// Bounded cooperative grace the session finalizer gives the adapter direct
+/// child before it stops claiming that an unsettled encoder subtree was
+/// settled. The endpoint never SIGKILLs the adapter while the permit is
+/// unsettled.
+const ADAPTER_COOPERATIVE_GRACE: Duration = Duration::from_secs(3);
+
+/// A typed session terminal that is an explicit failure rather than a cleanup
+/// success. `EncoderPermitUnsettled` is returned when an acquired encoder
+/// permit was not settled within the bounded settle deadline and adapter
+/// cooperative grace, so the endpoint has no signal authority for the
+/// separately spawned group and must not report successful cleanup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTerminal {
+    EncoderPermitUnsettled { registration_id: u64 },
+}
+
+impl std::fmt::Display for SessionTerminal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionTerminal::EncoderPermitUnsettled { registration_id } => write!(
+                formatter,
+                "SESSION_ENCODER_PERMIT_UNSETTLED: encoder permit {registration_id} was not settled before adapter cooperative grace"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SessionTerminal {}
+
 /// One per-attachment endpoint grant. `media` is filled only after the Host
 /// confirms an exact `(session_id, generation)` binding, so the `/media`
 /// subscriber can only ever read that exact session's encoded stream.
@@ -80,12 +113,32 @@ impl AdapterProcessOwner {
         let Some(mut child) = self.child.take() else { return Ok(()); };
         if child.try_wait()?.is_none() {
             let _ = signal_child(&child, libc::SIGTERM);
-            if tokio::time::timeout(Duration::from_secs(3), child.wait()).await.is_err() {
+            if tokio::time::timeout(ADAPTER_COOPERATIVE_GRACE, child.wait()).await.is_err() {
                 let _ = child.start_kill();
             }
         }
         let _ = child.wait().await;
         Ok(())
+    }
+
+    /// SIGTERM the adapter direct child and await its bounded cooperative grace
+    /// without escalating to SIGKILL. Returns whether the child exited. Used
+    /// when an in-flight encoder permit is unsettled: adapter exit is the only
+    /// remaining settle edge, and the endpoint must not force-kill the adapter
+    /// before that settle is observed.
+    async fn cooperative_exit(&mut self, grace: Duration) -> Result<bool> {
+        let Some(child) = self.child.as_mut() else { return Ok(true); };
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        let _ = signal_child(child, libc::SIGTERM);
+        match tokio::time::timeout(grace, child.wait()).await {
+            Ok(status) => {
+                status?;
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -137,8 +190,9 @@ impl SessionDurable {
             state.close_admission();
             state.take_settlement_receiver()
         };
-        if let Some((_registration_id, receiver)) = settlement {
-            match tokio::time::timeout(Duration::from_secs(5), receiver).await {
+        let mut unsettled = None;
+        if let Some((registration_id, receiver)) = settlement {
+            match tokio::time::timeout(ENCODER_ADMISSION_SETTLE_DEADLINE, receiver).await {
                 Ok(Ok(obscura_media::encoder_owner::EncoderSettlement::Armed { pgid })) => {
                     obscura_media::encoder_owner::signal_group(pgid, libc::SIGTERM);
                     if !wait_group_exit(pgid, Duration::from_secs(2)).await {
@@ -150,16 +204,27 @@ impl SessionDurable {
                     obscura_media::encoder_owner::EncoderSettlement::RefusedNoChild
                     | obscura_media::encoder_owner::EncoderSettlement::RefusedGroupStopped,
                 )) => {}
-                Ok(Err(_)) => {}
-                Err(_) => {
-                    // The settle deadline elapsed: adapter exit is the settle
-                    // edge. The adapter's local refused-path cleanup owns the
-                    // group; this finalizer does not SIGKILL an unbound group.
-                }
+                // A closed settlement channel or an elapsed deadline leaves the
+                // in-flight permit unsettled. The endpoint never bound this
+                // pgid, so it has no signal authority and must not report
+                // successful cleanup. Retain the registration identity.
+                Ok(Err(_)) | Err(_) => unsettled = Some(registration_id),
             }
         }
         self.stop_armed_encoder_group().await?;
-        if let Some(mut child) = self.child.lock().await.take() {
+        if let Some(registration_id) = unsettled {
+            // Adapter exit is the remaining settle edge. SIGTERM the adapter
+            // direct child and wait its bounded cooperative grace without
+            // SIGKILL: only cooperative exit proves its signal branch ran the
+            // local refused-group cleanup for the unregistered group.
+            let exited = self.cooperative_adapter_exit().await?;
+            if !exited {
+                return Err(anyhow::Error::new(SessionTerminal::EncoderPermitUnsettled { registration_id }));
+            }
+            // Adapter exit settles the permit; drop the already-reaped direct
+            // child handle.
+            let _ = self.child.lock().await.take();
+        } else if let Some(mut child) = self.child.lock().await.take() {
             child.finalize().await?;
         }
         // Only after adapter escalation does the reader stop. The supervisor
@@ -169,6 +234,16 @@ impl SessionDurable {
         let _ = std::fs::remove_file(&self.encoded_control.path);
         let _ = std::fs::remove_dir(&self.media_dir);
         Ok(())
+    }
+
+    /// SIGTERM the adapter direct child and await its bounded cooperative grace
+    /// without SIGKILL escalation. Returns whether the child exited.
+    async fn cooperative_adapter_exit(&self) -> Result<bool> {
+        let mut guard = self.child.lock().await;
+        match guard.as_mut() {
+            Some(child) => child.cooperative_exit(ADAPTER_COOPERATIVE_GRACE).await,
+            None => Ok(true),
+        }
     }
 }
 
@@ -191,13 +266,28 @@ struct SessionMediaEntry {
     durable: Arc<SessionDurable>,
     references: usize,
     finalizing: bool,
+    /// Present from the moment `finalizing` is set. The finalizer task owns the
+    /// sender and signals `true` when it finishes (supervisor join plus entry
+    /// removal). A closed channel also releases awaiters if that task ends
+    /// without signalling, so shutdown can await an in-progress finalizer
+    /// instead of only newly initiated ones.
+    completion: Option<watch::Receiver<bool>>,
 }
 
 enum Release {
     Absent,
     Referenced,
-    Ready(Arc<SessionDurable>),
+    Ready(Arc<SessionDurable>, watch::Sender<bool>),
     Finalizing,
+}
+
+/// Outcome of asking the registry to finalize one entry. A fresh entry yields
+/// the supervisor handle and a completion sender to signal; an entry that is
+/// already finalizing yields its in-progress completion receiver to await.
+enum FinalizeAction {
+    Absent,
+    InProgress(Option<watch::Receiver<bool>>),
+    Start(Option<tokio::task::JoinHandle<Result<()>>>, watch::Sender<bool>),
 }
 
 /// The endpoint's per-session registry. It owns every `SessionDurable` and the
@@ -269,6 +359,7 @@ impl SessionMediaRegistry {
             durable,
             references: 1,
             finalizing: false,
+            completion: None,
         });
         Ok((encoded_rx, Arc::clone(&self.entries[session_id].durable)))
     }
@@ -279,17 +370,24 @@ impl SessionMediaRegistry {
         entry.references = entry.references.saturating_sub(1);
         if entry.references == 0 {
             entry.finalizing = true;
-            Release::Ready(Arc::clone(&entry.durable))
+            let (completion, completion_rx) = watch::channel(false);
+            entry.completion = Some(completion_rx);
+            Release::Ready(Arc::clone(&entry.durable), completion)
         } else {
             Release::Referenced
         }
     }
 
-    fn begin_finalize(&mut self, durable: &Arc<SessionDurable>) -> Option<tokio::task::JoinHandle<Result<()>>> {
-        let entry = self.entries.get_mut(&durable.session_id)?;
-        if entry.finalizing { return None; }
+    fn begin_finalize(&mut self, durable: &Arc<SessionDurable>) -> FinalizeAction {
+        let Some(entry) = self.entries.get_mut(&durable.session_id) else { return FinalizeAction::Absent; };
+        if entry.finalizing {
+            return FinalizeAction::InProgress(entry.completion.clone());
+        }
         entry.finalizing = true;
-        durable.supervisor.lock().expect("supervisor owner").take()
+        let (completion, completion_rx) = watch::channel(false);
+        entry.completion = Some(completion_rx);
+        let supervisor = entry.durable.supervisor.lock().expect("supervisor owner").take();
+        FinalizeAction::Start(supervisor, completion)
     }
 
     fn remove_finalized(&mut self, durable: &Arc<SessionDurable>) {
@@ -310,7 +408,17 @@ impl SessionMediaRegistry {
     }
 
     fn snapshots(&self) -> Vec<Arc<SessionDurable>> {
-        self.entries.values().filter(|entry| !entry.finalizing).map(|entry| Arc::clone(&entry.durable)).collect()
+        self.entries.values().map(|entry| Arc::clone(&entry.durable)).collect()
+    }
+}
+
+/// Await one entry's finalization completion. A closed channel means the
+/// completion task ended (or panicked) without signalling; either way the
+/// finalizer is no longer running, so shutdown may proceed.
+async fn await_completion(receiver: Option<watch::Receiver<bool>>) {
+    let Some(mut receiver) = receiver else { return; };
+    while !*receiver.borrow() {
+        if receiver.changed().await.is_err() { break; }
     }
 }
 
@@ -389,17 +497,31 @@ struct EndpointOwner {
 
 impl EndpointOwner {
     /// Session-local finalization entry. It marks that one entry finalizing,
-    /// signals its cancel handle and awaits only that session's supervisor.
+    /// signals its cancel handle and awaits that session's supervisor. If the
+    /// entry is already finalizing (a release is in flight), it awaits the
+    /// in-progress completion instead of starting a second finalizer.
     async fn finalize_session(&self, durable: &Arc<SessionDurable>) -> Result<()> {
-        let supervisor = {
-            let mut registry = self.registry.lock().await;
-            registry.begin_finalize(durable)
-        };
-        let Some(supervisor) = supervisor else { return Ok(()); };
-        durable.cancel.send_replace(true);
-        supervisor.await.context("Session supervisor panicked")??;
-        self.registry.lock().await.remove_finalized(durable);
-        Ok(())
+        let action = { self.registry.lock().await.begin_finalize(durable) };
+        match action {
+            FinalizeAction::Absent => Ok(()),
+            FinalizeAction::InProgress(completion) => {
+                await_completion(completion).await;
+                Ok(())
+            }
+            FinalizeAction::Start(supervisor, completion) => {
+                durable.cancel.send_replace(true);
+                let joined = match supervisor {
+                    Some(supervisor) => supervisor.await,
+                    None => Ok(Ok(())),
+                };
+                self.registry.lock().await.remove_finalized(durable);
+                completion.send_replace(true);
+                match joined {
+                    Ok(result) => result,
+                    Err(error) => Err(anyhow::Error::new(error).context("Session supervisor panicked")),
+                }
+            }
+        }
     }
 
     /// Actual endpoint shutdown: sets the shutdown watch, then finalizes every
@@ -651,25 +773,28 @@ async fn release_exact_session(registry: &Arc<AsyncMutex<SessionMediaRegistry>>,
     let released = {
         let mut registry = registry.lock().await;
         match registry.release(durable) {
-            Release::Ready(durable) => {
-                let supervisor = durable.supervisor.lock().expect("supervisor owner").take();
-                Some((durable, supervisor))
-            }
+            Release::Ready(durable, completion) => Some((durable, completion)),
             Release::Absent | Release::Referenced | Release::Finalizing => None,
         }
     };
-    let Some((durable, supervisor)) = released else { return; };
+    let Some((durable, completion)) = released else { return; };
+    let supervisor = durable.supervisor.lock().expect("supervisor owner").take();
     let registry = Arc::clone(registry);
     // The completion runs in a detached task so aborting the caller after the
     // reference reaches zero cannot strand the entry in `finalizing`.
-    let completion = tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         durable.cancel.send_replace(true);
         if let Some(supervisor) = supervisor {
-            let _ = supervisor.await;
+            match supervisor.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => eprintln!("session media finalize terminal: {error}"),
+                Err(error) => eprintln!("session media supervisor panicked: {error}"),
+            }
         }
         registry.lock().await.remove_finalized(&durable);
+        completion.send_replace(true);
     });
-    let _ = completion.await;
+    let _ = task.await;
 }
 
 fn write_applied_receipt(args: &Args, projection: &remote_authorization::LoadedProjection, bound: SocketAddr) -> Result<()> {
@@ -722,6 +847,7 @@ mod tests {
             durable,
             references: 1,
             finalizing: false,
+            completion: None,
         });
     }
 

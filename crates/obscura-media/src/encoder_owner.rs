@@ -81,6 +81,11 @@ pub struct EncoderChildOwner {
     child: Option<tokio::process::Child>,
     control: EncoderControlClient,
     registration_id: u64,
+    /// True once the endpoint has acknowledged `Register` for the current
+    /// child, so the endpoint holds signal authority and a `RevokeEncoder` is
+    /// owed before the leader is reaped. A pre-registration interrupt leaves
+    /// this false and uses local refused-group cleanup instead.
+    armed: bool,
 }
 
 impl EncoderChildOwner {
@@ -94,6 +99,7 @@ impl EncoderChildOwner {
             child: None,
             control: EncoderControlClient { reader: BufReader::new(read), writer: write },
             registration_id: 0,
+            armed: false,
         })
     }
 
@@ -142,7 +148,7 @@ impl EncoderChildOwner {
         self.child = Some(child);
         let registered = self.control.register(registration_id, pgid).await;
         match registered {
-            Ok(EncoderControlResponse::Register { refused: false }) => {}
+            Ok(EncoderControlResponse::Register { refused: false }) => self.armed = true,
             Ok(EncoderControlResponse::Register { refused: true }) => {
                 self.finalize_local_refused().await.context("Local refused encoder cleanup")?;
                 self.control.settle(registration_id, EncoderSettlement::RefusedGroupStopped).await
@@ -161,10 +167,25 @@ impl EncoderChildOwner {
         let outcome = tokio::time::timeout(ENCODE_TIMEOUT, self.run_encode(registration_id, rgba)).await
             .context("H.264 encoder exceeded five second deadline");
         match outcome {
-            Ok(result) => result,
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(error)) => {
+                // Every terminal encode error still owns the retained subtree.
+                // Settle the group through the same owner before returning, and
+                // surface a cleanup failure instead of discarding it.
+                match self.finalize().await {
+                    Ok(_) => Err(error),
+                    Err(cleanup) => Err(error.context(format!(
+                        "encoder group cleanup failed for registration {registration_id}: {cleanup}"
+                    ))),
+                }
+            }
             Err(error) => {
-                self.finalize().await.ok();
-                Err(error)
+                match self.finalize().await {
+                    Ok(_) => Err(error),
+                    Err(cleanup) => Err(error.context(format!(
+                        "encoder group cleanup failed for registration {registration_id}: {cleanup}"
+                    ))),
+                }
             }
         }
     }
@@ -198,6 +219,7 @@ impl EncoderChildOwner {
         ensure!(!bytes.is_empty(), "H.264 encoder produced no access unit");
         self.group = None;
         self.child = None;
+        self.armed = false;
         Ok(bytes)
     }
 
@@ -211,11 +233,18 @@ impl EncoderChildOwner {
     /// before reaping the leader so the endpoint signal cannot address a
     /// reused process id.
     pub async fn finalize(&mut self) -> Result<EncoderStop> {
-        let registration_id = self.registration_id;
-        // Wait for the endpoint's typed acknowledgement before addressing the
-        // group. The acknowledgement is ordered after endpoint signal
-        // authority is complete (B4), so it is safe to stop the group here.
-        let _ = self.control.revoke(registration_id).await;
+        // Only an endpoint-acknowledged registration owes `RevokeEncoder`. A
+        // pre-registration interrupt (the fence flipped before `Registered`)
+        // has no Armed registration to revoke, so it runs the same local
+        // refused-group cleanup without sending a `RevokeEncoder` the endpoint
+        // would refuse.
+        if self.armed {
+            let registration_id = self.registration_id;
+            // Wait for the endpoint's typed acknowledgement before addressing
+            // the group. The acknowledgement is ordered after endpoint signal
+            // authority is complete (B4), so it is safe to stop the group here.
+            let _ = self.control.revoke(registration_id).await;
+        }
         self.stop_kill_reap().await
     }
 
@@ -265,6 +294,7 @@ impl EncoderChildOwner {
         .context("Encoder leader reap deadline exceeded")??;
         self.group = None;
         self.child = None;
+        self.armed = false;
         Ok(status)
     }
 }
