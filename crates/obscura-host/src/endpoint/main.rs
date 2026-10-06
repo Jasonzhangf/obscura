@@ -3,6 +3,8 @@
 #[cfg(unix)]
 mod channels;
 #[cfg(unix)]
+mod encoder_control;
+#[cfg(unix)]
 mod server;
 #[cfg(unix)]
 #[path = "../remote_admission.rs"]
@@ -35,6 +37,32 @@ struct Args {
     #[arg(long, default_value_t = false)] enable_webrtc: bool,
     /// Local address advertised by the explicitly enabled WebRTC backend.
     #[arg(long)] webrtc_bind_ip: Option<std::net::IpAddr>,
+    /// Absolute path for the typed endpoint applied receipt. When absent no
+    /// receipt is written.
+    #[arg(long)] applied_receipt_path: Option<PathBuf>,
+    /// Service-owned endpoint generation stamped into the applied receipt.
+    #[arg(long, default_value_t = 0)] endpoint_generation: u64,
+}
+
+impl Args {
+    /// Minimal placeholder used only to build the per-session registry args.
+    fn placeholder() -> Self {
+        Self {
+            listen: "0.0.0.0:0".parse().expect("valid placeholder address"),
+            host_dir: PathBuf::new(),
+            socket_dir: PathBuf::new(),
+            server_cert: PathBuf::new(),
+            server_key: PathBuf::new(),
+            client_ca: PathBuf::new(),
+            authorized_clients: PathBuf::new(),
+            media_bin: PathBuf::new(),
+            ffmpeg: PathBuf::from("ffmpeg"),
+            enable_webrtc: false,
+            webrtc_bind_ip: None,
+            applied_receipt_path: None,
+            endpoint_generation: 0,
+        }
+    }
 }
 
 #[cfg(unix)]

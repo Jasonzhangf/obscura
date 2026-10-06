@@ -11,6 +11,7 @@ webrtc = ["webrtc-probe", "dep:futures-util", "dep:tokio-rustls", "dep:tokio-tun
 
 [dependencies]
 obscura-host-protocol = { path = "../../protocol/browser" }
+libc = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

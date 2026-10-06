@@ -175,6 +175,13 @@ impl ProfileCatalogStore {
         self.profiles.iter().find(|profile| profile.profile_id == profile_id)
     }
 
+    /// Local admin projection of every loaded profile including the Host-owned
+    /// membership. Unlike `catalog()` it exposes `owner_device_id`/`members`, so
+    /// it is used only by the same-uid `host-admin.sock` owner.
+    pub fn entries(&self) -> &[ProfileEntry] {
+        &self.profiles
+    }
+
     pub fn access_for(&self, profile_id: &str) -> Option<&ProfileAccess> {
         self.record(profile_id).and_then(|entry| entry.access.as_ref())
     }
@@ -262,6 +269,28 @@ impl ProfileCatalogStore {
             profile_id: profile_id.to_string(),
             device_id: owner_device_id.to_string(),
         })
+    }
+
+    /// Select one existing profile as the default. This is the typed local
+    /// `admin.catalog.select` write; it commits a new catalog revision and
+    /// persists before returning, and it never creates a profile.
+    pub fn select(&mut self, profile_id: &str) -> Result<ProfileRecord, CatalogError> {
+        let index = self.profiles.iter().position(|entry| entry.profile_id == profile_id)
+            .ok_or_else(|| CatalogError::new("PROFILE_NOT_FOUND", "Unknown profile id"))?;
+        let previous_default = self.default_profile_id.clone();
+        let previous_flags: Vec<bool> = self.profiles.iter().map(|entry| entry.default).collect();
+        let previous_revision = self.catalog_revision;
+        for entry in &mut self.profiles { entry.default = false; }
+        self.profiles[index].default = true;
+        self.default_profile_id = Some(profile_id.to_string());
+        self.catalog_revision = self.catalog_revision.saturating_add(1);
+        if let Err(error) = self.persist() {
+            for (entry, flag) in self.profiles.iter_mut().zip(previous_flags) { entry.default = flag; }
+            self.default_profile_id = previous_default;
+            self.catalog_revision = previous_revision;
+            return Err(error);
+        }
+        Ok(self.profiles[index].wire())
     }
 
     fn persist(&self) -> Result<(), CatalogError> {

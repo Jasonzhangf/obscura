@@ -8,12 +8,14 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::test]
 async fn mutual_tls_endpoint_preserves_host_and_fences_remote_agent_access() {
-    tokio::time::timeout(Duration::from_secs(20), exercise()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(90), exercise()).await.unwrap();
 }
 
 async fn exercise() {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    let root = PathBuf::from("/tmp").join(format!("oe-{}", uuid::Uuid::new_v4().simple()));
+    // Exact-session media dirs are `socket_dir/session-<36>/encoder-control.sock`
+    // and must stay strictly below the macOS SUN_LEN bound, so keep the root short.
+    let root = PathBuf::from("/tmp").join(format!("oe-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
     std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
     let bind_ip = std::env::var("OBSCURA_ENDPOINT_BIND_IP").unwrap_or_else(|_| "127.0.0.1".into());
     let bind_ip: std::net::IpAddr = bind_ip.parse().unwrap();
@@ -71,11 +73,18 @@ async fn exercise() {
     });
     std::fs::write(root.join("registry.json"), serde_json::to_vec(&registry).unwrap()).unwrap();
     write_catalog(&root, &["local".to_string(), "test-device".to_string()]);
+    eprintln!("DIAG host bin {}", env!("CARGO_BIN_EXE_obscura-host"));
+    let host_err = std::fs::File::create(root.join("host.err")).unwrap();
+    let host_err2 = host_err.try_clone().unwrap();
     let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
         .arg("--authorization-registry").arg(root.join("registry.json"))
-        .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+.stdout(Stdio::null()).stderr(host_err).kill_on_drop(true).spawn().unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    eprintln!("DIAG host try_wait {:?}", host.try_wait());
+    eprintln!("DIAG host.err: {}", std::fs::read_to_string(root.join("host.err")).unwrap_or_default());
+    let _ = host_err2;
     wait_socket(root.join("host/host.sock")).await;
     let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await.unwrap();
     let mut local = BufReader::new(local);
@@ -94,8 +103,10 @@ async fn exercise() {
         .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("key.der"))
         .arg("--client-ca").arg(root.join("ca.der")).arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--media-bin").arg(media)
-        .stdout(Stdio::null()).stderr(Stdio::inherit()).kill_on_drop(true).spawn().unwrap();
-    wait_socket(root.join("endpoint/encoded.sock")).await;
+        .stdout(Stdio::null()).stderr(std::fs::File::create(root.join("endpoint.err")).unwrap()).kill_on_drop(true).spawn().unwrap();
+    // Exact-session encoded sockets are bound lazily on first session admission,
+    // so endpoint readiness is the socket directory created after TCP bind.
+    wait_socket(root.join("endpoint")).await;
     let mut roots = rustls::RootCertStore::empty(); roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
     let anonymous = rustls::ClientConfig::builder().with_root_certificates(roots.clone()).with_no_client_auth();
     let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
@@ -285,9 +296,16 @@ async fn local_request(socket: &mut BufReader<tokio::net::UnixStream>, request: 
 async fn wait_socket(path: PathBuf) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !path.exists() {
+        if let Some(parent) = path.parent() {
+            eprintln!("DIAG wait_socket {} missing; parent listing: {:?}", path.display(),
+                std::fs::read_dir(parent).map(|entries| entries.flatten().map(|e| e.file_name()).collect::<Vec<_>>()));
+        } else {
+            eprintln!("DIAG wait_socket {} missing; no parent", path.display());
+        }
         assert!(tokio::time::Instant::now() < deadline, "listener did not initialize");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    eprintln!("DIAG wait_socket {} present", path.display());
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 

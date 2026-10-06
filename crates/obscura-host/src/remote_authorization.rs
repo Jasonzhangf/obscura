@@ -272,22 +272,35 @@ impl LoadedProjection {
 /// Typed endpoint status receipt. `projection_sha256` is the digest of the exact
 /// read buffer; it is never a projection content field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointStatusReceipt {
-    pub status: String,
+    pub schema_version: u32,
+    pub endpoint_generation: u64,
+    pub endpoint_pid: u32,
+    pub bound_address: String,
     pub authorization_revision: u64,
     pub registry_sha256: String,
     pub projection_sha256: String,
-    pub endpoint_pid: u32,
 }
 
 impl EndpointStatusReceipt {
-    pub fn ready(projection: &LoadedProjection, endpoint_pid: u32) -> Self {
+    /// The v1 applied receipt. It carries no `status` field and is written by
+    /// the endpoint only after the TCP listener and local socket directory are
+    /// ready.
+    pub fn applied_v1(
+        projection: &LoadedProjection,
+        bound_address: String,
+        endpoint_generation: u64,
+        endpoint_pid: u32,
+    ) -> Self {
         Self {
-            status: "ready".into(),
+            schema_version: 1,
+            endpoint_generation,
+            endpoint_pid,
+            bound_address,
             authorization_revision: projection.authorization_revision(),
             registry_sha256: projection.registry_sha256().to_string(),
             projection_sha256: encode_hex(&projection.projection_sha256),
-            endpoint_pid,
         }
     }
 }

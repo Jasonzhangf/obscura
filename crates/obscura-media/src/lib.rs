@@ -191,6 +191,8 @@ pub mod encoder {
 #[cfg(target_os = "macos")]
 pub(crate) mod videotoolbox;
 
+pub mod encoder_owner;
+
 #[cfg(any(feature = "webrtc-probe", feature = "webrtc"))]
 pub mod webrtc;
 #[cfg(feature = "webrtc")]

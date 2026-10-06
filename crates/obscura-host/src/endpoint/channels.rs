@@ -8,10 +8,9 @@ use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 use crate::remote_admission::{self, InitialProfileGrant, RemoteAdmissionErrorCode, RemoteAdmissionRequest, RemoteAdmissionResult, RemotePrincipalContext};
+use super::server::{SessionDurable, SessionGrant};
 
 pub type Socket = WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
-pub struct Video { pub bytes: Vec<u8>, pub closed: bool, pub session_id: Option<String> }
-pub type Frame = Arc<Video>;
 
 /// Exact admitted media subscription state for one mTLS control attachment.
 /// Authority is only set after the Host confirms the final `Attach`/rebind; a
@@ -38,7 +37,7 @@ pub async fn control(
     mut remote: Socket,
     host_dir: &Path,
     active: watch::Sender<MediaState>,
-    latest: watch::Receiver<Option<Arc<EncodedFrame>>>,
+    grant: SessionGrant,
     principal: RemotePrincipalContext,
     initial: InitialProfileGrant,
     enable_webrtc: bool,
@@ -84,6 +83,9 @@ pub async fn control(
     let mut browser_requests: Option<mpsc::Receiver<Request>> = None;
     let mut browser_responses: Option<mpsc::Sender<BrowserResponseDispatch>> = None;
     let mut terminal_pending: Option<watch::Sender<bool>> = None;
+    // The exact-session encoded stream for the current binding. It is acquired
+    // on a new binding and released on the previous one.
+    let mut binding: Option<(String, Arc<SessionDurable>, watch::Receiver<Option<Arc<EncodedFrame>>>)> = None;
     let mut internal_id = u64::MAX;
     loop {
         tokio::select! {
@@ -108,8 +110,8 @@ pub async fn control(
                                 let bind = webrtc_bind.context("WebRTC enablement requires an explicit bind address")?;
                                 let authorization = host_command(&mut write, &mut reader, &mut internal_id,
                                     Command::AuthorizeWebRtc { capability: capability.clone() }).await?;
-                                let (binding, authorized_capability) = match authorization {
-                                    Response::Result { value: ResultValue::WebRtcAuthorization { binding, capability }, .. } => (binding, capability),
+                                let (webrtc_binding, authorized_capability) = match authorization {
+                                    Response::Result { value: ResultValue::WebRtcAuthorization { binding: webrtc_binding, capability }, .. } => (webrtc_binding, capability),
                                     other => bail!("Host rejected WebRTC authorization: {other:?}"),
                                 };
                                 ensure!(authorized_capability == capability, "Host returned a different WebRTC capability");
@@ -118,17 +120,21 @@ pub async fn control(
                                 let (terminal_tx, terminal_rx) = watch::channel(false);
                                 let (filtered_latest, webrtc_latest) = watch::channel(None);
                                 let (answer_sdp, endpoint) = obscura_media::webrtc_endpoint::accept_offer(
-                                    sdp, capability.clone(), binding.clone(), webrtc_latest,
+                                    sdp, capability.clone(), webrtc_binding.clone(), webrtc_latest,
                                     browser_request_tx, browser_response_rx, terminal_rx, bind).await?;
                                 let consumed = host_command(&mut write, &mut reader, &mut internal_id,
-                                    Command::ConsumeWebRtc { binding: binding.clone(), capability: capability.clone() }).await?;
+                                    Command::ConsumeWebRtc { binding: webrtc_binding.clone(), capability: capability.clone() }).await?;
                                 ensure!(matches!(consumed, Response::Result { value: ResultValue::WebRtcConsumed { .. }, .. }),
                                     "Host did not consume WebRTC authorization");
                                 let admitted = active.borrow().clone();
-                                ensure!(admitted.attached && admitted.session_id.as_deref() == Some(binding.session_id.as_str()),
+                                ensure!(admitted.attached && admitted.session_id.as_deref() == Some(webrtc_binding.session_id.as_str()),
                                     "WebRTC admitted session changed before binding commit");
-                                let filter = exact_session_stream(filtered_latest, latest.clone(), active.subscribe(), admitted);
-                                let answer = WebRtcSignal::Answer { id, capability, binding, sdp: answer_sdp };
+                                let encoded = binding.as_ref()
+                                    .filter(|(session_id, _, _)| session_id == &webrtc_binding.session_id)
+                                    .map(|(_, _, encoded)| encoded.clone())
+                                    .context("WebRTC offer arrived before the exact media binding was acquired")?;
+                                let filter = exact_session_stream(filtered_latest, encoded, active.subscribe(), admitted);
+                                let answer = WebRtcSignal::Answer { id, capability, binding: webrtc_binding, sdp: answer_sdp };
                                 send(&mut remote, Message::text(serde_json::to_string(&answer)?)).await?;
                                 browser_requests = Some(browser_request_rx);
                                 browser_responses = Some(browser_response_tx);
@@ -161,21 +167,26 @@ pub async fn control(
                         send(&mut remote, Message::text(serde_json::to_string(&error)?)).await?; continue;
                     }
                 };
+                let request_id = request.id;
                 let result = forward_remote_request(&mut write, &mut reader, request).await?;
-                let detached = update_media_state(&active, &result);
+                let terminal_denial = is_terminal_authorization_denial(&result, request_id);
+                let detached = response_ends_media(&active.borrow(), &result);
+                // Publish the new exact media binding and forward the response
+                // only after it. The media admission path never blocks on the
+                // adapter connection or a first frame, so the consumer cannot
+                // observe a binding that the endpoint has not yet acquired.
+                update_media_state(&active, &result);
+                reconcile_binding(&grant, &active, &mut binding).await;
                 send(&mut remote, Message::text(serde_json::to_string(&result)?)).await?;
+                if terminal_denial {
+                    release_binding(&grant, &mut binding).await;
+                    fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
+                        &mut browser_responses, &mut terminal_pending);
+                    break;
+                }
                 if detached {
-                    if let Some(task) = webrtc_filter.take() { task.abort(); }
-                    // Drop the endpoint handle without aborting it. Aborting
-                    // here tears down the peer with no observable terminal for
-                    // the remote, while keeping the handle would block a later
-                    // offer on this attachment. The aborted filter drops the
-                    // filtered sender, so the endpoint ends and closes its peer
-                    // on its own.
-                    webrtc_task = None;
-                    browser_requests = None;
-                    browser_responses = None;
-                    terminal_pending = None;
+                    fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
+                        &mut browser_responses, &mut terminal_pending);
                 }
             }
             request = async {
@@ -190,19 +201,25 @@ pub async fn control(
                     webrtc_task = None;
                     continue;
                 };
+                let request_id = request.id;
                 let result = forward_remote_request(&mut write, &mut reader, request).await?;
+                let terminal_denial = is_terminal_authorization_denial(&result, request_id);
                 let admitted = active.borrow().clone();
                 let terminal = response_ends_media(&admitted, &result);
+                // Commit the terminal disposition and the reserved terminal
+                // dispatch BEFORE the media fence, so closing the filtered frame
+                // watch cannot end `run_inner` before the correlated response is
+                // drained. `run_inner` keys its frame-watch-close handling off
+                // this disposition.
                 if terminal {
                     let _ = terminal_pending.as_ref().context("WebRTC terminal-pending sender unavailable")?
                         .send(true);
                 }
-                let detached = update_media_state(&active, &result);
                 let response_tx = browser_responses.as_ref().context("WebRTC browser response pump unavailable")?;
                 if terminal {
                     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
                     response_tx.send(BrowserResponseDispatch::Terminal {
-                        response: result,
+                        response: result.clone(),
                         completion: completion_tx,
                     }).await.context("WebRTC terminal browser response receiver ended before terminal dispatch")?;
                     match tokio::time::timeout(SETTLEMENT_DEADLINE, completion_rx).await {
@@ -212,22 +229,25 @@ pub async fn control(
                         Err(_) => bail!("WebRTC terminal browser response settlement deadline exceeded"),
                     }
                 } else {
-                    response_tx.send(BrowserResponseDispatch::Ordinary(result)).await
+                    response_tx.send(BrowserResponseDispatch::Ordinary(result.clone())).await
                         .context("WebRTC browser response receiver ended")?;
                 }
+                let detached = update_media_state(&active, &result);
+                if terminal_denial {
+                    release_binding(&grant, &mut binding).await;
+                    fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
+                        &mut browser_responses, &mut terminal_pending);
+                    continue;
+                }
+                reconcile_binding(&grant, &active, &mut binding).await;
                 if terminal || detached {
-                    if let Some(task) = webrtc_filter.take() { task.abort(); }
-                    // See the WSS path above: detach the endpoint handle so the
-                    // peer closes with an observable terminal and a later offer
-                    // is not blocked.
-                    webrtc_task = None;
-                    browser_requests = None;
-                    browser_responses = None;
-                    terminal_pending = None;
+                    fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
+                        &mut browser_responses, &mut terminal_pending);
                 }
             }
         }
     }
+    release_binding(&grant, &mut binding).await;
     if let Some(task) = webrtc_task { task.abort(); }
     if let Some(task) = webrtc_filter { task.abort(); }
     Ok(())
@@ -365,6 +385,68 @@ fn remote_command_error(id: u64) -> Response {
     }
 }
 
+/// Acquire the exact-session media reference for a new binding and release the
+/// previous one. The control attach path never blocks on an adapter connection
+/// or a first frame; `acquire` only binds resources and returns the encoded
+/// receiver.
+async fn reconcile_binding(
+    grant: &SessionGrant,
+    active: &watch::Sender<MediaState>,
+    binding: &mut Option<(String, Arc<SessionDurable>, watch::Receiver<Option<Arc<EncodedFrame>>>)>,
+) {
+    let current = active.borrow().clone();
+    let wanted = if current.attached { current.session_id.clone() } else { None };
+    let unchanged = binding.as_ref().is_some_and(|(session_id, _, _)| Some(session_id) == wanted.as_ref());
+    if unchanged { return; }
+    if let Some((_, durable, _)) = binding.take() {
+        grant.release(&durable).await;
+    }
+    if let Some(session_id) = wanted {
+        match grant.acquire(&session_id).await {
+            Ok((encoded, durable)) => { *binding = Some((session_id, durable, encoded)); }
+            Err(error) => eprintln!("media binding acquire failed for {session_id}: {error:?}"),
+        }
+    }
+}
+
+async fn release_binding(
+    grant: &SessionGrant,
+    binding: &mut Option<(String, Arc<SessionDurable>, watch::Receiver<Option<Arc<EncodedFrame>>>)>,
+) {
+    if let Some((_, durable, _)) = binding.take() {
+        grant.release(&durable).await;
+    }
+}
+
+/// Drop the endpoint media handles without aborting the WebRTC task, so the
+/// peer closes with an observable terminal while the fence keeps the current
+/// control attachment from reusing the old binding.
+fn fence_without_terminal(
+    webrtc_task: &mut Option<tokio::task::JoinHandle<Result<()>>>,
+    webrtc_filter: &mut Option<tokio::task::JoinHandle<()>>,
+    browser_requests: &mut Option<mpsc::Receiver<Request>>,
+    browser_responses: &mut Option<mpsc::Sender<BrowserResponseDispatch>>,
+    terminal_pending: &mut Option<watch::Sender<bool>>,
+) {
+    if let Some(task) = webrtc_filter.take() { task.abort(); }
+    *webrtc_task = None;
+    *browser_requests = None;
+    *browser_responses = None;
+    *terminal_pending = None;
+}
+
+/// True only for the frozen typed resident authorization denials. Other
+/// errors, navigation results and log text never trigger the transition.
+fn is_terminal_authorization_denial(response: &Response, request_id: u64) -> bool {
+    matches!(
+        response,
+        Response::Error { id, code, .. }
+            if *id == request_id
+                && (code == RemoteAdmissionErrorCode::RemoteAuthRequired.as_str()
+                    || code == RemoteAdmissionErrorCode::RemotePrincipalRevoked.as_str())
+    )
+}
+
 fn update_media_state(
     active: &watch::Sender<MediaState>,
     result: &Response,
@@ -452,7 +534,7 @@ fn packet_session(packet: &VideoPacket) -> Option<String> {
     }
 }
 
-pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>>, mut active: watch::Receiver<MediaState>) -> Result<()> {
+pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Arc<EncodedFrame>>>, mut active: watch::Receiver<MediaState>) -> Result<()> {
     let mut emit = true;
     loop {
         // A client may end its control attachment before this endpoint receives
@@ -468,7 +550,7 @@ pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>
         if let Some(frame) = frame {
             // Exact admitted session/generation only. A frame from any other
             // profile session is never forwarded to this peer.
-            if frame.session_id.as_deref() != Some(expected_session.as_str()) {
+            if packet_session(&frame.packet).as_deref() != Some(expected_session.as_str()) {
                 tokio::select! {
                     changed = latest.changed() => { changed.context("Encoder stream ended")?; emit = true; }
                     changed = active.changed() => {
@@ -484,8 +566,8 @@ pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>
                 }
                 continue;
             }
-            send(&mut remote, Message::Binary(frame.bytes.clone().into())).await?;
-            if frame.closed { return Ok(()); }
+            send(&mut remote, Message::Binary(frame.wire_bytes()?.into())).await?;
+            if matches!(frame.packet, VideoPacket::Closed { .. }) { return Ok(()); }
         }
         emit = false;
         tokio::select! {
@@ -509,45 +591,66 @@ pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Frame>
     }
 }
 
+/// The one per-session ingest task. It borrows the durable's listener and
+/// cancellation handle and owns only its reader and encoded fan-out sender.
+/// Every potentially blocking transport operation competes with cancellation.
 pub async fn ingest(
-    socket: UnixStream,
-    latest: watch::Sender<Option<Frame>>,
+    listener: tokio::net::UnixListener,
     encoded_latest: watch::Sender<Option<Arc<EncodedFrame>>>,
+    mut cancel: watch::Receiver<bool>,
 ) -> Result<()> {
+    // Startup is the existing concrete 10-second adapter deadline, racing
+    // cancellation. There is no separate pending-adapter future.
+    let accepted = tokio::select! {
+        biased;
+        _ = wait_cancelled(&mut cancel) => return Ok(()),
+        result = tokio::time::timeout(Duration::from_secs(10), listener.accept()) => result,
+    }.context("Media adapter startup deadline")??;
+    let (socket, _) = accepted;
     let mut reader = BufReader::new(socket);
     loop {
         let mut header = Vec::new();
-        (&mut reader).take(4096).read_until(b'\n', &mut header).await?;
+        // Scope the bounded header reader so its mutable borrow of `reader`
+        // ends before the payload read below.
+        let read = {
+            let mut bounded = (&mut reader).take(4096);
+            tokio::select! {
+                biased;
+                read = bounded.read_until(b'\n', &mut header) => read,
+                _ = wait_cancelled(&mut cancel) => return Ok(()),
+            }
+        };
+        read?;
         ensure!(header.len() < 4096 && header.last() == Some(&b'\n'), "Encoder stream ended or invalid header");
         header.pop();
         let packet: VideoPacket = serde_json::from_slice(&header)?;
         let size = match &packet { VideoPacket::AccessUnit { byte_length, .. } => *byte_length, _ => 0 };
         ensure!(size <= 4 * 1024 * 1024, "Encoded frame exceeds endpoint budget");
         let mut payload = vec![0; size as usize];
-        tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut payload)).await??;
-        encoded_latest.send_replace(Some(Arc::new(EncodedFrame { packet: packet.clone(), bytes: payload.clone().into() })));
-        let mut bytes = Vec::with_capacity(4 + header.len() + payload.len());
-        bytes.extend_from_slice(&(header.len() as u32).to_be_bytes()); bytes.extend_from_slice(&header); bytes.extend_from_slice(&payload);
-        let closed = matches!(packet, VideoPacket::Closed { .. });
-        let session_id = packet_session(&packet);
-        latest.send_replace(Some(Arc::new(Video { bytes, closed, session_id })));
+        let payload_read = tokio::select! {
+            biased;
+            read = tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut payload)) => read,
+            _ = wait_cancelled(&mut cancel) => return Ok(()),
+        };
+        payload_read??;
+        encoded_latest.send_replace(Some(Arc::new(EncodedFrame { packet: packet.clone(), bytes: payload.into() })));
         if matches!(packet, VideoPacket::EncoderUnavailable { .. }) {
-            // EncoderUnavailable is terminal at this local ABI boundary. Close
-            // both fan-out watches immediately so every endpoint can deliver
-            // its typed DataChannel error even if the adapter delays or fails
-            // to close its socket after sending the marker. Keep this media
-            // future alive: `server::serve` must not select a completed ingest
-            // future and abort the authenticated WebRTC task before delivery.
-            drop(latest);
+            // Terminal marker is retained, then the sole sender drops so every
+            // subscriber watch closes. The supervisor joins this task.
             drop(encoded_latest);
-            // The server owns cancellation of this media future: it drops the
-            // pinned future after its shutdown branch wins. Release the
-            // adapter socket before waiting so the pending future retains no
-            // file descriptor while the endpoint remains alive.
-            drop(reader);
-            return std::future::pending::<Result<()>>().await;
+            return Ok(());
         }
-        if closed { return Ok(()); }
+        if matches!(packet, VideoPacket::Closed { .. }) {
+            drop(encoded_latest);
+            return Ok(());
+        }
+    }
+}
+
+async fn wait_cancelled(cancel: &mut watch::Receiver<bool>) -> () {
+    loop {
+        if *cancel.borrow() { return; }
+        if cancel.changed().await.is_err() { return; }
     }
 }
 
@@ -557,11 +660,13 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
-    async fn terminal_encoder_unavailable_closes_fanout_watches() {
-        let (mut writer, socket) = UnixStream::pair().expect("create encoded stream pair");
-        let (latest_tx, mut latest_rx) = watch::channel(None);
+    async fn terminal_encoder_unavailable_closes_fanout_watch() {
+        let path = std::env::temp_dir().join(format!("ch-ing-{}.sock", uuid::Uuid::new_v4().simple()));
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind ingest socket");
+        let mut writer = tokio::net::UnixStream::connect(&path).await.expect("connect ingest socket");
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
         let (encoded_tx, mut encoded_rx) = watch::channel(None);
-        let mut task = tokio::spawn(ingest(socket, latest_tx, encoded_tx));
+        let task = tokio::spawn(ingest(listener, encoded_tx, cancel_rx));
         let packet = VideoPacket::EncoderUnavailable {
             session_id: "terminal-session".into(),
             message: "configured encoder exited".into(),
@@ -570,52 +675,48 @@ mod tests {
         header.push(b'\n');
         writer.write_all(&header).await.expect("write unavailable packet");
 
-        latest_rx.changed().await.expect("receive unavailable media state");
-        assert!(matches!(latest_rx.borrow().as_ref().map(|frame| frame.closed), Some(false)));
-        assert!(tokio::time::timeout(Duration::from_secs(1), latest_rx.changed()).await
-            .expect("latest watch closure was not observed").is_err());
         encoded_rx.changed().await.expect("receive unavailable encoded state");
         assert!(matches!(encoded_rx.borrow().as_ref().map(|frame| &frame.packet), Some(VideoPacket::EncoderUnavailable { .. })));
+        assert!(tokio::time::timeout(Duration::from_millis(200), task).await
+            .expect("terminal ingest must finish").is_ok());
         assert!(tokio::time::timeout(Duration::from_secs(1), encoded_rx.changed()).await
             .expect("encoded watch closure was not observed").is_err());
-        assert!(tokio::time::timeout(Duration::from_millis(100), &mut task).await.is_err(),
-            "terminal ingest must remain alive until endpoint shutdown");
-        task.abort();
-        let _ = task.await;
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn closed_packet_is_terminal_and_preserves_matching_session_state() {
-        let (mut writer, socket) = UnixStream::pair().expect("create encoded stream pair");
-        let (latest_tx, mut latest_rx) = watch::channel(None);
+        let path = std::env::temp_dir().join(format!("ch-closed-{}.sock", uuid::Uuid::new_v4().simple()));
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind ingest socket");
+        let mut writer = tokio::net::UnixStream::connect(&path).await.expect("connect ingest socket");
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
         let (encoded_tx, mut encoded_rx) = watch::channel(None);
-        let mut task = tokio::spawn(ingest(socket, latest_tx, encoded_tx));
+        let task = tokio::spawn(ingest(listener, encoded_tx, cancel_rx));
         let packet = VideoPacket::Closed { session_id: "closed-session".into() };
         let mut header = serde_json::to_vec(&packet).expect("serialize closed packet");
         header.push(b'\n');
         writer.write_all(&header).await.expect("write closed packet");
 
-        latest_rx.changed().await.expect("receive closed media state");
-        let latest = latest_rx.borrow();
-        assert!(latest.as_ref().is_some_and(|frame| frame.closed));
-        drop(latest);
         encoded_rx.changed().await.expect("receive closed encoded state");
         assert!(matches!(
             encoded_rx.borrow().as_ref().map(|frame| &frame.packet),
             Some(VideoPacket::Closed { session_id }) if session_id == "closed-session"
         ));
-        assert!(tokio::time::timeout(Duration::from_secs(1), &mut task).await.is_ok(),
-            "closed ingest must finish after publishing the terminal state");
-        assert!(tokio::time::timeout(Duration::from_millis(100), latest_rx.changed()).await
-            .expect("latest watch closure was not observed").is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(1), task).await
+            .expect("closed ingest must finish").is_ok());
+        assert!(tokio::time::timeout(Duration::from_millis(100), encoded_rx.changed()).await
+            .expect("encoded watch closure was not observed").is_err());
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn host_unavailable_eof_keeps_generic_stream_error() {
-        let (mut writer, socket) = UnixStream::pair().expect("create encoded stream pair");
-        let (latest_tx, mut latest_rx) = watch::channel(None);
+        let path = std::env::temp_dir().join(format!("ch-eof-{}.sock", uuid::Uuid::new_v4().simple()));
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind ingest socket");
+        let mut writer = tokio::net::UnixStream::connect(&path).await.expect("connect ingest socket");
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
         let (encoded_tx, mut encoded_rx) = watch::channel(None);
-        let task = tokio::spawn(ingest(socket, latest_tx, encoded_tx));
+        let task = tokio::spawn(ingest(listener, encoded_tx, cancel_rx));
         let packet = VideoPacket::Unavailable {
             session_id: "host-session".into(),
             message: "capture temporarily unavailable".into(),
@@ -625,11 +726,9 @@ mod tests {
         writer.write_all(&header).await.expect("write host unavailable packet");
         writer.shutdown().await.expect("close encoded stream");
 
-        latest_rx.changed().await.expect("receive host unavailable media state");
         encoded_rx.changed().await.expect("receive host unavailable encoded state");
         assert!(matches!(encoded_rx.borrow().as_ref().map(|frame| &frame.packet), Some(VideoPacket::Unavailable { .. })));
-        assert!(tokio::time::timeout(Duration::from_secs(1), encoded_rx.changed()).await
-            .expect("encoded watch closure was not observed").is_err());
         assert!(task.await.expect("ingest task panicked").is_err(), "Host unavailable EOF must remain a generic ingest error");
+        let _ = std::fs::remove_file(&path);
     }
 }

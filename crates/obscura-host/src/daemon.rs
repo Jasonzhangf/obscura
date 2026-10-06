@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -12,6 +12,7 @@ use crate::remote_admission::{
     RemoteConnectionIo, RemotePrincipalContext, RemoteScope,
 };
 use crate::remote_authorization::{self, AuthFailure};
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -29,6 +30,9 @@ enum Event {
     /// Detach one connection without retiring its identity, for a profile
     /// rebind. Rejected when the caller still owns an open input lease.
     Release { connection: u64, reply: oneshot::Sender<Result<(), &'static str>> },
+    /// One typed local-admin request. The main loop owns the catalog store, the
+    /// registry validation and the per-connection replay map.
+    Admin { connection: u64, request: AdminRequest, reply: oneshot::Sender<AdminResponse> },
 }
 
 // Created exclusively. Never unlink a pre-existing socket or directory.
@@ -43,6 +47,23 @@ impl Drop for SocketDir {
         }
         if let Err(error) = std::fs::remove_file(self.0.join("remote-admission.sock")) {
             if error.kind() != std::io::ErrorKind::NotFound { eprintln!("remote admission socket cleanup: {error}"); }
+        }
+        if let Err(error) = std::fs::remove_file(self.0.join("host-admin.sock")) {
+            if error.kind() != std::io::ErrorKind::NotFound { eprintln!("host admin socket cleanup: {error}"); }
+        }
+        // Per-session sources remove their own socket on drop; sweep any that
+        // remain so a failed session cleanup does not leave a stale bound path.
+        match std::fs::read_dir(&self.0) {
+            Ok(entries) => for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("session-") && name.ends_with(".sock") {
+                    if let Err(error) = std::fs::remove_file(entry.path()) {
+                        if error.kind() != std::io::ErrorKind::NotFound { eprintln!("session media cleanup: {error}"); }
+                    }
+                }
+            },
+            Err(error) => eprintln!("socket directory listing failed: {error}"),
         }
         if let Err(error) = std::fs::remove_dir(&self.0) { eprintln!("socket directory cleanup: {error}"); }
     }
@@ -765,6 +786,9 @@ struct SessionRuntime {
     work: mpsc::Sender<Work>,
     frames: tokio::sync::watch::Receiver<media::SharedFrame>,
     interest: tokio::sync::watch::Sender<usize>,
+    /// Exact-session raw media listener bound at session start. It exists for
+    /// every live session, not only the presented one.
+    media_source: media::SessionMediaSource,
     viewers: usize,
     join: std::thread::JoinHandle<Result<()>>,
 }
@@ -776,6 +800,7 @@ async fn spawn_session(
     profile_dir: Option<PathBuf>,
     network: bool,
     faults_out: mpsc::Sender<(String, worker::PageUpdate)>,
+    socket_dir: &std::path::Path,
 ) -> Result<SessionRuntime> {
     let id = uuid::Uuid::new_v4().to_string();
     let (work, incoming_work) = mpsc::channel(1);
@@ -785,6 +810,12 @@ async fn spawn_session(
     let (interest, interested) = tokio::sync::watch::channel(0usize);
     let worker = worker::start(id.clone(), profile_dir, network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
+    // Bind the exact-session source only after the worker is live, so a failed
+    // startup leaves no socket or accept task behind.
+    let mut media_source = media::SessionMediaSource::bind(socket_dir, &id)
+        .context("Bind exact-session media source")?;
+    let listener = media_source.take_listener().expect("session media listener is bound");
+    tokio::spawn(media::serve_session(listener, latest.clone(), interest.clone(), id.clone()));
     let forward_id = id.clone();
     tokio::spawn(async move {
         while let Some(update) = fault_events.recv().await {
@@ -816,7 +847,7 @@ async fn spawn_session(
         navigation: NavigationState { url: "about:blank".into(), title: String::new(), can_go_back: false, can_go_forward: false },
         profile: ProfileBinding { profile_id: profile_id.clone(), session_id: id.clone() },
     };
-    Ok(SessionRuntime { session, work, frames: latest, interest, viewers: 0, join: worker })
+    Ok(SessionRuntime { session, work, frames: latest, interest, media_source, viewers: 0, join: worker })
 }
 
 /// Host-local reservation for one remote admission. It binds the accepted
@@ -890,6 +921,7 @@ async fn resolve_remote_admission(
     sessions: &mut HashMap<String, SessionRuntime>,
     conn_route: &mut HashMap<u64, Route>,
     conn_principal: &mut HashMap<u64, RemotePrincipalContext>,
+    socket_dir: &std::path::Path,
     connection: u64,
     request: RemoteAdmissionRequest,
     allow_private_network: bool,
@@ -935,7 +967,7 @@ async fn resolve_remote_admission(
     }
     let profile_dir = catalog.profile_dir(&profile_id);
     if !sessions.contains_key(&profile_id) {
-        match spawn_session(profile_id.clone(), profile_dir, allow_private_network, fault_tx.clone()).await {
+        match spawn_session(profile_id.clone(), profile_dir, allow_private_network, fault_tx.clone(), socket_dir).await {
             Ok(runtime) => { sessions.insert(profile_id.clone(), runtime); }
             Err(cause) => return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Session unavailable: {cause}")),
         }
@@ -948,6 +980,362 @@ async fn resolve_remote_admission(
     conn_route.insert(connection, Route { profile_id, session_id: session_id.clone(), reservation_id: reservation_id.clone() });
     conn_principal.insert(connection, request.principal.clone());
     RemoteAdmissionResult::Ok { request_id, reservation_id, session_id }
+}
+
+// ---------------------------------------------------------------------------
+// Local admin authority (`host-admin.sock`)
+//
+// One UTF-8 JSON object plus LF per frame, request/response, same-uid local
+// peer only. The catalog store remains the single membership source: this
+// layer validates intent, registered devices and revision, then calls the
+// existing `ProfileCatalogStore::create`/`assign_access`/`select`.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct AdminRequest {
+    schema_version: u32,
+    id: u64,
+    op: String,
+    #[serde(default)] intent: Option<String>,
+    #[serde(default)] attempt_id: Option<String>,
+    #[serde(default)] expected_catalog_revision: Option<u64>,
+    #[serde(default)] profile_id: Option<String>,
+    #[serde(default)] owner_device_id: Option<String>,
+    #[serde(default)] device_id: Option<String>,
+    #[serde(default)] members: Option<Vec<String>>,
+    #[serde(default)] display_name: Option<String>,
+    #[serde(default)] make_default: Option<bool>,
+}
+
+impl AdminRequest {
+    /// Compare the typed mutating request without the per-frame `id`, so an
+    /// exact retry may carry a new request id but any changed field is refused.
+    fn same_attempt(&self, other: &AdminRequest) -> bool {
+        self.schema_version == other.schema_version
+            && self.op == other.op
+            && self.intent == other.intent
+            && self.attempt_id == other.attempt_id
+            && self.expected_catalog_revision == other.expected_catalog_revision
+            && self.profile_id == other.profile_id
+            && self.owner_device_id == other.owner_device_id
+            && self.device_id == other.device_id
+            && self.members == other.members
+            && self.display_name == other.display_name
+            && self.make_default == other.make_default
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct AdminProfile {
+    profile_id: String,
+    display_name: String,
+    default: bool,
+    owner_device_id: Option<String>,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct AdminMembershipReceipt {
+    receipt_type: String,
+    catalog_revision: u64,
+    profile_id: String,
+    device_id: String,
+    owner_device_id: String,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct AdminResponse {
+    schema_version: u32,
+    id: u64,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")] code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] catalog_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")] default_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] profiles: Option<Vec<AdminProfile>>,
+    #[serde(skip_serializing_if = "Option::is_none")] profile: Option<AdminProfile>,
+    #[serde(skip_serializing_if = "Option::is_none")] membership_receipt: Option<AdminMembershipReceipt>,
+}
+
+fn admin_ok(id: u64) -> AdminResponse {
+    AdminResponse {
+        schema_version: 1, id, state: "ok".into(), code: None, message: None,
+        catalog_revision: None, default_profile_id: None, profiles: None, profile: None,
+        membership_receipt: None,
+    }
+}
+
+fn admin_error(id: u64, code: &str, message: impl Into<String>) -> AdminResponse {
+    let mut response = admin_ok(id);
+    response.state = "error".into();
+    response.code = Some(code.into());
+    response.message = Some(message.into());
+    response
+}
+
+fn admin_profile(entry: &catalog::ProfileEntry) -> AdminProfile {
+    AdminProfile {
+        profile_id: entry.profile_id.clone(),
+        display_name: entry.display_name.clone(),
+        default: entry.default,
+        owner_device_id: entry.access.as_ref().map(|access| access.owner_device_id.clone()),
+        members: entry.access.as_ref().map(|access| access.members.iter().cloned().collect()).unwrap_or_default(),
+    }
+}
+
+#[derive(Default)]
+struct AdminConnState {
+    replay: HashMap<String, (AdminRequest, AdminResponse)>,
+    order: std::collections::VecDeque<String>,
+}
+
+impl AdminConnState {
+    fn remember(&mut self, attempt_id: String, request: AdminRequest, response: AdminResponse) {
+        const MAX_REPLAY: usize = 64;
+        if self.replay.insert(attempt_id.clone(), (request, response)).is_none() {
+            self.order.push_back(attempt_id);
+        }
+        while self.order.len() > MAX_REPLAY {
+            if let Some(oldest) = self.order.pop_front() { self.replay.remove(&oldest); }
+        }
+    }
+}
+
+fn admin_revision_conflict(catalog: &ProfileCatalogStore, expected: Option<u64>) -> bool {
+    expected.is_some_and(|expected| expected != catalog.catalog_revision())
+}
+
+fn handle_admin(
+    catalog: &mut ProfileCatalogStore,
+    registry_path: Option<&std::path::Path>,
+    state: &mut AdminConnState,
+    request: AdminRequest,
+) -> AdminResponse {
+    let id = request.id;
+    if request.schema_version != 1 {
+        return admin_error(id, "ADMIN_FRAME_MALFORMED", "schema_version must be 1");
+    }
+    match request.op.as_str() {
+        "admin.catalog.info" => {
+            let mut response = admin_ok(id);
+            response.catalog_revision = Some(catalog.catalog_revision());
+            response.default_profile_id = catalog.default_id();
+            response.profiles = Some(catalog.entries().iter().map(admin_profile).collect());
+            response
+        }
+        "admin.catalog.create" => {
+            if admin_revision_conflict(catalog, request.expected_catalog_revision) {
+                return admin_error(id, "CATALOG_REVISION_CONFLICT", "expected_catalog_revision does not match the committed catalog");
+            }
+            let Some(display_name) = request.display_name.as_deref() else {
+                return admin_error(id, "ADMIN_FRAME_MALFORMED", "display_name is required");
+            };
+            let make_default = request.make_default.unwrap_or(false);
+            match catalog.create(display_name, make_default, catalog::LOCAL_DEVICE_ID) {
+                Ok(record) => {
+                    let mut response = admin_ok(id);
+                    response.catalog_revision = Some(catalog.catalog_revision());
+                    response.profile = catalog.record(&record.profile_id).map(admin_profile);
+                    response
+                }
+                Err(error) => admin_error(id, error.code, error.message),
+            }
+        }
+        "admin.catalog.select" => {
+            if admin_revision_conflict(catalog, request.expected_catalog_revision) {
+                return admin_error(id, "CATALOG_REVISION_CONFLICT", "expected_catalog_revision does not match the committed catalog");
+            }
+            let Some(profile_id) = request.profile_id.as_deref() else {
+                return admin_error(id, "ADMIN_FRAME_MALFORMED", "profile_id is required");
+            };
+            match catalog.select(profile_id) {
+                Ok(record) => {
+                    let mut response = admin_ok(id);
+                    response.catalog_revision = Some(catalog.catalog_revision());
+                    response.default_profile_id = Some(record.profile_id.clone());
+                    response.profile = catalog.record(&record.profile_id).map(admin_profile);
+                    response
+                }
+                Err(error) => admin_error(id, error.code, error.message),
+            }
+        }
+        "admin.membership.set" => {
+            if let Some(attempt_id) = request.attempt_id.as_deref() {
+                if let Some((stored, response)) = state.replay.get(attempt_id) {
+                    if stored.same_attempt(&request) {
+                        let mut replayed = response.clone();
+                        replayed.id = id;
+                        return replayed;
+                    }
+                    return admin_error(id, "ADMIN_FRAME_MALFORMED", "attempt_id replay with a changed field");
+                }
+            }
+            let response = admin_membership_set(catalog, registry_path, &request);
+            if response.state == "ok" {
+                if let Some(attempt_id) = request.attempt_id.clone() {
+                    state.remember(attempt_id, request.clone(), response.clone());
+                }
+            }
+            response
+        }
+        _ => admin_error(id, "ADMIN_FRAME_MALFORMED", "unknown admin op"),
+    }
+}
+
+fn admin_membership_set(
+    catalog: &mut ProfileCatalogStore,
+    registry_path: Option<&std::path::Path>,
+    request: &AdminRequest,
+) -> AdminResponse {
+    let id = request.id;
+    let Some(intent) = request.intent.as_deref() else {
+        return admin_error(id, "ADMIN_FRAME_MALFORMED", "intent is required and must be grant or remove");
+    };
+    if intent != "grant" && intent != "remove" {
+        return admin_error(id, "ADMIN_FRAME_MALFORMED", "intent must be exactly grant or remove");
+    }
+    let Some(attempt_id) = request.attempt_id.as_deref() else {
+        return admin_error(id, "ADMIN_FRAME_MALFORMED", "attempt_id is required");
+    };
+    if attempt_id.trim().is_empty() {
+        return admin_error(id, "ADMIN_FRAME_MALFORMED", "attempt_id must not be empty");
+    }
+    let (Some(profile_id), Some(owner), Some(device_id), Some(members)) =
+        (request.profile_id.as_deref(), request.owner_device_id.as_deref(), request.device_id.as_deref(), request.members.as_ref())
+    else {
+        return admin_error(id, "ADMIN_FRAME_MALFORMED", "profile_id, owner_device_id, device_id and members are required");
+    };
+    if admin_revision_conflict(catalog, request.expected_catalog_revision) {
+        return admin_error(id, "CATALOG_REVISION_CONFLICT", "expected_catalog_revision does not match the committed catalog");
+    }
+    if catalog.record(profile_id).is_none() {
+        return admin_error(id, "PROFILE_NOT_FOUND", "Unknown profile id");
+    }
+    let Some(registry_path) = registry_path else {
+        return admin_error(id, "PROFILE_ACCESS_FAILED", "authorization registry is not configured");
+    };
+    let registry = match remote_authorization::RegistryFile::load(registry_path) {
+        Ok(registry) => registry,
+        Err(error) => return admin_error(id, "PROFILE_ACCESS_FAILED", format!("authorization registry unavailable: {error}")),
+    };
+    if let Err((code, message)) = validate_membership_devices(&registry, intent, owner, device_id, members) {
+        return admin_error(id, code, message);
+    }
+    let requested: BTreeSet<String> = members.iter().cloned().collect();
+    match catalog.assign_access(profile_id, owner, requested) {
+        Ok(_) => {}
+        Err(error) => return admin_error(id, error.code, error.message),
+    }
+    let committed = catalog.access_for(profile_id);
+    let committed_members: Vec<String> = committed.map(|access| access.members.iter().cloned().collect()).unwrap_or_default();
+    let receipt_type = match intent {
+        "grant" if committed_members.iter().any(|member| member == device_id) => "export_eligible",
+        "remove" if !committed_members.iter().any(|member| member == device_id) => "removed",
+        "grant" => return admin_error(id, "MEMBERSHIP_REQUIRED", "granted members do not contain the target device"),
+        _ => return admin_error(id, "PROFILE_ACCESS_FAILED", "removed members still contain the target device"),
+    };
+    let mut response = admin_ok(id);
+    response.catalog_revision = Some(catalog.catalog_revision());
+    response.membership_receipt = Some(AdminMembershipReceipt {
+        receipt_type: receipt_type.into(),
+        catalog_revision: catalog.catalog_revision(),
+        profile_id: profile_id.to_string(),
+        device_id: device_id.to_string(),
+        owner_device_id: owner.to_string(),
+        members: committed_members,
+    });
+    response
+}
+
+fn validate_membership_devices(
+    registry: &remote_authorization::RegistryFile,
+    intent: &str,
+    owner: &str,
+    device_id: &str,
+    members: &[String],
+) -> Result<(), (&'static str, String)> {
+    let active: HashSet<&str> = registry.devices.iter()
+        .filter(|device| device.status == remote_authorization::DeviceStatus::Active)
+        .map(|device| device.device_id.as_str())
+        .collect();
+    let device = registry.devices.iter().find(|device| device.device_id == device_id)
+        .ok_or(("DEVICE_NOT_REGISTERED", "target device is not registered".to_string()))?;
+    if device.status != remote_authorization::DeviceStatus::Active {
+        return Err(("DEVICE_REVOKED", "target device is revoked".to_string()));
+    }
+    if device.scopes.is_empty() {
+        return Err(("DEVICE_NOT_REGISTERED", "target device has no scopes".to_string()));
+    }
+    if device.initial_profile_grant.authorization_revision != registry.authorization_revision {
+        return Err(("DEVICE_GRANT_STALE", "target device initial grant is stale".to_string()));
+    }
+    if owner != catalog::LOCAL_DEVICE_ID && !active.contains(owner) {
+        return Err(("DEVICE_NOT_REGISTERED", "profile owner is not an active registered device".to_string()));
+    }
+    for member in members {
+        if member != catalog::LOCAL_DEVICE_ID && !active.contains(member.as_str()) {
+            return Err(("DEVICE_NOT_REGISTERED", "member is not an active registered device".to_string()));
+        }
+    }
+    match intent {
+        "grant" if !members.iter().any(|member| member == device_id) => {
+            return Err(("MEMBERSHIP_REQUIRED", "granted members must contain the target device".to_string()));
+        }
+        "remove" if members.iter().any(|member| member == device_id) => {
+            return Err(("PROFILE_ACCESS_FAILED", "removed members must not contain the target device".to_string()));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn admin_write(write: &mut tokio::net::unix::OwnedWriteHalf, response: AdminResponse) -> Result<()> {
+    let mut bytes = serde_json::to_vec(&response)?;
+    bytes.push(b'\n');
+    timeout(Duration::from_secs(2), write.write_all(&bytes)).await??;
+    Ok(())
+}
+
+async fn admin_connection(stream: UnixStream, connection: u64, events: mpsc::Sender<Event>) -> Result<()> {
+    let peer = stream.peer_cred().context("Read admin peer credentials")?;
+    // Safety: geteuid is always safe and never fails.
+    let euid = unsafe { libc::geteuid() };
+    if peer.uid() != euid {
+        anyhow::bail!("ADMIN_PEER_REJECTED: admin socket peer uid does not match the daemon");
+    }
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    loop {
+        let mut line = Vec::new();
+        let read = {
+            let mut bounded = (&mut reader).take(MAX_FRAME as u64 + 1);
+            timeout(Duration::from_secs(30), bounded.read_until(b'\n', &mut line)).await
+        };
+        let count = match read { Ok(result) => result?, Err(_) => return Ok(()) };
+        if count == 0 {
+            if line.is_empty() { return Ok(()); }
+            admin_write(&mut write, admin_error(0, "ADMIN_FRAME_MALFORMED", "partial admin frame at EOF")).await?;
+            return Ok(());
+        }
+        if line.len() > MAX_FRAME || line.last() != Some(&b'\n') {
+            admin_write(&mut write, admin_error(0, "ADMIN_FRAME_MALFORMED", "admin frame must be one JSON object plus newline")).await?;
+            continue;
+        }
+        line.pop();
+        let request: AdminRequest = match serde_json::from_slice(&line) {
+            Ok(request) => request,
+            Err(_) => {
+                admin_write(&mut write, admin_error(0, "ADMIN_FRAME_MALFORMED", "malformed admin frame")).await?;
+                continue;
+            }
+        };
+        let (reply, result) = oneshot::channel();
+        if events.send(Event::Admin { connection, request, reply }).await.is_err() { return Ok(()); }
+        let response = match result.await { Ok(response) => response, Err(_) => return Ok(()) };
+        admin_write(&mut write, response).await?;
+    }
 }
 
 pub async fn serve(
@@ -964,13 +1352,14 @@ pub async fn serve(
 
     let (fault_tx, mut fault_rx) = mpsc::channel::<(String, worker::PageUpdate)>(16);
     let mut sessions: HashMap<String, SessionRuntime> = HashMap::new();
-    let default_runtime = spawn_session(default_profile.clone(), catalog.profile_dir(&default_profile), allow_private_network, fault_tx.clone()).await?;
+    let default_runtime = spawn_session(default_profile.clone(), catalog.profile_dir(&default_profile), allow_private_network, fault_tx.clone(), &socket_dir).await?;
     let default_session_id = default_runtime.session.id.clone();
     sessions.insert(default_profile.clone(), default_runtime);
     let mut presented = default_profile.clone();
     let mut conn_session: HashMap<u64, String> = HashMap::new();
     let mut conn_route: HashMap<u64, Route> = HashMap::new();
     let mut conn_principal: HashMap<u64, RemotePrincipalContext> = HashMap::new();
+    let mut conn_admin: HashMap<u64, AdminConnState> = HashMap::new();
 
     let listener = UnixListener::bind(socket_dir.join("host.sock"))?;
     std::fs::set_permissions(socket_dir.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
@@ -978,6 +1367,8 @@ pub async fn serve(
     std::fs::set_permissions(socket_dir.join("frames.sock"), std::fs::Permissions::from_mode(0o600))?;
     let remote_listener = UnixListener::bind(socket_dir.join("remote-admission.sock"))?;
     std::fs::set_permissions(socket_dir.join("remote-admission.sock"), std::fs::Permissions::from_mode(0o600))?;
+    let admin_listener = UnixListener::bind(socket_dir.join("host-admin.sock"))?;
+    std::fs::set_permissions(socket_dir.join("host-admin.sock"), std::fs::Permissions::from_mode(0o600))?;
     let media_permits = Arc::new(Semaphore::new(16));
     let permits = Arc::new(Semaphore::new(16));
     let (events, mut incoming) = mpsc::channel(64);
@@ -1125,6 +1516,20 @@ pub async fn serve(
                     });
                 }
             }
+            accepted = admin_listener.accept() => {
+                let (stream, _) = accepted?;
+                if let Ok(permit) = permits.clone().try_acquire_owned() {
+                    counter = counter.checked_add(1).context("connection identity exhausted")?;
+                    let connection_id = counter;
+                    let sender = events.clone();
+                    tasks.spawn(async move {
+                        let _permit = permit;
+                        let result = admin_connection(stream, connection_id, sender.clone()).await;
+                        sender.send(Event::Gone(connection_id)).await.ok();
+                        result
+                    });
+                }
+            }
             accepted = listener.accept() => {
                 let (stream, _) = accepted?;
                 if let Ok(permit) = permits.clone().try_acquire_owned() {
@@ -1158,6 +1563,12 @@ pub async fn serve(
                     }
                     conn_route.remove(&connection);
                     conn_principal.remove(&connection);
+                    conn_admin.remove(&connection);
+                }
+                Event::Admin { connection, request, reply } => {
+                    let state = conn_admin.entry(connection).or_default();
+                    let response = handle_admin(&mut catalog, authorization_registry.as_deref(), state, request);
+                    let _ = reply.send(response);
                 }
                 Event::RemoteAdmission { connection, request, reply } => {
                     let outcome = resolve_remote_admission(
@@ -1166,6 +1577,7 @@ pub async fn serve(
                         &mut sessions,
                         &mut conn_route,
                         &mut conn_principal,
+                        &socket_dir,
                         connection,
                         request,
                         allow_private_network,
@@ -1265,7 +1677,7 @@ pub async fn serve(
                                 continue;
                             }
                             if !sessions.contains_key(&profile_id) {
-                                match spawn_session(profile_id.clone(), catalog.profile_dir(&profile_id), allow_private_network, fault_tx.clone()).await {
+                                match spawn_session(profile_id.clone(), catalog.profile_dir(&profile_id), allow_private_network, fault_tx.clone(), &socket_dir).await {
                                     Ok(runtime) => { sessions.insert(profile_id.clone(), runtime); }
                                     Err(cause) => { let _ = reply.send(error(id, "SESSION_UNAVAILABLE", cause.to_string())); continue; }
                                 }

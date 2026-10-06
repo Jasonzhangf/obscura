@@ -5,6 +5,12 @@ use clap::Parser;
 use obscura_host_protocol::{FramePacket, VideoCodec, VideoPacket};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+/// One in-flight encode result or the signal that cancelled its borrow.
+enum EncodeRun {
+    Finished(Result<Vec<u8>>),
+    Interrupted(&'static str),
+}
+
 #[derive(Parser)]
 #[command(about = "Encode Host raw frames as H.264 access units to a local consumer")]
 struct Args {
@@ -25,6 +31,13 @@ async fn main() -> Result<()> {
     let socket = tokio::net::UnixStream::connect(&args.frames_socket).await.context("Connect Host frame socket")?;
     let mut reader = BufReader::new(socket);
     let mut output = tokio::net::UnixStream::connect(&args.video_socket).await.context("Connect encoded media consumer")?;
+    // The private encoder-control socket lives beside the consumer-owned video
+    // socket, so no new CLI flag or ABI is introduced.
+    let control_dir = args.video_socket.parent().context("Video socket has no parent directory")?;
+    let control_path = control_dir.join("encoder-control.sock");
+    let mut owner = obscura_media::encoder_owner::EncoderChildOwner::open(&args.ffmpeg, &control_path).await
+        .context("Open Host encoder control")?;
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let encoder_id = uuid::Uuid::new_v4().to_string();
     let start = Instant::now();
     let mut session = None;
@@ -57,7 +70,27 @@ async fn main() -> Result<()> {
                 let pts_us = u64::try_from(start.elapsed().as_micros()).context("Media timestamp exhausted")?;
                 let mut rgba = vec![0; info.byte_length as usize];
                 tokio::time::timeout(Duration::from_secs(2), reader.read_exact(&mut rgba)).await.context("Incomplete raw frame deadline")??;
-                match obscura_media::encode(&args.ffmpeg, info.width, info.height, rgba).await {
+                // The complete borrowed encode runs under one signal select.
+                // If a signal wins, the borrow ends before the same retained
+                // owner finalizes the group, so the group is never dropped
+                // while an encode borrow is in flight.
+                let outcome = {
+                    let encode = owner.encode_frame(info.width, info.height, rgba);
+                    tokio::pin!(encode);
+                    tokio::select! {
+                        result = &mut encode => EncodeRun::Finished(result),
+                        _ = tokio::signal::ctrl_c() => EncodeRun::Interrupted("ctrl-c"),
+                        _ = term.recv() => EncodeRun::Interrupted("SIGTERM"),
+                    }
+                };
+                let encoded = match outcome {
+                    EncodeRun::Finished(encoded) => encoded,
+                    EncodeRun::Interrupted(signal) => {
+                        owner.finalize().await.context("Finalize encoder group on interrupt")?;
+                        return Err(anyhow::anyhow!("Media adapter received {signal} before frame completion"));
+                    }
+                };
+                match encoded {
                     Ok(encoded) => {
                         bytes = encoded;
                         VideoPacket::AccessUnit { coded_width: (info.width + 1) & !1, coded_height: (info.height + 1) & !1,
