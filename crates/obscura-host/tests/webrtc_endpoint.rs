@@ -379,20 +379,26 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
     } else {
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
+    let mut released = false;
     for sequence in 1..=12u64 {
         if scenario == "foreign-then-a" {
             let foreign = scripted_access_unit(&foreign_session, sequence, bytes.len() as u64);
-            send_video_packet(&mut producer, &foreign, &bytes).await?;
+            if send_video_packet(&mut producer, &foreign, &bytes).await.is_err() { released = true; break; }
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
         let packet = scripted_access_unit(&session_id, sequence, bytes.len() as u64);
-        send_video_packet(&mut producer, &packet, &bytes).await?;
+        if send_video_packet(&mut producer, &packet, &bytes).await.is_err() { released = true; break; }
         tokio::time::sleep(Duration::from_millis(350)).await;
     }
 
     let output = receiver.wait_with_output().await?;
     let phase_dir = raw_root.join("scripted");
     std::fs::create_dir_all(&phase_dir)?;
+    std::fs::write(phase_dir.join("producer-release.txt"), format!(
+        "observed={released}\nsession_socket_exists={}\n",
+        session_socket.exists()
+    ))?;
+    anyhow::ensure!(released, "scripted producer never observed the designed session release");
     std::fs::write(phase_dir.join("stdout.txt"), &output.stdout)?;
     std::fs::write(phase_dir.join("stderr.txt"), &output.stderr)?;
     std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", output.status.code()))?;

@@ -1,20 +1,55 @@
 #![cfg(unix)]
-use std::{os::unix::fs::DirBuilderExt, path::PathBuf, process::Stdio, time::Duration};
+use std::{os::unix::fs::{DirBuilderExt, PermissionsExt}, path::PathBuf, process::Stdio, time::Duration};
 use obscura_host_protocol::{FrameInfo, FramePacket, PixelFormat, VideoPacket};
 use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::{UnixListener, UnixStream}};
 
 struct Directory(PathBuf);
 impl Directory {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("om-{}", uuid::Uuid::new_v4().simple()));
+        let path = std::path::Path::new("/tmp").join(format!("om-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
         std::fs::DirBuilder::new().mode(0o700).create(&path).unwrap(); Self(path)
     }
 }
 impl Drop for Directory {
     fn drop(&mut self) {
-        for name in ["raw", "video"] { std::fs::remove_file(self.0.join(name)).unwrap(); }
+        for name in ["raw", "video", "encoder-control.sock"] { std::fs::remove_file(self.0.join(name)).unwrap(); }
         std::fs::remove_dir(&self.0).unwrap();
     }
+}
+
+/// The r11 adapter requires the consumer-owned `encoder-control.sock`
+/// listener beside the video socket. This real test peer answers the typed
+/// register/revoke protocol exactly as the endpoint control surface does.
+async fn serve_control(listener: UnixListener) {
+    let Ok((stream, _)) = listener.accept().await else { return; };
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    loop {
+        let mut line = String::new();
+        let count = match reader.read_line(&mut line).await { Ok(count) => count, Err(_) => return };
+        if count == 0 { return; }
+        let request: serde_json::Value = match serde_json::from_str(line.trim_end()) { Ok(value) => value, Err(_) => return };
+        let response = match request["op"].as_str().unwrap_or_default() {
+            "acquire" => serde_json::json!({"op":"acquire","permit":"granted"}),
+            "register" => serde_json::json!({"op":"register","refused":false}),
+            "revoke" => serde_json::json!({"op":"revoke","refused":false}),
+            "settle" => serde_json::json!({"op":"settle"}),
+            _ => return,
+        };
+        let mut bytes = serde_json::to_vec(&response).unwrap();
+        bytes.push(b'\n');
+        if write.write_all(&bytes).await.is_err() { return; }
+    }
+}
+
+fn bind_fixture() -> (Directory, UnixListener, UnixListener) {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let control = UnixListener::bind(dir.0.join("encoder-control.sock")).unwrap();
+    std::fs::set_permissions(dir.0.join("encoder-control.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    drop(tokio::spawn(serve_control(control)));
+    (dir, raw, video)
 }
 async fn write(socket: &mut UnixStream, packet: &FramePacket, pixels: &[u8]) {
     let mut header = serde_json::to_vec(packet).unwrap(); header.push(b'\n');
@@ -30,9 +65,7 @@ async fn read(socket: &mut BufReader<UnixStream>) -> (VideoPacket, Vec<u8>) {
 }
 
 async fn exercise(missing_encoder: bool) {
-    let dir = Directory::new();
-    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
-    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let (dir, raw, video) = bind_fixture();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
     command.arg("--frames-socket").arg(dir.0.join("raw")).arg("--video-socket").arg(dir.0.join("video"));
     if missing_encoder { command.args(["--ffmpeg", "/nonexistent-obscura-encoder"]); }
@@ -72,9 +105,7 @@ async fn exercise(missing_encoder: bool) {
 
 #[tokio::test]
 async fn public_adapter_rejects_session_switch_and_exits() {
-    let dir = Directory::new();
-    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
-    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let (dir, raw, video) = bind_fixture();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
     command.arg("--frames-socket").arg(dir.0.join("raw")).arg("--video-socket").arg(dir.0.join("video"));
     let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
@@ -92,9 +123,7 @@ async fn public_adapter_rejects_session_switch_and_exits() {
 
 #[tokio::test]
 async fn public_adapter_stops_after_first_closed_packet() {
-    let dir = Directory::new();
-    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
-    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let (dir, raw, video) = bind_fixture();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
     command.arg("--frames-socket").arg(dir.0.join("raw")).arg("--video-socket").arg(dir.0.join("video"));
     let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
@@ -122,9 +151,7 @@ async fn public_adapter_reports_encoder_failure_and_exits() {
 
 #[tokio::test]
 async fn public_adapter_recovers_after_host_unavailable() {
-    let dir = Directory::new();
-    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
-    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let (dir, raw, video) = bind_fixture();
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
     command.arg("--frames-socket").arg(dir.0.join("raw")).arg("--video-socket").arg(dir.0.join("video"));
     let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
