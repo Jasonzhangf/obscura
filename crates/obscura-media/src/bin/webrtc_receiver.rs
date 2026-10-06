@@ -769,23 +769,7 @@ async fn request_dc(
 ) -> Result<Response> {
     let request_id = request.id;
     send_control(channel, &WebRtcControlMessage::BrowserRequest { request }).await?;
-    timeout(DEADLINE, async {
-        loop {
-            tokio::select! {
-                message = rx.recv() => match message.context("WebRTC DataChannel reader ended")?? {
-                    WebRtcControlMessage::VideoFrame { descriptor } => media.accept_descriptor(descriptor, session_id)?,
-                    WebRtcControlMessage::BrowserResponse { response } => {
-                        ensure!(response_id(&response) == Some(request_id), "WebRTC browser response id mismatch");
-                        return Ok(response);
-                    }
-                    WebRtcControlMessage::Pong { .. } => {},
-                    WebRtcControlMessage::Error { code, message } => bail!("Host WebRTC error {code}: {message}"),
-                    other => bail!("unexpected WebRTC control message while waiting for browser response: {other:?}"),
-                },
-                event = track.poll() => media.accept_track_event(event.context("receiver H.264 track ended")?)?,
-            }
-        }
-    }).await.context("timed out waiting for WebRTC browser response")?
+    wait_for_correlated_response(rx, track, media, session_id, request_id).await
 }
 
 /// Wait for a response to a request that was already sent. This is used for
