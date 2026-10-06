@@ -27,6 +27,9 @@ futures-util = "0.3"
 
 [dev-dependencies]
 rcgen = "0.13"
+async-trait = "0.1"
+rtc = { version = "=0.21.0-rc.2", default-features = false, features = ["crypto-ring"] }
+webrtc-rs = { package = "webrtc", version = "=0.21.0-rc.2", default-features = false, features = ["runtime-tokio", "crypto-ring"] }
 
 [[bin]]
 name = "obscura-host"

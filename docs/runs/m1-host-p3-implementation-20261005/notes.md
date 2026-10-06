@@ -53,6 +53,43 @@ of the early full-suite runs and passed in the four env2-5 runs.
 `crates/obscura-browser` is untouched by the whole task delta and is outside this
 node's allowed write scope, so it was left unchanged.
 
+## P3-r8 black-box evidence rows
+
+Terminal: **COMPLETE**. This node closes the required black-box evidence gap for
+B1, B4, B5, B6, and B7 without re-litigating any r7 fix. B1, B4, B6, B7 now
+have public-surface discriminating before/after pairs; B5 has a documented
+impossibility (A3). No product source was modified; all temporary source
+reverts were restored byte-identical.
+
+| Time / node | Conclusion or state | Evidence path | Input version and environment | Next |
+| --- | --- | --- | --- | --- |
+| 2026-10-06T14:20Z / A1 `admission` (r8) | PASS. `git rev-parse HEAD` = `c9264e2cb459e791e31a7888233ba7e27cd45afd`; branch = `codex/m1-host-p3-implementation-20261005`; `git status --porcelain` shows only the pre-existing untracked `docs/runs/m1-frame-forwarding-impl-r1-20261005/`. The sole Obscura target grant is recorded at the task-owned stage-notes header for owner `m1-host-p3-implementation-r8-20261005` / `gcm-host-p3-r8`, with `CARGO_INCREMENTAL=0` and `CARGO_BUILD_JOBS=2`. | `git rev-parse HEAD`; `git branch --show-current`; `git status --porcelain`; task-owned notes header | HEAD `c9264e2c`; zsh; granted target `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target` | Design and add public-surface regressions for B1, B4, B5, B6, B7. |
+| 2026-10-06T17:0xZ / A2 `pairs` (r8) | PASS. Four new public-surface tests discriminate: B1 `blackbox_b1_denial_fence.rs::datachannel_denial_fences_only_the_denied_attachment_media` (100→0), B4 `blackbox_b4_encoder_revoke.rs::revoke_ack_waits_for_endpoint_group_signal_authority` (100→0), B6 `blackbox_b6_registry_lock.rs::slow_session_finalize_does_not_block_a_second_session` (100→0), B7 `blackbox_b7_spawn_rollback.rs::failed_adapter_spawn_rolls_back_and_retry_serves_media` (100→0). Each before run reverted only that finding's fix. | `raw/b1-dc-*`, `raw/b4-revoke-*`, `raw/b6-registry-r8-*`, `raw/b7-rollback-*` | HEAD `c9264e2c` + new tests; real binaries; `--features render` | Record A3. |
+| 2026-10-06T17:0xZ / A3 `impossibility` (r8) | PASS (documented impossible). B5 fires only when the hard-coded 3600s connection-lifetime future is cancelled while the endpoint runs. Arrangement 1 (abrupt close) and arrangement 2 (endpoint SIGTERM + `finalize_all`) both pass on reverted and fixed source (`b5-abrupt-*` 0/0, `b5-shutdown-*` 0/0). No public config changes the timeout. | `raw/b5-abrupt-*.{log,exit}`, `raw/b5-shutdown-*.{log,exit}`; `blackbox_b5_cancel_probe.rs` | HEAD `c9264e2c` + probe | Record A5-A8. |
+| 2026-10-06T17:2xZ / A5 `focused-green` (r8) | PASS. endpoint 5/5, persistent 28/28, remote_admission_r1 37/37, webrtc_endpoint 12/12, obscura-endpoint unit bin 10/10, obscura-media stream 5/5; each own `.exit`=0, run at `-j 4`. | `raw/a5-*.{log,exit}` | HEAD `c9264e2c` + new tests; granted target | Builds. |
+| 2026-10-06T17:3xZ / A6 `builds` (r8) | PASS. media `--features webrtc`, host `--bins`, cli `--bins --features render`, each `.exit`=0. | `raw/a6-media-build.*`, `raw/a6-host-build.*`, `raw/a6-cli-build.*` | HEAD `c9264e2c` + new tests; granted target | Full gate. |
+| 2026-10-06T17:5xZ / A7 `full-gate` (r8) | PASS. Two runs, each `1811 tests run: 1811 passed, 4 skipped`, `.exit`=0. Pre-bump run 1 failed 3 cases with `listener did not initialize` at the fixtures' old 10s deadline (`1808 passed, 3 failed, 4 skipped`); recovered and retained as `raw/a7-full-gate-1-pre-bump.{log,exit}`; fixture socket deadline raised to 60s; then two clean runs. | `raw/a7-full-gate-1-pre-bump.*` (red, recovered), `raw/a7-full-gate-1.*`, `raw/a7-full-gate-2.*` | HEAD `c9264e2c` + new tests; `-j 4`; granted target | Record A8. |
+| 2026-10-06T18:0xZ / A8 `obstacle-reuse` (r8) | NOT_RUN. `cargo tree -p obscura-cli --features render --locked` `.exit`=0 with zero `obscura-host` / `obscura-media` edges. Rebuilt CLI SHA256 `4ee9e2dce274ef1d8c1a163f557ca215dbe2be8ef3957513364e5bfdde208f45`. | `raw/a8-cli-tree.*`, `raw/a8-cli-sha256.log` | HEAD `c9264e2c` + new tests; granted target | Write A9. |
+| 2026-10-06T18:1xZ / A9 `docs` (r8) | COMPLETE. Whole-task notes/report/result and the worker record (`notes.md`, `report.md`, `result.json`, `handoff.md`) written. Source reverts restored (`server.rs` `2e1e0a8b`, `channels.rs` `cee34521`, `encoder_control.rs` `f9b60b05`); orphaned test adapters reaped by explicit PID. | this file; `report.md`; `result.json`; record docs | HEAD `c9264e2c` + new tests | Return to controller. |
+
+### Disclosed non-gate runs (r8)
+
+- `raw/a5-remote-admission-loadflake1.{log,exit}` (EXIT=100): first
+  `remote_admission_r1` run without `-j 4` at host load average ~38 from
+  unrelated tasks; three cases hit a bind-to-listen `Connection refused` race.
+  Re-run at `-j 4` is 37/37. Load/invocation artifact, not a product result; the
+  red log is retained.
+- `raw/a7-full-gate-1-pre-bump.{log,exit}` (EXIT=100): the first full-gate run,
+  before the fixture socket deadline was raised. It failed 3 cases with
+  `listener did not initialize` at the old 10s deadline
+  (`1811 tests run: 1808 passed, 3 failed, 4 skipped`). The live log was
+  overwritten by the green re-run, so the run summary was recovered verbatim
+  from the worker `events.jsonl` and written to this path; the run's own `run.sh`
+  wrote `EXIT=100`. Retained as history; not a product result.
+- `raw/b1-denial-before.exit`=0 and `raw/b6-registry-before.exit`=0 are r7's
+  endpoint-level tests, retained as history; they confirm those arrangements do
+  not discriminate.
+
 ## P3-r7 review-repair rows (r7)
 
 Terminal: **COMPLETE for the r7 node**. Start HEAD `759b99a` (rejected candidate),

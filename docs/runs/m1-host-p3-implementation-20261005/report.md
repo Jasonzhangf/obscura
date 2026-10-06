@@ -435,3 +435,98 @@ Commit the working tree (no rebase, squash, or history rewrite), run the
 independent architecture review on `base..final HEAD`, and re-run the required
 gates on the exact candidate SHA. All tests used the granted shared target; no
 install, restart, OTA, device, or Collab operation was performed.
+
+# P3-r8 black-box evidence closure terminal (r8)
+
+Status: **COMPLETE for the r8 node**. The r7 review found that five of the eight
+findings (B1, B4, B5, B6, B7) had only white-box discriminating regressions, and
+that the r7 endpoint-level B1 test did not discriminate. This node adds a
+public-surface discriminating before/after regression for B1, B4, B6, B7 and a
+documented impossibility for B5. No r7 fix was re-litigated; no product source
+was modified.
+
+## Identity
+
+- Task: `m1-host-p3-implementation-r8-20261005`
+- Worker: `gcm-host-p3-r8` (fresh GCM standalone author)
+- Start HEAD: `c9264e2cb459e791e31a7888233ba7e27cd45afd`
+- Sole target: `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target`
+- Env: `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`,
+  `OBSCURA_TEST_BINARY_DIR=<target>/release`
+
+## Per-finding result
+
+| Finding | Verdict | Test | Before / After | Evidence |
+| --- | --- | --- | --- | --- |
+| B1 | BLACK-BOX DISCRIMINATING | `blackbox_b1_denial_fence.rs::datachannel_denial_fences_only_the_denied_attachment_media` | 100 / 0 | `raw/b1-dc-*` |
+| B4 | BLACK-BOX DISCRIMINATING | `blackbox_b4_encoder_revoke.rs::revoke_ack_waits_for_endpoint_group_signal_authority` | 100 / 0 | `raw/b4-revoke-*` |
+| B5 | DOCUMENTED IMPOSSIBLE | `blackbox_b5_cancel_probe.rs::endpoint_shutdown_reaps_bound_session_but_does_not_discriminate_b5` | 0 / 0 | `raw/b5-abrupt-*`, `raw/b5-shutdown-*` |
+| B6 | BLACK-BOX DISCRIMINATING | `blackbox_b6_registry_lock.rs::slow_session_finalize_does_not_block_a_second_session` | 100 / 0 | `raw/b6-registry-r8-*` |
+| B7 | BLACK-BOX DISCRIMINATING | `blackbox_b7_spawn_rollback.rs::failed_adapter_spawn_rolls_back_and_retry_serves_media` | 100 / 0 | `raw/b7-rollback-*` |
+
+All observations are external: real `obscura-host` / `obscura-endpoint` /
+`obscura-media` binaries, the real Host protocol over its Unix socket, real mTLS
+on the endpoint, the real WSS `/media` DataChannel path, the real per-session
+`encoder-control.sock`, real process-group signal authority, and real filesystem
+effects (session directories, `encoded.sock`, `encoder-control.sock`).
+
+### B5 impossibility
+
+The defect fires only when the hard-coded 3600s connection-lifetime future is
+cancelled while the endpoint keeps running. Two public arrangements were built
+and run: (1) abrupt mTLS control close and (2) endpoint `SIGTERM` shutdown with a
+live bound session. Both pass on reverted and fixed source (`b5-abrupt-*` 0/0,
+`b5-shutdown-*` 0/0). Abrupt close uses the normal drop/drain path; shutdown
+aborts clients then runs `finalize_all`, which removes the session regardless of
+the leaked reference. No public config changes the timeout, so the defect is not
+externally observable.
+
+## Verification
+
+- Focused (all `-j 4`, each own `.exit`=0): endpoint 5/5, persistent 28/28,
+  remote_admission_r1 37/37, webrtc_endpoint 12/12, obscura-endpoint unit bin
+  10/10, obscura-media stream 5/5. Evidence `raw/a5-*.{log,exit}`.
+- Builds: media `--features webrtc`, host `--bins`, cli `--bins --features render`,
+  each `.exit`=0. Evidence `raw/a6-*.{log,exit}`.
+- Full gate twice: `cargo nextest run --locked --release --features render
+  --no-fail-fast -j 4`, each `1811 tests run: 1811 passed, 4 skipped`, `.exit`=0.
+  Evidence `raw/a7-full-gate-1.*`, `raw/a7-full-gate-2.*`.
+- A8 obstacle NOT_RUN: `cargo tree -p obscura-cli --features render --locked`
+  `.exit`=0 with zero `obscura-host` / `obscura-media` edges; rebuilt CLI SHA256
+  `4ee9e2dce274ef1d8c1a163f557ca215dbe2be8ef3957513364e5bfdde208f45`.
+  Evidence `raw/a8-cli-tree.*`, `raw/a8-cli-sha256.log`.
+- Source reverts restored byte-identical: `server.rs` `2e1e0a8b...`,
+  `channels.rs` `cee34521...`, `encoder_control.rs` `f9b60b05...`.
+
+## Disclosed non-gate runs
+
+- `raw/a5-remote-admission-loadflake1.{log,exit}` (EXIT=100): first
+  `remote_admission_r1` run without `-j 4` at host load average ~38 from
+  unrelated tasks; three cases hit a bind-to-listen `Connection refused` race.
+  Re-run at `-j 4` is 37/37. Load/invocation artifact, not a product result; the
+  red log is retained.
+- `raw/a7-full-gate-1-pre-bump.{log,exit}` (EXIT=100): the first full-gate run,
+  before the fixture socket deadline was raised. It failed 3 cases with
+  `listener did not initialize` at the old 10s deadline (`1808 passed, 3 failed,
+  4 skipped`). The live log was overwritten by the green re-run, so the run
+  summary was recovered verbatim from the worker `events.jsonl` to this path;
+  the run's own `run.sh` wrote `EXIT=100`. Retained as history.
+- `raw/b1-denial-before.exit`=0 and `raw/b6-registry-before.exit`=0 are r7's
+  endpoint-level tests, retained as history.
+
+## Changed files
+
+New: `crates/obscura-host/tests/blackbox_b1_denial_fence.rs`,
+`blackbox_b4_encoder_revoke.rs`, `blackbox_b5_cancel_probe.rs`,
+`blackbox_b6_registry_lock.rs`, `blackbox_b7_spawn_rollback.rs`. Modified:
+`crates/obscura-host/Cargo.toml` (dev-deps `async-trait`, `rtc`, `webrtc-rs`),
+`Cargo.lock`, and the whole-task docs. No product source changed. The only
+untracked tree entry is the unrelated
+`docs/runs/m1-frame-forwarding-impl-r1-20261005/`, left untouched.
+
+## Controller next
+
+Commit the working tree as the r8 candidate (no rebase, squash, or history
+rewrite), run the independent architecture review on `base..final HEAD`, and
+re-run the required gates on that exact candidate SHA. No install, restart, OTA,
+device, or Collab operation was performed.
