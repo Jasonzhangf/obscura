@@ -73,18 +73,11 @@ async fn exercise() {
     });
     std::fs::write(root.join("registry.json"), serde_json::to_vec(&registry).unwrap()).unwrap();
     write_catalog(&root, &["local".to_string(), "test-device".to_string()]);
-    eprintln!("DIAG host bin {}", env!("CARGO_BIN_EXE_obscura-host"));
-    let host_err = std::fs::File::create(root.join("host.err")).unwrap();
-    let host_err2 = host_err.try_clone().unwrap();
     let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
         .arg("--authorization-registry").arg(root.join("registry.json"))
-.stdout(Stdio::null()).stderr(host_err).kill_on_drop(true).spawn().unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    eprintln!("DIAG host try_wait {:?}", host.try_wait());
-    eprintln!("DIAG host.err: {}", std::fs::read_to_string(root.join("host.err")).unwrap_or_default());
-    let _ = host_err2;
+.stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
     wait_socket(root.join("host/host.sock")).await;
     let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await.unwrap();
     let mut local = BufReader::new(local);
@@ -242,6 +235,11 @@ async fn exercise() {
     }).await.expect("media channel did not deliver Closed");
     assert_eq!(closed_header["session_id"], ready["session_id"]);
     drop(control);
+    // The r11 per-session endpoint is a persistent service: session close and
+    // control EOF finalize only that session. Endpoint shutdown is the designed
+    // cooperative SIGTERM path (implementation-contracts.md `finalize_all`;
+    // blackbox-plan.md 6.14 terminates the endpoint with SIGTERM).
+    std::process::Command::new("kill").args(["-TERM", &endpoint.id().unwrap().to_string()]).status().unwrap();
     endpoint.wait().await.unwrap();
     std::process::Command::new("kill").args(["-TERM", &host.id().unwrap().to_string()]).status().unwrap();
     host.wait().await.unwrap();
@@ -296,16 +294,9 @@ async fn local_request(socket: &mut BufReader<tokio::net::UnixStream>, request: 
 async fn wait_socket(path: PathBuf) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !path.exists() {
-        if let Some(parent) = path.parent() {
-            eprintln!("DIAG wait_socket {} missing; parent listing: {:?}", path.display(),
-                std::fs::read_dir(parent).map(|entries| entries.flatten().map(|e| e.file_name()).collect::<Vec<_>>()));
-        } else {
-            eprintln!("DIAG wait_socket {} missing; no parent", path.display());
-        }
         assert!(tokio::time::Instant::now() < deadline, "listener did not initialize");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    eprintln!("DIAG wait_socket {} present", path.display());
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 

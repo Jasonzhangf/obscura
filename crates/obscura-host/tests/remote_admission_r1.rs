@@ -1112,7 +1112,7 @@ async fn endpoint_control_outcome(name: &str, reply: Option<Value>) -> ControlOu
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    wait_path(&root.join("endpoint/encoded.sock")).await;
+    wait_path(&root.join("endpoint")).await;
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();

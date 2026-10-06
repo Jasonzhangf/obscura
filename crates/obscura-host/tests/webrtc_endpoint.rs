@@ -72,9 +72,20 @@ async fn active_receiver_observes_wss_rebind_terminal_without_leak() {
         .await.expect("WSS rebind terminal lifecycle timed out").unwrap();
 }
 
+/// Two authorized receivers bound to two distinct Host profiles run at the same
+/// time. Each exact session owns its own adapter and encoded socket, so every
+/// frame a receiver decodes must carry its own session identity.
+#[tokio::test]
+async fn two_concurrent_authorized_receivers_keep_distinct_sessions() {
+    tokio::time::timeout(Duration::from_secs(240), run_two_session_isolation())
+        .await.expect("two-session isolation lifecycle timed out").unwrap();
+}
+
 async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    let root = PathBuf::from("/tmp").join(format!("ow-{}", uuid::Uuid::new_v4().simple()));
+    // The r11 exact-session sockets live at `socket_dir/session-<36>/...`, so
+    // keep the root short enough to stay below the macOS SUN_LEN bound.
+    let root = PathBuf::from("/tmp").join(format!("ow-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
     let raw_root = raw_webrtc_root("ow");
     std::fs::create_dir_all(&raw_root)?;
@@ -145,7 +156,7 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     if encoder_failure { endpoint_command.arg("--ffmpeg").arg("/nonexistent-obscura-encoder"); }
     let endpoint = endpoint_command.kill_on_drop(true).spawn()?;
     std::fs::write(raw_root.join("endpoint.pid"), endpoint.id().expect("endpoint child pid").to_string())?;
-    wait_socket(root.join("endpoint/encoded.sock")).await;
+    wait_socket(root.join("endpoint")).await;
 
     let first = run_receiver(&receiver_bin, address, &root, &raw_root, "first", false, false, encoder_failure).await?;
     if encoder_failure {
@@ -271,7 +282,7 @@ async fn send_video_packet(stream: &mut tokio::net::UnixStream, packet: &obscura
 async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::process::Stdio;
-    let root = PathBuf::from("/tmp").join(format!("ow-scripted-{}", uuid::Uuid::new_v4().simple()));
+    let root = PathBuf::from("/tmp").join(format!("ow-scripted-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
     let raw_root = raw_webrtc_root(&format!("scripted-{scenario}"));
     std::fs::create_dir_all(&raw_root)?;
@@ -343,8 +354,7 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
         .stderr(std::fs::File::create(raw_root.join("endpoint.stderr"))?);
     let endpoint = endpoint_command.kill_on_drop(true).spawn()?;
     std::fs::write(raw_root.join("endpoint.pid"), endpoint.id().expect("endpoint child pid").to_string())?;
-    wait_socket(root.join("endpoint/encoded.sock")).await;
-    let mut producer = tokio::net::UnixStream::connect(root.join("endpoint/encoded.sock")).await?;
+    wait_socket(root.join("endpoint")).await;
 
     let mut receiver_command = Command::new(&receiver_bin);
     receiver_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
@@ -352,6 +362,12 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
         .arg("--frames").arg("3").arg("--skip-click")
         .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let receiver = receiver_command.spawn()?;
+
+    // The r11 endpoint binds the exact-session encoded socket only on
+    // admission, so the receiver must attach before the producer connects.
+    let session_socket = root.join(format!("endpoint/session-{session_id}/encoded.sock"));
+    wait_socket(session_socket.clone()).await;
+    let mut producer = tokio::net::UnixStream::connect(&session_socket).await?;
 
     let bytes = obscura_media::encode(std::path::Path::new("ffmpeg"), 160, 120, scripted_scene(160, 120)).await?;
     anyhow::ensure!(!bytes.is_empty(), "scripted producer got no H.264 access unit");
@@ -425,7 +441,7 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
         "backpressure-detach" => ("detach-backpressure", "data-channel"),
         other => (other, "data-channel"),
     };
-    let root = PathBuf::from("/tmp").join(format!("ow-terminal-{}", uuid::Uuid::new_v4().simple()));
+    let root = PathBuf::from("/tmp").join(format!("ow-terminal-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
     std::fs::DirBuilder::new().mode(0o700).create(&root)?;
     let raw_root = raw_webrtc_root(&format!("terminal-{mode}"));
     std::fs::create_dir_all(&raw_root)?;
@@ -496,8 +512,7 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
         .stderr(std::fs::File::create(raw_root.join("endpoint.stderr"))?);
     let endpoint = endpoint_command.kill_on_drop(true).spawn()?;
     std::fs::write(raw_root.join("endpoint.pid"), endpoint.id().expect("endpoint child pid").to_string())?;
-    wait_socket(root.join("endpoint/encoded.sock")).await;
-    let producer = tokio::net::UnixStream::connect(root.join("endpoint/encoded.sock")).await?;
+    wait_socket(root.join("endpoint")).await;
 
     let bytes = obscura_media::encode(std::path::Path::new("ffmpeg"), 160, 120, scripted_scene(160, 120)).await?;
     anyhow::ensure!(!bytes.is_empty(), "terminal producer got no H.264 access unit");
@@ -505,6 +520,22 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
     // terminate keeps delivering admitted-session frames and trips the
     // receiver's finite deadline instead of silently passing.
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+
+    let ready_file = root.join("ready.json");
+    let mut receiver_command = Command::new(&receiver_bin);
+    receiver_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
+        .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
+        .arg("--frames").arg("3").arg("--skip-click")
+        .arg("--terminal-trigger").arg(trigger).arg("--terminal-transport").arg(transport)
+        .arg("--ready-file").arg(&ready_file)
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let receiver = receiver_command.spawn()?;
+
+    // The r11 endpoint binds the exact-session encoded socket only on
+    // admission, so the receiver must attach before the producer connects.
+    let session_socket = root.join(format!("endpoint/session-{session_id}/encoded.sock"));
+    wait_socket(session_socket.clone()).await;
+    let producer = tokio::net::UnixStream::connect(&session_socket).await?;
     let producer_task = {
         let session_id = session_id.clone();
         let bytes = bytes.clone();
@@ -525,15 +556,6 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
         })
     };
 
-    let ready_file = root.join("ready.json");
-    let mut receiver_command = Command::new(&receiver_bin);
-    receiver_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
-        .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
-        .arg("--frames").arg("3").arg("--skip-click")
-        .arg("--terminal-trigger").arg(trigger).arg("--terminal-transport").arg(transport)
-        .arg("--ready-file").arg(&ready_file)
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let receiver = receiver_command.spawn()?;
     if trigger == "none" {
         // The receiver writes the ready marker only after decoding its first
         // frame; only then does the external producer close.
@@ -573,18 +595,46 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
             "rebind receipt did not move the attachment to a new session: {receipt}");
     }
 
+    let _ = stop_tx.send(true);
+    let _ = producer_task.await;
     if trigger != "none" {
-        // The fence terminal must not have consumed the endpoint: a fresh
-        // authorized attachment still receives the live producer stream.
-        let fresh = run_receiver(&receiver_bin, address, &root, &raw_root, &format!("after-{mode}"), true, false, false).await?;
+        // Zero media references finalize the old adapter. A fresh authorized
+        // attachment must re-acquire the session and receive a new source.
+        wait_absent(&session_socket, Duration::from_secs(15)).await?;
+        let mut fresh_command = Command::new(&receiver_bin);
+        fresh_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
+            .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
+            .arg("--frames").arg("3").arg("--skip-click")
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let fresh = fresh_command.spawn()?;
+        wait_socket(session_socket.clone()).await;
+        let fresh_producer = tokio::spawn({
+            let session_socket = session_socket.clone();
+            let session_id = session_id.clone();
+            let bytes = bytes.clone();
+            async move {
+                let mut producer = tokio::net::UnixStream::connect(&session_socket).await?;
+                for sequence in 1..=12u64 {
+                    let packet = scripted_access_unit(&session_id, sequence, bytes.len() as u64);
+                    if send_video_packet(&mut producer, &packet, &bytes).await.is_err() { break; }
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+        });
+        let fresh = fresh.wait_with_output().await?;
+        let _ = fresh_producer.await;
         anyhow::ensure!(fresh.status.success(), "fresh authorized attachment failed after {mode}: {}", String::from_utf8_lossy(&fresh.stderr));
+        let phase_dir = raw_root.join(format!("after-{mode}"));
+        std::fs::create_dir_all(&phase_dir)?;
+        std::fs::write(phase_dir.join("stdout.txt"), &fresh.stdout)?;
+        std::fs::write(phase_dir.join("stderr.txt"), &fresh.stderr)?;
+        std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", fresh.status.code()))?;
         let fresh_report: serde_json::Value = serde_json::from_slice(&fresh.stdout)?;
         anyhow::ensure!(fresh_report["pass"] == true && fresh_report["session_id"].as_str() == Some(session_id.as_str()),
             "fresh authorized attachment evidence missing after {mode}: {fresh_report}");
     }
 
-    let _ = stop_tx.send(true);
-    let _ = producer_task.await;
     let mut endpoint = endpoint;
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;
@@ -594,11 +644,161 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Drive two concurrent authorized receivers, each paired with a distinct Host
+/// profile. Both exact sessions own their own adapter and encoded socket, so
+/// every frame a receiver decodes must carry its own session identity.
+async fn run_two_session_isolation() -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let root = PathBuf::from("/tmp").join(format!("ow-two-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let raw_root = raw_webrtc_root("two-session");
+    std::fs::create_dir_all(&raw_root)?;
+    std::fs::write(raw_root.join("command.env"), format!(
+        "scenario=two-session\nUTC={}\n",
+        std::process::Command::new("/bin/date").arg("-u").arg("+%Y-%m-%dT%H:%M:%SZ").output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    ))?;
+    let bind_ip = "127.0.0.1";
+    let ca_key = rcgen::KeyPair::generate()?;
+    let mut ca_params = rcgen::CertificateParams::new(vec![])?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Obscura two-session CA");
+    let ca = ca_params.self_signed(&ca_key)?;
+    let server_key = rcgen::KeyPair::generate()?;
+    let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
+        .signed_by(&server_key, &ca, &ca_key)?;
+    let client_a_key = rcgen::KeyPair::generate()?;
+    let client_b_key = rcgen::KeyPair::generate()?;
+    let mut client_params = rcgen::CertificateParams::new(vec![])?;
+    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let client_a = client_params.clone().signed_by(&client_a_key, &ca, &ca_key)?;
+    let client_b = client_params.clone().signed_by(&client_b_key, &ca, &ca_key)?;
+    std::fs::write(root.join("server.der"), server.der())?;
+    std::fs::write(root.join("server.key"), server_key.serialize_der())?;
+    std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(root.join("ca.der"), ca.der())?;
+    std::fs::write(root.join("client-a.der"), client_a.der())?;
+    std::fs::write(root.join("client-a.key"), client_a_key.serialize_der())?;
+    std::fs::set_permissions(root.join("client-a.key"), std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(root.join("client-b.der"), client_b.der())?;
+    std::fs::write(root.join("client-b.key"), client_b_key.serialize_der())?;
+    std::fs::set_permissions(root.join("client-b.key"), std::fs::Permissions::from_mode(0o600))?;
+    write_authorized_two(root.join("registry.json"), root.join("authorized-clients.json"),
+        root.join("profiles"), &client_a.der().to_vec(), &client_b.der().to_vec())?;
+
+    let mut host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+        .arg("--socket-dir").arg(root.join("host"))
+        .arg("--profile-root").arg(root.join("profiles"))
+        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .stdout(std::fs::File::create(raw_root.join("host.stdout"))?)
+        .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
+        .kill_on_drop(true).spawn()?;
+    std::fs::write(raw_root.join("host.pid"), host.id().expect("Host child pid").to_string())?;
+    wait_socket(root.join("host/host.sock")).await;
+    let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await?;
+    let mut local = BufReader::new(local);
+    let mut line = String::new(); local.read_line(&mut line).await?;
+    let mut state = local_request(&mut local, serde_json::json!({"id":1,"command":{"type":"attach","mode":"agent"}})).await?;
+    let default_session = state["session_id"].as_str().ok_or_else(|| anyhow::anyhow!("Host default session missing"))?.to_owned();
+    let html = "data:text/html,<style>body{margin:0;background:white}button{width:80px;height:80px;border:0;background:red}</style><button id='target'>target</button>";
+    state = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state),"command":{"type":"resize","width":160,"height":120}})).await?;
+    let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state),"command":{"type":"navigate","url":html}})).await?;
+    // Materialize the secondary profile/session and give it its own page so the
+    // second adapter has a real frame source when its receiver attaches.
+    let bound = local_request(&mut local, serde_json::json!({"id":4,"operation":identity(&state),"command":{"type":"profile_select","profile_id":"p1"}})).await?;
+    let secondary_session = bound["status"]["session_id"].as_str().ok_or_else(|| anyhow::anyhow!("Host secondary session missing"))?.to_owned();
+    anyhow::ensure!(default_session != secondary_session, "two profiles resolved to one session");
+    drop(local);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let reservation = TcpListener::bind((bind_ip, 0)).await?;
+    let address = reservation.local_addr()?; drop(reservation);
+    let media_bin = release_binary("obscura-media");
+    let receiver_bin = release_binary("obscura-webrtc-receiver");
+    anyhow::ensure!(media_bin.is_file(), "Build target/release/obscura-media with --features webrtc first");
+    anyhow::ensure!(receiver_bin.is_file(), "Build target/release/obscura-webrtc-receiver with --features webrtc first");
+    let mut endpoint_command = Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"));
+    endpoint_command
+        .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
+        .arg("--socket-dir").arg(root.join("endpoint"))
+        .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
+        .arg("--client-ca").arg(root.join("ca.der"))
+        .arg("--media-bin").arg(&media_bin)
+        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
+        .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
+    endpoint_command
+        .stdout(std::fs::File::create(raw_root.join("endpoint.stdout"))?)
+        .stderr(std::fs::File::create(raw_root.join("endpoint.stderr"))?);
+    let endpoint = endpoint_command.kill_on_drop(true).spawn()?;
+    std::fs::write(raw_root.join("endpoint.pid"), endpoint.id().expect("endpoint child pid").to_string())?;
+    wait_socket(root.join("endpoint")).await;
+
+    let (report_a, report_b) = tokio::try_join!(
+        run_receiver_cert(&receiver_bin, address, &root, &raw_root, "profile-a", "client-a"),
+        run_receiver_cert(&receiver_bin, address, &root, &raw_root, "profile-b", "client-b"),
+    )?;
+    anyhow::ensure!(report_a["pass"] == true && report_b["pass"] == true,
+        "concurrent receivers did not both pass: a={report_a} b={report_b}");
+    let session_a = report_a["session_id"].as_str().unwrap_or("");
+    let session_b = report_b["session_id"].as_str().unwrap_or("");
+    anyhow::ensure!(!session_a.is_empty() && !session_b.is_empty() && session_a != session_b,
+        "concurrent receivers did not bind distinct sessions: a={session_a} b={session_b}");
+    for (label, report, expected) in [("a", &report_a, session_a), ("b", &report_b, session_b)] {
+        let frames = report["frames"].as_array().ok_or_else(|| anyhow::anyhow!("receiver {label} frame evidence missing: {report}"))?;
+        anyhow::ensure!(frames.len() >= 3, "receiver {label} decoded fewer than three frames: {report}");
+        for frame in frames {
+            anyhow::ensure!(frame["session_id"].as_str() == Some(expected),
+                "receiver {label} decoded a frame from another session: {frame}");
+        }
+    }
+
+    let mut endpoint = endpoint;
+    let _ = endpoint.kill().await;
+    let _ = endpoint.wait().await;
+    let _ = host.kill().await;
+    let _ = host.wait().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+async fn run_receiver_cert(
+    binary: &PathBuf,
+    address: std::net::SocketAddr,
+    root: &PathBuf,
+    raw_root: &PathBuf,
+    phase: &str,
+    client: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let mut command = Command::new(binary);
+    command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
+        .arg("--client-cert").arg(root.join(format!("{client}.der")))
+        .arg("--client-key").arg(root.join(format!("{client}.key")))
+        .arg("--frames").arg("3").arg("--skip-click");
+    let output = command.output().await?;
+    let phase_dir = raw_root.join(phase);
+    std::fs::create_dir_all(&phase_dir)?;
+    std::fs::write(phase_dir.join("stdout.txt"), &output.stdout)?;
+    std::fs::write(phase_dir.join("stderr.txt"), &output.stderr)?;
+    std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", output.status.code()))?;
+    anyhow::ensure!(output.status.success(), "receiver {phase} failed at {}: {}", raw_root.display(), String::from_utf8_lossy(&output.stderr));
+    Ok(serde_json::from_slice(&output.stdout)?)
+}
+
 async fn wait_file(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     while !path.exists() {
         anyhow::ensure!(tokio::time::Instant::now() < deadline, "ready marker was not written: {}", path.display());
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+async fn wait_absent(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while path.exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "path did not disappear: {}", path.display());
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
     Ok(())
 }
@@ -686,6 +886,79 @@ fn write_authorized(registry_path: PathBuf, projection_path: PathBuf, profile_ro
         }, {
             "profile_id": "p1",
             "display_name": "Rebind Target",
+            "default": false,
+            "access": {"owner_device_id": "local", "members": members}
+        }],
+        "default_profile_id": "default",
+        "next_id": 2
+    });
+    std::fs::create_dir_all(&profile_root)?;
+    std::fs::write(profile_root.join("catalog.json"), serde_json::to_string_pretty(&catalog)?)?;
+    Ok(())
+}
+
+/// Registry/projection/catalog for two paired devices, each granted a distinct
+/// initial profile so two remote attachments resolve to two exact sessions.
+fn write_authorized_two(
+    registry_path: PathBuf,
+    projection_path: PathBuf,
+    profile_root: PathBuf,
+    client_a: &[u8],
+    client_b: &[u8],
+) -> anyhow::Result<()> {
+    let scopes = ["observe_human_control", "profile_read", "profile_create", "profile_select"];
+    let fingerprint_a = hex(&Sha256::digest(client_a));
+    let fingerprint_b = hex(&Sha256::digest(client_b));
+    let device = |device_id: &str, label: &str, fingerprint: &str, selection: serde_json::Value| serde_json::json!({
+        "device_id": device_id,
+        "device_label": label,
+        "client_certificate_sha256": fingerprint,
+        "scopes": scopes,
+        "initial_profile_grant": {"selection": selection, "authorization_revision": 1},
+        "scope_revision": 1,
+        "status": "active",
+        "not_before_unix": 0,
+        "not_after_unix": 4102444800i64,
+        "created_at_unix": 0,
+        "revoked_at_unix": null
+    });
+    let registry = serde_json::json!({
+        "schema_version": 2,
+        "authorization_revision": 1,
+        "host_id": "host-test",
+        "devices": [
+            device("device-a", "profile a", &fingerprint_a, serde_json::json!("default_profile")),
+            device("device-b", "profile b", &fingerprint_b, serde_json::json!({"profile_id": "p1"})),
+        ]
+    });
+    std::fs::write(&registry_path, serde_json::to_vec(&registry)?)?;
+    let client = |device_id: &str, fingerprint: &str, selection: serde_json::Value| serde_json::json!({
+        "device_id": device_id,
+        "client_certificate_sha256": fingerprint,
+        "scopes": scopes,
+        "initial_profile_grant": {"selection": selection, "authorization_revision": 1}
+    });
+    let projection = serde_json::json!({
+        "schema_version": 2,
+        "authorization_revision": 1,
+        "registry_sha256": "00".repeat(32),
+        "clients": [
+            client("device-a", &fingerprint_a, serde_json::json!("default_profile")),
+            client("device-b", &fingerprint_b, serde_json::json!({"profile_id": "p1"})),
+        ]
+    });
+    std::fs::write(&projection_path, serde_json::to_vec(&projection)?)?;
+    let members = serde_json::json!(["local", "device-a", "device-b"]);
+    let catalog = serde_json::json!({
+        "catalog_revision": 2,
+        "profiles": [{
+            "profile_id": "default",
+            "display_name": "Default",
+            "default": true,
+            "access": {"owner_device_id": "local", "members": members}
+        }, {
+            "profile_id": "p1",
+            "display_name": "Secondary",
             "default": false,
             "access": {"owner_device_id": "local", "members": members}
         }],
