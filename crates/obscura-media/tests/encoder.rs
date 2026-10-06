@@ -115,6 +115,9 @@ const WRAPPER_NORMAL: &str = "#!/bin/sh\ncat >/dev/null\nprintf 'AU'\n";
 /// A real wrapper encoder that spawns a long-lived grandchild in its own
 /// process group and then blocks without reading stdin.
 const WRAPPER_BLOCKING: &str = "#!/bin/sh\nsleep 300 &\nsleep 300\n";
+/// A real wrapper encoder that exits while a descendant inherits stdin/stdout/
+/// stderr, so the leader is gone but the process group still holds the pipes.
+const WRAPPER_WRAPPER_EXIT: &str = "#!/bin/sh\nsleep 300 &\nexit 0\n";
 
 fn owner_ops(requests: &Arc<Mutex<Vec<serde_json::Value>>>) -> Vec<String> {
     requests.lock().expect("requests owner")
@@ -186,6 +189,34 @@ async fn encoder_owner_timeout_sigkills_process_group() {
     let pgid = bound.lock().expect("pgid owner").expect("register bound a pgid");
     assert!(wait_group_gone(pgid).await, "whole-encode timeout must finalize the retained subtree");
     assert!(!owner.has_live_child(), "no live child may remain after timeout finalization");
+}
+
+/// B3: `finalize` must settle the whole process group, not just the leader. A
+/// wrapper that exits while a descendant still holds the encoder stdout makes
+/// `run_encode` block on pipe EOF until its deadline. The leader exit must not
+/// short-circuit finalization: the descendant group is stopped, and then the
+/// leader is reaped and ownership released.
+#[tokio::test]
+async fn encoder_owner_finalize_settles_descendant_of_exited_wrapper() {
+    let root = OwnerRoot::new("wrapper-exit");
+    let control = root.control_path();
+    let listener = UnixListener::bind(&control).expect("bind control peer");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let bound = Arc::new(Mutex::new(None));
+    tokio::spawn(serve_control(listener, ControlScript::AcceptAll, Arc::clone(&requests), Arc::clone(&bound)));
+    let wrapper = write_wrapper(&root, "wrapper-exit.sh", WRAPPER_WRAPPER_EXIT);
+    let mut owner = EncoderChildOwner::open(&wrapper, &control).await.expect("open owner");
+    owner.encode_frame(16, 16, solid_rgba(16, 16)).await
+        .expect_err("an exited wrapper that leaks stdout must hit the deadline, not succeed");
+    let pgid = bound.lock().expect("pgid owner").expect("register bound a pgid");
+    let leader_reaped = !owner.has_live_child();
+    let group_gone = wait_group_gone(pgid).await;
+    if !group_gone {
+        // Keep a failing pre-fix run from leaking the test wrapper descendant.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    }
+    assert!(leader_reaped, "finalize must reap the leader after settling the group");
+    assert!(group_gone, "finalize must settle the descendant group of an exited wrapper");
 }
 
 /// A refused acquisition settles the permit with `RefusedNoChild` and spawns no

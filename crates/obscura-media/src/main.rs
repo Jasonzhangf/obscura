@@ -35,8 +35,20 @@ async fn main() -> Result<()> {
     // socket, so no new CLI flag or ABI is introduced.
     let control_dir = args.video_socket.parent().context("Video socket has no parent directory")?;
     let control_path = control_dir.join("encoder-control.sock");
-    let mut owner = obscura_media::encoder_owner::EncoderChildOwner::open(&args.ffmpeg, &control_path).await
-        .context("Open Host encoder control")?;
+    let mut owner = match obscura_media::encoder_owner::EncoderChildOwner::open(&args.ffmpeg, &control_path).await {
+        Ok(owner) => owner,
+        Err(endpoint_error) => {
+            // Standalone consumers have no Endpoint to provide the typed
+            // admission resource. Bind it locally and keep using the same
+            // EncoderChildOwner for the actual process ownership. Endpoint
+            // sessions already bound this path, so they take the branch above.
+            let listener = tokio::net::UnixListener::bind(&control_path)
+                .with_context(|| format!("Open Host encoder control ({endpoint_error})"))?;
+            tokio::spawn(serve_standalone_control(listener));
+            obscura_media::encoder_owner::EncoderChildOwner::open(&args.ffmpeg, &control_path).await
+                .context("Open standalone encoder control")?
+        }
+    };
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let encoder_id = uuid::Uuid::new_v4().to_string();
     let start = Instant::now();
@@ -120,6 +132,29 @@ async fn send(output: &mut (impl tokio::io::AsyncWrite + Unpin), packet: &VideoP
         output.flush().await
     }).await.context("Encoded media consumer stalled")??;
     Ok(())
+}
+
+async fn serve_standalone_control(listener: tokio::net::UnixListener) {
+    let Ok((stream, _)) = listener.accept().await else { return; };
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    loop {
+        let mut line = String::new();
+        let count = match reader.read_line(&mut line).await { Ok(count) => count, Err(_) => return };
+        if count == 0 { return; }
+        let request: obscura_media::encoder_owner::EncoderControlRequest =
+            match serde_json::from_str(line.trim_end()) { Ok(request) => request, Err(_) => return };
+        use obscura_media::encoder_owner::{EncoderControlRequest as Request, EncoderControlResponse as Response};
+        let response = match request {
+            Request::Acquire { .. } => Response::Acquire { permit: obscura_media::encoder_owner::EncoderPermit::Granted },
+            Request::Register { .. } => Response::Register { refused: false },
+            Request::Revoke { .. } => Response::Revoke { refused: false },
+            Request::Settle { .. } => Response::Settle,
+        };
+        let mut bytes = match serde_json::to_vec(&response) { Ok(bytes) => bytes, Err(_) => return };
+        bytes.push(b'\n');
+        if write.write_all(&bytes).await.is_err() { return; }
+    }
 }
 
 #[cfg(not(unix))]

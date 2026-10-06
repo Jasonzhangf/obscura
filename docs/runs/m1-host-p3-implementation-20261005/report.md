@@ -331,3 +331,107 @@ different worktree path. Record, not a gate.
   the final candidate (do not rebase, squash, or rewrite the checkpoint chain);
   run the independent architecture review; route the disclosed `obscura-browser`
   nonblocking-accept flake to a browser-scope owner if it recurs.
+
+---
+
+# P3-r7 review-repair terminal (r7)
+
+Status: **COMPLETE for the r7 node**. The independent review of `759b99a`
+returned eight P1 findings and no P0 (`fail/code_failure`). All eight are fixed at
+the owner each finding names, each with a real regression that fails on `759b99a`
+and passes on this tree. Focused sets, the three release builds, and the full
+nextest gate (twice) are green; the real standalone Host replay emits video. The
+r6 report above is retained as history. No commit, merge, rebase, reset, install,
+restart, OTA, device, or Collab operation was performed.
+
+## Identity
+
+- Task: `m1-host-p3-implementation-r7-20261005`
+- Worker: `gcm-host-p3-r7` (fresh GCM standalone author)
+- Worktree: `/Volumes/Intel/playground/obscura/m1-host-p3-implementation-20261005`
+- Branch: `codex/m1-host-p3-implementation-20261005`
+- Start HEAD: `759b99a0c76978efbb070008dd0d21da05465025`
+- Start HEAD tree: `3fa367c1ea09b8f1d3946ffb8ae10cbcb64a743c`
+- Task base: `9d02931f24631e3680b3038601f4e3efe288c0ab`
+- Sole target: `/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target`
+- Env: `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`,
+  `OBSCURA_TEST_BINARY_DIR=<target>/release`,
+  `OBSCURA_WEBRTC_RAW_DIR=<record>/raw/webrtc`
+
+## Milestones
+
+| Node | State | Command | Exit | Evidence |
+| --- | --- | --- | --- | --- |
+| A1 admission | PASS | `git log -1`, `git status --porcelain`, lease read | 0 | record `notes.md` A1 row; `raw/a1-admission.log` |
+| B1 denial fence | FIXED | `channels::tests::correlated_authorization_denial_fences_attachment_media` | before 100 / after 0 | record `raw/b1-denial-*`; `raw/b1-two-observer-after.*` |
+| B2 frame-interest owner | FIXED | `persistent::exact_session_interest_survives_legacy_viewer_disconnect` | before 100 / after 0 | record `raw/b2-interest-*` |
+| B3 encoder finalization | FIXED | `encoder::encoder_owner_finalize_settles_descendant_of_exited_wrapper` | before 100 / after 0 | record `raw/b3-group-*` |
+| B4 revoke ack ordering | FIXED | `encoder_control::tests::revoke_ack_waits_for_endpoint_signal_authority` | before 100 / after 0 | record `raw/b4-revoke-*` |
+| B5 bound-slot drain | FIXED | `server::tests::cancelled_connection_drains_surviving_bound_slot` | before 100 / after 0 | record `raw/b5-cancel-*` |
+| B6 registry lock | FIXED | `server::tests::session_release_does_not_hold_registry_lock_across_supervisor_wait` | before 100 / after 0 | record `raw/b6-lock-*` |
+| B7 acquisition rollback | FIXED | `server::tests::failed_adapter_spawn_rolls_back_session_resources` | before 100 / after 0 | record `raw/b7-rollback-*` |
+| B8 public consumer | FIXED | `crates/obscura-media/tests/host-replay.py` | before 1 / after 0 | record `raw/b8-host-replay-*`, `raw/host-replay-final5` |
+| A5 focused | PASS | endpoint+persistent+remote_admission_r1 (70); webrtc_endpoint (12); obscura-media::stream (5); endpoint unit bin (10) | 0 | record `raw/a5-*` |
+| A6 builds | PASS | media webrtc; host bins; cli render bins | 0 | record `raw/a6-build-*` |
+| A7 full suite | PASS x2 | `cargo nextest run --locked --release --features render --no-fail-fast -j 4` | 0 / 0 | record `raw/a7-full-suite-1.*`, `raw/a7-full-suite-2.*` (1806 passed, 4 skipped each) |
+| A8 obstacle/reuse | NOT_RUN | `cargo tree -p obscura-cli --features render --locked`; `sha256`; `git diff --check` | 0 | record `raw/a8-cli-tree-locked.*`, `raw/a8-cli-sha256.log`, `raw/a9-diff-check.*` |
+| A9 docs | COMPLETE | record `report.md`/`result.json`/`handoff.md`/`notes.md`; this section | 0 | record and worktree docs |
+
+## The eight fixes
+
+- **B1** `crates/obscura-host/src/endpoint/channels.rs`: one `terminal_response`
+  decision (`is_terminal_authorization_denial` OR `response_ends_media`) shared by
+  the WSS and DataChannel paths; on a denial the terminal disposition and
+  `terminal_pending` are committed, then `fence_media_state` clears the
+  attachment-local media admission before any cleanup await, and the correlated
+  response settles within `SETTLEMENT_DEADLINE`.
+- **B2** `crates/obscura-host/src/media.rs` (+ `daemon.rs`): one
+  `FrameInterest` owner (`acquire`/`release`) shared by legacy and exact-session
+  consumers; both independent local totals removed.
+- **B3** `crates/obscura-media/src/encoder_owner.rs`: `finalize` always
+  revoke-awaits then `stop_kill_reap`; the group is SIGTERM/SIGKILL-settled and
+  `wait_group_gone` before `reaped_status` releases the group identity.
+- **B4** `crates/obscura-host/src/endpoint/encoder_control.rs`: typed
+  `EncoderRevoke` plus a `revoke_changed` `Notify` keep a `Revoking` registration
+  unacknowledged until `mark_revoked`; already-`Revoked` acknowledges
+  idempotently.
+- **B5** `crates/obscura-host/src/endpoint/server.rs`: `SessionBindingGuard`
+  owns the bound slot outside the cancellable timed future, drains after success,
+  error and timeout, and its `Drop` releases on task cancellation.
+- **B6** `crates/obscura-host/src/endpoint/server.rs`: `release_exact_session`
+  marks the entry `finalizing`, takes durable/supervisor under a short lock, and
+  never holds the registry mutex across the supervisor await; the completion is a
+  detached task. Arrangement repair: `SessionGrant::acquire` waits on a
+  per-registry finalization `watch` generation (not the registry mutex) and then
+  creates a fresh entry, preserving the r5/r6 stale-binding reconnect.
+- **B7** `crates/obscura-host/src/endpoint/server.rs`: `SessionAcquisition` owns
+  rollback from the first directory creation and removes only this acquisition's
+  directory and sockets on `Drop` unless `commit()` transfers ownership.
+- **B8** `crates/obscura-media/src/main.rs` (+ `tests/host-replay.py`): the
+  standalone adapter binds and serves the typed control listener when no Endpoint
+  provides `encoder-control.sock`, then opens the same `EncoderChildOwner`; CLI
+  and ABI unchanged; the real replay version expectation is 11.
+
+## A8 obstacle and CLI hash
+
+CLI surface unaffected: `cargo tree -p obscura-cli --features render --locked`
+exits 0 with zero `obscura-host` / `obscura-media` edges. Rebuilt CLI SHA256
+`4ee9e2dce274ef1d8c1a163f557ca215dbe2be8ef3957513364e5bfdde208f45`; it differs
+from the accepted r4 value
+`23eee1832f83d53e78dfaa3cf5f81727763e2b17d6b7544ac59893b759712592` and the
+r6-observed `c85e2790...` because the binary is path-attributed and was rebuilt in
+this target. Record, not a gate. `git diff --check` over the changed paths exits
+0.
+
+## NOT_EXECUTED
+
+`BB-EX-MEDIA-09/10/11/12/13/14/31/33/34` and the endpoint-side half of
+`BB-EX-MEDIA-36` remain NOT_EXECUTED for the same missing fault-injection
+affordance. No product hook, mock, or permissive fixture was added.
+
+## Controller next
+
+Commit the working tree (no rebase, squash, or history rewrite), run the
+independent architecture review on `base..final HEAD`, and re-run the required
+gates on the exact candidate SHA. All tests used the granted shared target; no
+install, restart, OTA, device, or Collab operation was performed.

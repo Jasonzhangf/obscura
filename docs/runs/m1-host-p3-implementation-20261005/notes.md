@@ -53,6 +53,32 @@ of the early full-suite runs and passed in the four env2-5 runs.
 `crates/obscura-browser` is untouched by the whole task delta and is outside this
 node's allowed write scope, so it was left unchanged.
 
+## P3-r7 review-repair rows (r7)
+
+Terminal: **COMPLETE for the r7 node**. Start HEAD `759b99a` (rejected candidate),
+start HEAD tree `3fa367c1ea09b8f1d3946ffb8ae10cbcb64a743c`. All eight P1
+findings B1-B8 are fixed at the owner each finding names; each has a real
+regression that fails on `759b99a` and passes on this tree. The focused sets, the
+three release builds, and the full gate (twice) are green; the real standalone
+Host replay emits video. The full per-file evidence is in the worker record
+`gcm-host-p3-r7/report.md`, `result.json`, and `raw/`.
+
+| Time / node | Conclusion or state | Evidence | Input version / environment | Next |
+| --- | --- | --- | --- | --- |
+| 2026-10-06T13:00Z / B1 `denial-fence` (r7) | FIXED. Owner `crates/obscura-host/src/endpoint/channels.rs`. A correlated `REMOTE_AUTH_REQUIRED` / `REMOTE_PRINCIPAL_REVOKED` response is not a `Status`/`ProfileSelected` result, so `response_ends_media` returned false and the denial left the attachment and session id active; one `terminal_response` decision now serves both request paths, the terminal disposition and `terminal_pending` commit before `fence_media_state` clears the attachment-local admission, and the correlated response settles within `SETTLEMENT_DEADLINE`. | before EXIT=100, after EXIT=0 (record `raw/b1-denial-*`); two-observer `raw/b1-two-observer-after.log` EXIT=0 | source `759b99a`; target granted; `--features render` | B2 |
+| 2026-10-06T13:00Z / B2 `frame-interest` (r7) | FIXED. Owner `crates/obscura-host/src/media.rs` (+ `daemon.rs`). One `FrameInterest` accounting owner (`acquire`/`release` via `send_modify`) shared by the legacy `frames.sock` and exact-session consumers; both independent local totals removed, so neither path can force interest to zero while the other is connected. | before EXIT=100, after EXIT=0 (`raw/b2-interest-*`) | source `759b99a`; target granted; `--features render` | B3 |
+| 2026-10-06T13:00Z / B3 `group-settlement` (r7) | FIXED. Owner `crates/obscura-media/src/encoder_owner.rs`. `finalize` always revoke-awaits then `stop_kill_reap`; the group is SIGTERM/SIGKILL-settled and `wait_group_gone` before `reaped_status` releases the group identity, so an exited wrapper cannot strand a descendant. | before EXIT=100, after EXIT=0 (`raw/b3-group-*`) | source `759b99a`; target granted; media webrtc | B4 |
+| 2026-10-06T13:00Z / B4 `revoke-ack` (r7) | FIXED. Owner `crates/obscura-host/src/endpoint/encoder_control.rs`. Typed `EncoderRevoke` plus a `revoke_changed` `Notify` keep a `Revoking` registration unacknowledged until `mark_revoked`; already-`Revoked` acknowledges idempotently. | before EXIT=100, after EXIT=0 (`raw/b4-revoke-*`) | source `759b99a`; target granted; `--features render` | B5 |
+| 2026-10-06T13:00Z / B5 `bound-slot-drain` (r7) | FIXED. Owner `crates/obscura-host/src/endpoint/server.rs`. `SessionBindingGuard` owns the bound slot outside the cancellable timed future, drains after success, error and timeout, and its `Drop` releases on task cancellation. | before EXIT=100, after EXIT=0 (`raw/b5-cancel-*`) | source `759b99a`; target granted; `--features render` | B6 |
+| 2026-10-06T13:00Z / B6 `registry-lock` (r7) | FIXED. Owner `crates/obscura-host/src/endpoint/server.rs`. `release_exact_session` marks the entry `finalizing`, takes durable/supervisor under a short lock, and never holds the registry mutex across the supervisor await; the completion is a detached task. Arrangement repair: `SessionGrant::acquire` waits on a per-registry finalization `watch` generation (not the registry mutex) and creates a fresh entry, preserving the r5/r6 stale-binding reconnect. | before EXIT=100, after EXIT=0 (`raw/b6-lock-*`); arrangement `raw/a5-focused-webrtc.log` EXIT=0 (12/12) | source `759b99a`; target granted; `--features render` | B7 |
+| 2026-10-06T13:00Z / B7 `acquisition-rollback` (r7) | FIXED. Owner `crates/obscura-host/src/endpoint/server.rs`. `SessionAcquisition` owns rollback from the first directory creation and removes only this acquisition's directory and sockets on `Drop` unless `commit()` transfers ownership to `SessionDurable`. | before EXIT=100, after EXIT=0 (`raw/b7-rollback-*`) | source `759b99a`; target granted; `--features render` | B8 |
+| 2026-10-06T13:00Z / B8 `public-consumer` (r7) | FIXED. Owner `crates/obscura-media/src/main.rs` (+ `tests/host-replay.py`). The standalone adapter binds and serves the typed control listener when no Endpoint provides `encoder-control.sock`, then opens the same `EncoderChildOwner`; CLI and ABI unchanged; the real replay version expectation is 11. | before EXIT=1, after EXIT=0 (`raw/b8-host-replay-*`); frames `raw/host-replay-final5` | source `759b99a`; target granted; render Host binary | A5 |
+| 2026-10-06T13:20Z / A5 `focused-green` (r7) | PASS. endpoint + persistent + remote_admission_r1 `70/70`; webrtc_endpoint `12/12`; obscura-media::stream `5/5`; endpoint unit bin `10/10`. | record `raw/a5-focused-host.*`, `raw/a5-focused-webrtc.*`, `raw/a5-focused-stream.*`, `raw/a5-server-units.*` (all EXIT=0) | source `759b99a`; target granted; `--features render`; `-j 4` | A6 |
+| 2026-10-06T13:23Z / A6 `builds` (r7) | PASS. media webrtc, host bins, cli render bins. | record `raw/a6-build-media.*`, `raw/a6-build-host.*`, `raw/a6-build-cli.*` (all EXIT=0) | source `759b99a`; target granted | A7 |
+| 2026-10-06T13:25Z / A7 `full-suite` (r7) | PASS twice. `1806 passed, 4 skipped` each run. | record `raw/a7-full-suite-1.*`, `raw/a7-full-suite-2.*` (EXIT=0) | source `759b99a`; target granted; `-j 4` | A8 |
+| 2026-10-06T13:25Z / A8 `obstacle-reuse` (r7) | NOT_RUN, reuse evidence. Zero `obscura-host`/`obscura-media` edges in the CLI tree; rebuilt CLI sha256 `4ee9e2dc...` (path-attributed, differs from the accepted r4 value). `git diff --check` over changed paths EXIT=0. | record `raw/a8-cli-tree-locked.*`, `raw/a8-cli-sha256.log`, `raw/a9-diff-check.*` | source `759b99a`; target granted | A9 |
+| 2026-10-06T13:31Z / A9 `docs` (r7) | COMPLETE. Worker record `report.md`/`result.json`/`handoff.md`/`notes.md` and this whole-task doc section written. | record dir; this section | source `759b99a`; start HEAD tree `3fa367c1...` | Controller commit and review |
+
 ## r4 node log (history)
 
 | Time / node | Conclusion or state | Evidence | Input version / environment | Next |

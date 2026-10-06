@@ -212,12 +212,10 @@ impl EncoderChildOwner {
     /// reused process id.
     pub async fn finalize(&mut self) -> Result<EncoderStop> {
         let registration_id = self.registration_id;
-        let revoke = self.control.revoke(registration_id).await;
-        if matches!(revoke, Ok(EncoderControlResponse::Revoke { refused: false })) {
-            if self.reap_within(GROUP_GRACE).await? {
-                return Ok(EncoderStop::Exited(self.reaped_status().await?));
-            }
-        }
+        // Wait for the endpoint's typed acknowledgement before addressing the
+        // group. The acknowledgement is ordered after endpoint signal
+        // authority is complete (B4), so it is safe to stop the group here.
+        let _ = self.control.revoke(registration_id).await;
         self.stop_kill_reap().await
     }
 
@@ -230,11 +228,21 @@ impl EncoderChildOwner {
     async fn stop_kill_reap(&mut self) -> Result<EncoderStop> {
         let group = self.group.context("Encoder group identity missing")?;
         signal_group(group, libc::SIGTERM);
-        if self.reap_within(GROUP_GRACE).await? {
-            return Ok(EncoderStop::Exited(self.reaped_status().await?));
+        let leader_exited = self.reap_within(GROUP_GRACE).await?;
+        let group_gone = wait_group_gone(group, GROUP_GRACE).await;
+        let escalated = !leader_exited || !group_gone;
+        if escalated {
+            signal_group(group, libc::SIGKILL);
         }
-        signal_group(group, libc::SIGKILL);
-        Ok(EncoderStop::KilledAndReaped(self.reaped_status().await?))
+        if !wait_group_gone(group, REAP_DEADLINE).await {
+            bail!("Encoder process group survived SIGKILL");
+        }
+        let status = self.reaped_status().await?;
+        if escalated {
+            Ok(EncoderStop::KilledAndReaped(status))
+        } else {
+            Ok(EncoderStop::Exited(status))
+        }
     }
 
     /// Try to reap the leader within `grace`. Returns true when the leader
@@ -273,6 +281,20 @@ pub fn signal_group(pgid: i32, signal: libc::c_int) {
             eprintln!("encoder group signal failed: {error}");
         }
     }
+}
+
+async fn wait_group_gone(pgid: i32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !group_exists(pgid) { return true; }
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+fn group_exists(pgid: i32) -> bool {
+    // Safety: signal 0 performs an existence/permission check only.
+    unsafe { libc::kill(-pgid, 0) == 0 }
 }
 
 struct EncoderControlClient {

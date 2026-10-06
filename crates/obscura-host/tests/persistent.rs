@@ -405,7 +405,10 @@ fn viewport_callback_deadline_faults_without_committing_or_handover() {
 }
 impl Media {
     fn connect(daemon: &Daemon) -> Self {
-        let socket = UnixStream::connect(daemon.dir.join("frames.sock")).unwrap();
+        Self::connect_path(&daemon.dir.join("frames.sock"))
+    }
+    fn connect_path(path: &std::path::Path) -> Self {
+        let socket = UnixStream::connect(path).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
         Self(BufReader::new(socket))
     }
@@ -848,6 +851,38 @@ fn private_socket_rejects_replacement_and_invalid_protocol_frames() {
     client.0.get_mut().write_all(&vec![b'x';65537]).unwrap();
     assert_eq!(client.read()["code"], "INVALID_FRAME");
     let mut line = String::new(); assert_eq!(client.0.read_line(&mut line).unwrap(), 0);
+}
+
+/// B2: frame interest has exactly one accounting owner. The exact-session raw
+/// socket and the legacy `frames.sock` share one count. A legacy viewer that
+/// connects and then leaves must not drop that count to zero while an
+/// exact-session consumer is still attached, so the worker must keep painting.
+#[test]
+fn exact_session_interest_survives_legacy_viewer_disconnect() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"resize","width":160,"height":120}));
+    let state = agent.ok(json!({"type":"navigate","url":"data:text/html,<style>html,body{margin:0;background:rgb(12,34,56)}</style>"}));
+    let session_id = state["session_id"].as_str().unwrap().to_string();
+    let exact_path = daemon.dir.join(format!("session-{session_id}.sock"));
+    let mut exact = Media::connect_path(&exact_path);
+    let (mut previous, _) = exact.frame();
+    assert_eq!(previous["session_id"], state["session_id"]);
+    // A legacy viewer joins and is fully accepted (one frame), then leaves.
+    let mut legacy = Media::connect(&daemon);
+    let _ = legacy.frame();
+    drop(legacy);
+    // The exact-session consumer must keep receiving new frames. Before the
+    // one-owner fix the legacy disconnect drives the shared interest to zero and
+    // the worker stops painting, so this advance cannot be reached.
+    let target = previous["sequence"].as_u64().unwrap() + 6;
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while previous["sequence"].as_u64().unwrap() < target {
+        let (next, _) = exact.frame();
+        if next["sequence"].as_u64().unwrap() > previous["sequence"].as_u64().unwrap() { previous = next; }
+        assert!(Instant::now() < deadline, "exact-session stream stopped after the legacy viewer disconnected: {previous}");
+    }
+    agent.ok(json!({"type":"close_session"}));
 }
 
 // ---------------------------------------------------------------------------

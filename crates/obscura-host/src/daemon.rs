@@ -785,11 +785,12 @@ struct SessionRuntime {
     session: Session,
     work: mpsc::Sender<Work>,
     frames: tokio::sync::watch::Receiver<media::SharedFrame>,
-    interest: tokio::sync::watch::Sender<usize>,
+    /// The single frame-interest accounting owner for this session, shared by
+    /// the legacy `frames.sock` viewers and the exact-session accept loop.
+    interest: media::FrameInterest,
     /// Exact-session raw media listener bound at session start. It exists for
     /// every live session, not only the presented one.
     media_source: media::SessionMediaSource,
-    viewers: usize,
     join: std::thread::JoinHandle<Result<()>>,
 }
 
@@ -808,6 +809,7 @@ async fn spawn_session(
     let (faults, mut fault_events) = mpsc::channel(1);
     let (frames, latest) = tokio::sync::watch::channel(media::state(FramePacket::Waiting { session_id: id.clone() }));
     let (interest, interested) = tokio::sync::watch::channel(0usize);
+    let interest = media::FrameInterest::new(interest);
     let worker = worker::start(id.clone(), profile_dir, network, incoming_work, ready, faults, frames, interested)?;
     let viewport = initialized.await.context("browser worker stopped during startup")?.map_err(anyhow::Error::msg)?;
     // Bind the exact-session source only after the worker is live, so a failed
@@ -847,7 +849,7 @@ async fn spawn_session(
         navigation: NavigationState { url: "about:blank".into(), title: String::new(), can_go_back: false, can_go_forward: false },
         profile: ProfileBinding { profile_id: profile_id.clone(), session_id: id.clone() },
     };
-    Ok(SessionRuntime { session, work, frames: latest, interest, media_source, viewers: 0, join: worker })
+    Ok(SessionRuntime { session, work, frames: latest, interest, media_source, join: worker })
 }
 
 /// Host-local reservation for one remote admission. It binds the accepted
@@ -1491,8 +1493,7 @@ pub async fn serve(
                 let (socket, _) = accepted?;
                 if let Ok(permit) = media_permits.clone().try_acquire_owned() {
                     if let Some(runtime) = sessions.get_mut(&presented) {
-                        runtime.viewers += 1;
-                        runtime.interest.send_replace(runtime.viewers);
+                        runtime.interest.acquire();
                         let latest = runtime.frames.clone();
                         let events = events.clone();
                         let session = presented.clone();
@@ -1552,8 +1553,7 @@ pub async fn serve(
             Some(event) = incoming.recv() => match event {
                 Event::MediaGone(session) => {
                     if let Some(runtime) = sessions.get_mut(&session) {
-                        runtime.viewers = runtime.viewers.saturating_sub(1);
-                        runtime.interest.send_replace(runtime.viewers);
+                        runtime.interest.release();
                     }
                 }
                 Event::Gone(connection) => {

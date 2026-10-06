@@ -19,7 +19,7 @@ use obscura_media::encoder_owner::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{oneshot, Mutex},
+    sync::{oneshot, Mutex, Notify},
 };
 
 /// One endpoint admission fence for encoder acquisition. Registration is
@@ -47,6 +47,12 @@ pub enum EncoderRegistrationState {
     Revoked,
 }
 
+pub enum EncoderRevoke {
+    Acknowledged,
+    Refused,
+    AwaitingSignal(std::sync::Arc<Notify>),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderRegistration {
     pub registration_id: u64,
@@ -62,6 +68,7 @@ pub struct EncoderControlState {
     pub admission: EncoderAdmission,
     pub in_flight: Option<InFlightAcquisition>,
     pub registration: Option<EncoderRegistration>,
+    revoke_changed: std::sync::Arc<Notify>,
 }
 
 impl Default for EncoderAdmission {
@@ -127,19 +134,22 @@ impl EncoderControlState {
         Some((in_flight.registration_id, receiver))
     }
 
-    /// ACK an `Armed`/`Revoking`/`Revoked` registration. A refused or unknown
-    /// id returns `EncoderRegistrationRefused` and sends no `Revoked`.
-    pub fn revoke(&mut self, registration_id: u64) -> bool {
-        let Some(registration) = self.registration.as_mut() else { return true; };
+    /// Begin or observe revocation for one registration. An `Armed` group is
+    /// acknowledged immediately. A group already under endpoint signal
+    /// authority remains unacknowledged until `mark_revoked` completes that
+    /// authority. Unknown and mismatched ids are refused.
+    pub fn revoke(&mut self, registration_id: u64) -> EncoderRevoke {
+        let Some(registration) = self.registration.as_mut() else { return EncoderRevoke::Refused; };
         if registration.registration_id != registration_id {
-            return true;
+            return EncoderRevoke::Refused;
         }
         match registration.state {
-            EncoderRegistrationState::Armed | EncoderRegistrationState::Revoking => {
+            EncoderRegistrationState::Armed => {
                 registration.state = EncoderRegistrationState::Revoked;
-                false
+                EncoderRevoke::Acknowledged
             }
-            EncoderRegistrationState::Revoked => false,
+            EncoderRegistrationState::Revoking => EncoderRevoke::AwaitingSignal(std::sync::Arc::clone(&self.revoke_changed)),
+            EncoderRegistrationState::Revoked => EncoderRevoke::Acknowledged,
         }
     }
 
@@ -159,6 +169,7 @@ impl EncoderControlState {
         if let Some(registration) = self.registration.as_mut() {
             registration.state = EncoderRegistrationState::Revoked;
         }
+        self.revoke_changed.notify_one();
     }
 
     /// Flip admission to `Finalizing` and return the exact armed pgid if one is
@@ -262,11 +273,7 @@ async fn serve_connection(mut stream: UnixStream, state: Arc<Mutex<EncoderContro
                 EncoderControlResponse::Register { refused }
             }
             EncoderControlRequest::Revoke { registration_id } => {
-                let refused = {
-                    let mut guard = state.lock().await;
-                    guard.revoke(registration_id)
-                };
-                EncoderControlResponse::Revoke { refused }
+                EncoderControlResponse::Revoke { refused: await_revoke(&state, registration_id).await }
             }
             EncoderControlRequest::Settle { registration_id, outcome } => {
                 state.lock().await.settle(registration_id, outcome);
@@ -276,5 +283,78 @@ async fn serve_connection(mut stream: UnixStream, state: Arc<Mutex<EncoderContro
         let mut bytes = serde_json::to_vec(&response)?;
         bytes.push(b'\n');
         tokio::time::timeout(Duration::from_secs(2), write.write_all(&bytes)).await.context("Encoder control consumer stalled")??;
+    }
+}
+
+async fn await_revoke(state: &Arc<Mutex<EncoderControlState>>, registration_id: u64) -> bool {
+    loop {
+        let notified = {
+            let mut guard = state.lock().await;
+            match guard.revoke(registration_id) {
+                EncoderRevoke::Acknowledged => return false,
+                EncoderRevoke::Refused => return true,
+                EncoderRevoke::AwaitingSignal(notified) => notified,
+            }
+        };
+        notified.notified().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn exchange(
+        reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        request: EncoderControlRequest,
+    ) -> EncoderControlResponse {
+        let mut bytes = serde_json::to_vec(&request).unwrap();
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await.unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        serde_json::from_str(line.trim_end()).unwrap()
+    }
+
+    /// B4: the typed revoke acknowledgement must not outrun endpoint signal
+    /// authority. While the registration is `Revoking`, a revoke request stays
+    /// unacknowledged until `mark_revoked` closes that authority.
+    #[tokio::test]
+    async fn revoke_ack_waits_for_endpoint_signal_authority() {
+        let root = std::path::Path::new("/tmp").join(format!("ec-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let state = Arc::new(Mutex::new(EncoderControlState::default()));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let reader_task = tokio::spawn(run_reader(listener, Arc::clone(&state), stop_rx));
+        let stream = UnixStream::connect(&path).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut read = BufReader::new(read);
+
+        let acquired = exchange(&mut read, &mut write, EncoderControlRequest::Acquire { registration_id: 1 }).await;
+        assert!(matches!(acquired, EncoderControlResponse::Acquire { permit: EncoderPermit::Granted }));
+        let registered = exchange(&mut read, &mut write, EncoderControlRequest::Register { registration_id: 1, pgid: 42 }).await;
+        assert!(matches!(registered, EncoderControlResponse::Register { refused: false }));
+        assert_eq!(state.lock().await.begin_stop_armed_group(), Some(42));
+
+        let mut request = serde_json::to_vec(&EncoderControlRequest::Revoke { registration_id: 1 }).unwrap();
+        request.push(b'\n');
+        write.write_all(&request).await.unwrap();
+        let mut line = String::new();
+        let early = tokio::time::timeout(Duration::from_millis(150), read.read_line(&mut line)).await;
+        assert!(early.is_err(), "revoke was acknowledged before endpoint signal authority completed: {line:?}");
+
+        state.lock().await.mark_revoked();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(1), read.read_line(&mut response)).await
+            .expect("revoke was not acknowledged after signal authority completed").unwrap();
+        let response: EncoderControlResponse = serde_json::from_str(response.trim_end()).unwrap();
+        assert!(matches!(response, EncoderControlResponse::Revoke { refused: false }));
+
+        let _ = stop_tx.send(());
+        let _ = reader_task.await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

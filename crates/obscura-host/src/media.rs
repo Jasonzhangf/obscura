@@ -10,6 +10,19 @@ use tokio::time::{timeout, Duration};
 pub struct Frame { pub packet: FramePacket, pub pixels: Vec<u8> }
 pub type SharedFrame = Arc<Frame>;
 
+/// The single frame-interest accounting owner for one session. Every raw-media
+/// consumer, exact-session or legacy, acquires and releases this one count. No
+/// path replaces the count from an independent local total, so the last
+/// consumer to leave always drives interest back to zero.
+#[derive(Clone)]
+pub struct FrameInterest(watch::Sender<usize>);
+
+impl FrameInterest {
+    pub fn new(sender: watch::Sender<usize>) -> Self { Self(sender) }
+    pub fn acquire(&self) { self.0.send_modify(|count| *count = count.saturating_add(1)); }
+    pub fn release(&self) { self.0.send_modify(|count| *count = count.saturating_sub(1)); }
+}
+
 /// One exact-session raw media source owned by the Host. It validates the
 /// session identity before binding so a long or malformed session id cannot
 /// truncate a Unix socket path.
@@ -57,19 +70,17 @@ impl SessionMediaSource {
 pub async fn serve_session(
     mut listener: UnixListener,
     frames: watch::Receiver<SharedFrame>,
-    interest: watch::Sender<usize>,
+    interest: FrameInterest,
     session_id: String,
 ) {
-    let mut viewers = 0usize;
     loop {
         let Ok((socket, _)) = listener.accept().await else { return; };
-        viewers = viewers.saturating_add(1);
-        interest.send_replace(viewers);
+        interest.acquire();
         let frames = frames.clone();
         let interest = interest.clone();
         tokio::spawn(async move {
             let _ = stream(socket, frames).await;
-            interest.send_modify(|count| *count = count.saturating_sub(1));
+            interest.release();
         });
         let _ = session_id;
     }

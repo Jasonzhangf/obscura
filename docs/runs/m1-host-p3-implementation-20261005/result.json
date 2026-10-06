@@ -1,11 +1,17 @@
 {
-  "task": "m1-host-p3-implementation-r6-20261005",
-  "worker": "gcm-host-p3-r6",
+  "task": "m1-host-p3-implementation-r7-20261005",
+  "worker": "gcm-host-p3-r7",
   "status": "COMPLETE",
-  "reason": "Both open blockers are settled. The persistent failure was root-caused to the fixture's macOS nonblocking-accept read (not a product race) and fixed in crates/obscura-host/tests/persistent.rs; the stream.rs serve_control fixture now uses the real EncoderControlRequest/EncoderControlResponse types. The full nextest gate is green with zero failures on four consecutive runs.",
+  "reason": "All eight P1 findings from the 759b99a review are fixed at the owner each finding names, each with a real before/after regression (fails on 759b99a, passes on this tree). Focused sets, the three release builds, and the full nextest gate are green. The real standalone Host replay runs to completion and emits video.",
   "branch": "codex/m1-host-p3-implementation-20261005",
-  "source_head": "b2584ee01b702fcff59f69c5b5f45cf6d60d307d",
-  "source_tree": "33dc4afb4fc277e97132e059e61b247596f42ef2",
+  "source_head": "759b99a0c76978efbb070008dd0d21da05465025",
+  "source_tree": "3fa367c1ea09b8f1d3946ffb8ae10cbcb64a743c",
+  "previous_terminal": {
+    "task": "m1-host-p3-implementation-r6-20261005",
+    "worker": "gcm-host-p3-r6",
+    "source_head": "b2584ee01b702fcff59f69c5b5f45cf6d60d307d",
+    "source_tree": "33dc4afb4fc277e97132e059e61b247596f42ef2"
+  },
   "task_base": "9d02931f24631e3680b3038601f4e3efe288c0ab",
   "target_dir": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target",
   "env": {
@@ -14,101 +20,183 @@
     "OBSCURA_TEST_BINARY_DIR": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/release"
   },
   "changed_files_local": [
+    "crates/obscura-host/src/daemon.rs",
+    "crates/obscura-host/src/endpoint/channels.rs",
+    "crates/obscura-host/src/endpoint/encoder_control.rs",
+    "crates/obscura-host/src/endpoint/server.rs",
+    "crates/obscura-host/src/media.rs",
+    "crates/obscura-host/tests/endpoint.rs",
     "crates/obscura-host/tests/persistent.rs",
-    "crates/obscura-media/tests/stream.rs"
+    "crates/obscura-media/src/encoder_owner.rs",
+    "crates/obscura-media/src/main.rs",
+    "crates/obscura-media/tests/encoder.rs",
+    "crates/obscura-media/tests/host-replay.py"
   ],
   "local_file_sha256": {
-    "crates/obscura-host/tests/persistent.rs": "7b6342625dbb13e69fcb26a886191b7f84ca05957f6b8b4268171fdf42aaca65",
-    "crates/obscura-media/tests/stream.rs": "80e59ac497a1b8e6cec9cecca7c60d6219c6bca0b8ad825903639df9bcea71d3"
+    "crates/obscura-host/src/daemon.rs": "8d3d771c70d197b320ce7049ab2c7f991f27980d8492e24f6d799886648dedc1",
+    "crates/obscura-host/src/endpoint/channels.rs": "cee3452160e0ad9089e35464915760d808397972760a4bc248e0200b67faa502",
+    "crates/obscura-host/src/endpoint/encoder_control.rs": "f9b60b05d473bf1705c182c40044271a946d765059c6173895bfe8e21477b512",
+    "crates/obscura-host/src/endpoint/server.rs": "2e1e0a8bcbc5e74d2a46898df44d9d871f8f2a654f92fb09c9b117987ce14624",
+    "crates/obscura-host/src/media.rs": "9306a7c9555d4de6ef0eb127218e131d977958914a7b612994607d8cabdcc129",
+    "crates/obscura-host/tests/endpoint.rs": "7cb71cc8e326bef7e2d483fc863f3aa6ed00d5bbf1970a7838ad49226f377acd",
+    "crates/obscura-host/tests/persistent.rs": "a0e4a6ff4a453dace010dd19ec64e438573bd5c80de4ff4d81083c3c5e0d4ab6",
+    "crates/obscura-media/src/encoder_owner.rs": "2f891e18d66310b9bece0b089bfa5187ac0d667b798d563aba4bdab6776780ee",
+    "crates/obscura-media/src/main.rs": "10927a09adc70a0a1db0bacdf09777c112825a9d3b2f5bad8abc960e898ccd9f",
+    "crates/obscura-media/tests/encoder.rs": "f5b64f444beed22c56c9681d04b8d8bdac3c19627f32d0bba4dfa1012e173745",
+    "crates/obscura-media/tests/host-replay.py": "52817acdfa02802353c037701bddbe29bde2a2dea8a1b095cfd7e8158d64c875"
   },
   "milestones": {
     "A1_admission": "PASS",
-    "A2_admin_ops": "PASS_INHERITED",
-    "A3_receipt": "PASS_INHERITED",
-    "A4_bb35": "PASS",
+    "B1_terminal_auth_denial_fences_media": "FIXED",
+    "B2_one_owner_frame_interest": "FIXED",
+    "B3_encoder_finalization_settles_group": "FIXED",
+    "B4_revoke_ack_ordering": "FIXED",
+    "B5_bound_slot_drain_survives_cancellation": "FIXED",
+    "B6_no_registry_lock_across_child_waits": "FIXED",
+    "B7_failed_acquisition_rollback": "FIXED",
+    "B8_real_public_consumer": "FIXED",
     "A5_focused": "PASS",
     "A6_builds": "PASS",
     "A7_full_suite": "PASS",
     "A8_obstacle": "NOT_RUN",
-    "A9_docs": "COMPLETE",
-    "A10_stream_fixture": "PASS",
-    "A11_scripted_arrangement": "PASS",
-    "A12_typed_fixture": "PASS",
-    "A13_persistent_stability": "PASS"
+    "A9_docs": "COMPLETE"
   },
   "commands": [
     {
-      "node": "A12_stream_typed",
-      "command": "cargo nextest run --locked --release --features webrtc -p obscura-media --test stream",
-      "exit": 0,
-      "evidence": "raw/a12-stream-typed.log, raw/a12-stream-typed.exit",
-      "summary": "5 tests run: 5 passed"
+      "node": "B1",
+      "command": "cargo nextest run --locked --release --features render -p obscura-host --bin obscura-endpoint -E 'test(channels::tests::correlated_authorization_denial_fences_attachment_media)'",
+      "before_exit": 100,
+      "after_exit": 0,
+      "evidence": "raw/b1-denial-before.*, raw/b1-denial-after.*, raw/b1-two-observer-after.*"
     },
     {
-      "node": "A13_persistent_isolated",
-      "command": "cargo nextest run --locked --release --features render -p obscura-host --test persistent -E 'test(sleeping_page_remains_responsive_and_fetch_finishes_after_disconnect)'",
-      "exit": 0,
-      "evidence": "raw/a13-persistent-isolated.log, raw/a13-persistent-isolated.exit",
-      "summary": "1 test run: 1 passed"
+      "node": "B2",
+      "command": "cargo nextest run --locked --release --features render -p obscura-host --test persistent -E 'test(exact_session_interest_survives_legacy_viewer_disconnect)'",
+      "before_exit": 100,
+      "after_exit": 0,
+      "evidence": "raw/b2-interest-before.*, raw/b2-interest-after.*"
     },
     {
-      "node": "A5_focused",
-      "command": "cargo nextest run --locked --release --features render -p obscura-host --test endpoint --test persistent --test remote_admission_r1 --no-fail-fast",
+      "node": "B3",
+      "command": "cargo nextest run --locked --release -p obscura-media --test encoder -E 'test(encoder_owner_finalize_settles_descendant_of_exited_wrapper)'",
+      "before_exit": 100,
+      "after_exit": 0,
+      "evidence": "raw/b3-group-before2.*, raw/b3-group-after.*"
+    },
+    {
+      "node": "B4",
+      "command": "cargo nextest run --locked --release --features render -p obscura-host --bin obscura-endpoint -E 'test(encoder_control::tests::revoke_ack_waits_for_endpoint_signal_authority)'",
+      "before_exit": 100,
+      "after_exit": 0,
+      "evidence": "raw/b4-revoke-before.*, raw/b4-revoke-after.*"
+    },
+    {
+      "node": "B5",
+      "command": "cargo nextest run --locked --release --features render -p obscura-host --bin obscura-endpoint -E 'test(server::tests::cancelled_connection_drains_surviving_bound_slot)'",
+      "before_exit": 100,
+      "after_exit": 0,
+      "evidence": "raw/b5-cancel-before.*, raw/b5-cancel-after.*"
+    },
+    {
+      "node": "B6",
+      "command": "cargo nextest run --locked --release --features render -p obscura-host --bin obscura-endpoint -E 'test(server::tests::session_release_does_not_hold_registry_lock_across_supervisor_wait)'",
+      "before_exit": 100,
+      "after_exit": 0,
+      "evidence": "raw/b6-lock-before.*, raw/b6-lock-after.*"
+    },
+    {
+      "node": "B7",
+      "command": "cargo nextest run --locked --release --features render -p obscura-host --bin obscura-endpoint -E 'test(server::tests::failed_adapter_spawn_rolls_back_session_resources)'",
+      "before_exit": 100,
+      "after_exit": 0,
+      "evidence": "raw/b7-rollback-before.*, raw/b7-rollback-after.*"
+    },
+    {
+      "node": "B8",
+      "command": "python3 crates/obscura-media/tests/host-replay.py <render-host> <media> <dir>",
+      "before_exit": 1,
+      "after_exit": 0,
+      "evidence": "raw/b8-host-replay-before.*, raw/b8-host-replay-after.*, raw/host-replay-final5"
+    },
+    {
+      "node": "A5_focused_host",
+      "command": "cargo nextest run --locked --release --features render -j 4 -p obscura-host --test endpoint --test persistent --test remote_admission_r1",
       "exit": 0,
-      "evidence": "raw/a5-focused.log, raw/a5-focused.exit",
-      "summary": "68 tests run: 68 passed (5 leaky)"
+      "evidence": "raw/a5-focused-host.log, raw/a5-focused-host.exit",
+      "summary": "70 tests run: 70 passed, 0 skipped"
+    },
+    {
+      "node": "A5_focused_webrtc",
+      "command": "cargo nextest run --locked --release --features render -j 4 --no-fail-fast -p obscura-host --test webrtc_endpoint",
+      "exit": 0,
+      "evidence": "raw/a5-focused-webrtc.log, raw/a5-focused-webrtc.exit",
+      "summary": "12 tests run: 12 passed, 0 skipped"
+    },
+    {
+      "node": "A5_focused_stream",
+      "command": "cargo nextest run --locked --release -j 4 -p obscura-media --test stream",
+      "exit": 0,
+      "evidence": "raw/a5-focused-stream.log, raw/a5-focused-stream.exit",
+      "summary": "5 tests run: 5 passed, 0 skipped"
+    },
+    {
+      "node": "A5_server_units",
+      "command": "cargo nextest run --locked --release --features render -p obscura-host --bin obscura-endpoint",
+      "exit": 0,
+      "evidence": "raw/a5-server-units.log, raw/a5-server-units.exit",
+      "summary": "10 tests run: 10 passed, 0 skipped"
     },
     {
       "node": "A6_media_build",
       "command": "cargo build --locked --release -p obscura-media --features webrtc --bins",
       "exit": 0,
-      "evidence": "raw/a6-media-build.log, raw/a6-media-build.exit"
+      "evidence": "raw/a6-build-media.log, raw/a6-build-media.exit"
     },
     {
       "node": "A6_host_build",
       "command": "cargo build --locked --release -p obscura-host --bins",
       "exit": 0,
-      "evidence": "raw/a6-host-build.log, raw/a6-host-build.exit"
+      "evidence": "raw/a6-build-host.log, raw/a6-build-host.exit"
     },
     {
       "node": "A6_cli_build",
       "command": "cargo build --locked --release -p obscura-cli --bins --features render",
       "exit": 0,
-      "evidence": "raw/a6-cli-build.log, raw/a6-cli-build.exit"
+      "evidence": "raw/a6-build-cli.log, raw/a6-build-cli.exit"
     },
     {
-      "node": "A7_full_suite",
-      "command": "cargo nextest run --locked --release --features render --no-fail-fast",
+      "node": "A7_full_suite_1",
+      "command": "cargo nextest run --locked --release --features render --no-fail-fast -j 4",
       "exit": 0,
-      "evidence": "raw/a7-full-suite-env2..5.log, raw/a7-full-suite-env2..5.exit",
-      "summary": "4 runs, each 1798 tests: 1798 passed, 4 skipped"
+      "evidence": "raw/a7-full-suite-1.log, raw/a7-full-suite-1.exit",
+      "summary": "1806 tests run: 1806 passed, 4 skipped"
     },
     {
-      "node": "A11_webrtc_endpoint",
-      "command": "cargo nextest run --locked --release --features render -p obscura-host --test webrtc_endpoint --no-fail-fast",
+      "node": "A7_full_suite_2",
+      "command": "cargo nextest run --locked --release --features render --no-fail-fast -j 4",
       "exit": 0,
-      "evidence": "raw/a11-webrtc-endpoint.log, raw/a11-webrtc-endpoint.exit",
-      "summary": "12 tests run: 12 passed"
+      "evidence": "raw/a7-full-suite-2.log, raw/a7-full-suite-2.exit",
+      "summary": "1806 tests run: 1806 passed, 4 skipped"
     },
     {
       "node": "A8_cli_tree",
-      "command": "cargo tree --locked -p obscura-cli --features render",
+      "command": "cargo tree -p obscura-cli --features render --locked",
       "exit": 0,
-      "evidence": "raw/a8-cli-tree-locked.log",
-      "summary": "0 obscura-host edges"
+      "evidence": "raw/a8-cli-tree-locked.log, raw/a8-cli-tree-locked.exit",
+      "summary": "0 obscura-host / obscura-media edges"
     },
     {
       "node": "A8_cli_sha256",
-      "command": "shasum -a 256 target/release/obscura",
+      "command": "shasum -a 256 <target>/release/obscura",
       "exit": 0,
       "evidence": "raw/a8-cli-sha256.log",
-      "summary": "rebuilt c85e2790e948de877e9377367615813bfa5e256a919cd6775f23b0b142e3f4f9 vs accepted 23eee1832f83d53e78dfaa3cf5f81727763e2b17d6b7544ac59893b759712592"
+      "summary": "rebuilt 4ee9e2dce274ef1d8c1a163f557ca215dbe2be8ef3957513364e5bfdde208f45 vs accepted 23eee1832f83d53e78dfaa3cf5f81727763e2b17d6b7544ac59893b759712592"
     },
     {
-      "node": "diff_check",
-      "command": "git diff --check -- crates/obscura-host/tests/persistent.rs crates/obscura-media/tests/stream.rs",
+      "node": "A9_diff_check",
+      "command": "git diff --check -- <changed paths>",
       "exit": 0,
-      "evidence": "inline"
+      "evidence": "raw/a9-diff-check.log, raw/a9-diff-check.exit"
     }
   ],
   "failures": [],
@@ -124,11 +212,10 @@
     "BB-EX-MEDIA-34",
     "BB-EX-MEDIA-36 (endpoint-side half)"
   ],
-  "cli_sha256_rebuilt": "c85e2790e948de877e9377367615813bfa5e256a919cd6775f23b0b142e3f4f9",
+  "cli_sha256_rebuilt": "4ee9e2dce274ef1d8c1a163f557ca215dbe2be8ef3957513364e5bfdde208f45",
   "cli_sha256_accepted_r4": "23eee1832f83d53e78dfaa3cf5f81727763e2b17d6b7544ac59893b759712592",
   "controller_next": [
-    "Commit the two working-tree files and the rewritten run docs as the final candidate; do not rebase, squash, or rewrite the checkpoint chain.",
-    "Run the independent architecture review on the final candidate.",
-    "Route the disclosed obscura-browser nonblocking-accept flake to a browser-scope owner if it recurs."
+    "Commit the working tree (11 files plus the rewritten run docs) as the r7 candidate; do not rebase, squash, or rewrite the checkpoint chain.",
+    "Run the independent architecture review on base..final HEAD and re-run the required gates on the exact candidate SHA."
   ]
 }

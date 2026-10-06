@@ -171,6 +171,14 @@ pub async fn control(
                 let result = forward_remote_request(&mut write, &mut reader, request).await?;
                 let terminal_denial = is_terminal_authorization_denial(&result, request_id);
                 let detached = response_ends_media(&active.borrow(), &result);
+                // A correlated authorization denial is terminal for this
+                // attachment even though it is not a Status/ProfileSelected
+                // result. Commit the attachment-local media fence before any
+                // cleanup await so the old /media grant cannot keep streaming
+                // while release_binding waits on the session supervisor.
+                if terminal_denial {
+                    fence_media_state(&active);
+                }
                 // Publish the new exact media binding and forward the response
                 // only after it. The media admission path never blocks on the
                 // adapter connection or a first frame, so the consumer cannot
@@ -205,7 +213,7 @@ pub async fn control(
                 let result = forward_remote_request(&mut write, &mut reader, request).await?;
                 let terminal_denial = is_terminal_authorization_denial(&result, request_id);
                 let admitted = active.borrow().clone();
-                let terminal = response_ends_media(&admitted, &result);
+                let terminal = terminal_response(&admitted, &result, request_id);
                 // Commit the terminal disposition and the reserved terminal
                 // dispatch BEFORE the media fence, so closing the filtered frame
                 // watch cannot end `run_inner` before the correlated response is
@@ -214,6 +222,9 @@ pub async fn control(
                 if terminal {
                     let _ = terminal_pending.as_ref().context("WebRTC terminal-pending sender unavailable")?
                         .send(true);
+                }
+                if terminal_denial {
+                    fence_media_state(&active);
                 }
                 let response_tx = browser_responses.as_ref().context("WebRTC browser response pump unavailable")?;
                 if terminal {
@@ -476,6 +487,17 @@ fn update_media_state(
     }
 }
 
+/// Clear the attachment-local media admission without touching any other
+/// attachment's binding. The generation bump wakes every existing `/media`
+/// stream and makes new handshakes fail the `attached` check.
+fn fence_media_state(active: &watch::Sender<MediaState>) {
+    active.send_modify(|state| {
+        state.generation = state.generation.wrapping_add(1);
+        state.attached = false;
+        state.session_id = None;
+    });
+}
+
 /// A response ends media for the current attachment when the Host reports no
 /// active attachment, or when it moved the attachment to a different session.
 /// A detach clears the attachment id; a rebind keeps an attachment id but
@@ -491,6 +513,15 @@ fn response_ends_media(admitted: &MediaState, result: &Response) -> bool {
         _ => return false,
     };
     attachment_id.is_none() || admitted.session_id.as_deref() != session_id
+}
+
+/// The single terminal-response decision shared by the WSS and DataChannel
+/// browser-request paths. A response is terminal for this attachment when the
+/// Host either denied the resident principal (`REMOTE_AUTH_REQUIRED` /
+/// `REMOTE_PRINCIPAL_REVOKED`) or reported that the attachment ended, detached
+/// or moved to a different session.
+fn terminal_response(admitted: &MediaState, result: &Response, request_id: u64) -> bool {
+    is_terminal_authorization_denial(result, request_id) || response_ends_media(admitted, result)
 }
 
 async fn host_request(
@@ -658,6 +689,44 @@ async fn wait_cancelled(cancel: &mut watch::Receiver<bool>) -> () {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    /// B1: a correlated `REMOTE_PRINCIPAL_REVOKED` / `REMOTE_AUTH_REQUIRED`
+    /// denial is terminal for the attachment's media. `terminal_response`,
+    /// the one decision both request paths use, must classify the denial as
+    /// terminal even though it is not a `Status`/`ProfileSelected` result, and
+    /// the fence must invalidate existing and new `/media` grants.
+    #[test]
+    fn correlated_authorization_denial_fences_attachment_media() {
+        let (active, receiver) = watch::channel(MediaState {
+            attached: true,
+            session_id: Some("shared-session".into()),
+            generation: 4,
+        });
+        let admitted = active.borrow().clone();
+        let denied = Response::Error {
+            id: 200,
+            code: RemoteAdmissionErrorCode::RemotePrincipalRevoked.as_str().to_string(),
+            message: "Remote device is revoked".into(),
+        };
+        assert!(!response_ends_media(&active.borrow(), &denied),
+            "an authorization denial is not a Status/ProfileSelected result and must be fenced explicitly");
+        assert!(terminal_response(&admitted, &denied, 200),
+            "the shared terminal decision must treat a correlated denial as terminal");
+        assert!(!terminal_response(&admitted, &denied, 201),
+            "a denial for a different request id must not be treated as terminal");
+        fence_media_state(&active);
+        let fenced = receiver.borrow().clone();
+        assert!(!fenced.attached, "a terminal denial must clear the attachment-local media admission");
+        assert_eq!(fenced.session_id, None, "a terminal denial must drop the admitted session identity");
+        assert_eq!(fenced.generation, 5, "a terminal denial must bump the generation so existing /media streams wake");
+        let auth_required = Response::Error {
+            id: 5,
+            code: RemoteAdmissionErrorCode::RemoteAuthRequired.as_str().to_string(),
+            message: "Remote device is not registered".into(),
+        };
+        assert!(terminal_response(&admitted, &auth_required, 5),
+            "REMOTE_AUTH_REQUIRED must also be media-terminal for the denied attachment");
+    }
 
     #[tokio::test]
     async fn terminal_encoder_unavailable_closes_fanout_watch() {
