@@ -558,6 +558,11 @@ fn click_receipt_precedes_navigation_and_old_document_input_is_rejected() {
                 Err(e) => panic!("fixture accept: {e}"),
             }
         };
+        // The listener is nonblocking to poll accept, but macOS accepts inherit
+        // O_NONBLOCK, which makes set_read_timeout inert and read() return EAGAIN
+        // before the request arrives. Restore blocking mode so the read waits for
+        // the request (bounded by the timeout) instead of racing the client.
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let request = read_complete_http_request(&stream, 8 * 1024)
             .unwrap_or_else(|error| panic!("fixture request read: {error}"));
@@ -652,6 +657,13 @@ fn sleeping_page_remains_responsive_and_fetch_finishes_after_disconnect() {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // The listener is nonblocking so the accept loop can poll,
+                    // but on macOS the accepted socket inherits O_NONBLOCK, which
+                    // makes set_read_timeout inert: read() would return EAGAIN
+                    // before the request arrives. Return the stream to blocking
+                    // mode so the read waits for the request (bounded by the
+                    // timeout) instead of racing the client.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
                     let request = read_complete_http_request(&stream, 8 * 1024)
                         .unwrap_or_else(|error| panic!("fixture request read: {error}"));

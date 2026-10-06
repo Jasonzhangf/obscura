@@ -1,10 +1,10 @@
-# P3-r4 host authority closure: run report
+# P3 host suite closure: run report (r6 terminal)
 
-Status: **INCOMPLETE**. A4 `bb35` is green and the authority focused set and
-the three release builds are green. The full nextest gate is not green. Eight
-public cases fail, all of them because of test arrangements outside the allowed
-write scope, not because of a product defect in the r4 delta. No commit, merge,
-install, restart, OTA, device, or runtime operation was performed.
+Status: **COMPLETE for the r6 node**. The two open blockers are settled, the
+full nextest gate is green with zero failures on four consecutive runs, the
+three release builds and the focused sets are green, and the docs are written.
+No commit, merge, install, restart, OTA, device, or runtime operation was
+performed. The r4 section below is retained as history.
 
 ## Identity
 
@@ -209,3 +209,125 @@ rest is the inherited r2/r3 checkpoint delta.
    `c85e2790...`; decide whether the accepted value is path-bound or needs a
    fresh baseline.
 4. Re-run the full suite, then the A8 obstacle decision, on the repaired tree.
+
+---
+
+## P3-r6 terminal (supersedes the r4 status above)
+
+### Identity
+
+- Task: `m1-host-p3-implementation-r6-20261005`
+- Worker: `gcm-host-p3-r6`
+- Final candidate: checkpoint HEAD `b2584ee01b702fcff59f69c5b5f45cf6d60d307d`
+  (tree `33dc4afb4fc277e97132e059e61b247596f42ef2`) plus two r6 working-tree
+  changes: `crates/obscura-host/tests/persistent.rs` and
+  `crates/obscura-media/tests/stream.rs`.
+- Env: `CARGO_INCREMENTAL=0`, `CARGO_BUILD_JOBS=2`,
+  `CARGO_TARGET_DIR=<sole target>`, `OBSCURA_TEST_BINARY_DIR=<target>/release`,
+  `OBSCURA_WEBRTC_RAW_DIR=<record>/raw/webrtc`.
+
+### Milestones
+
+| Node | State | Command | Exit | Evidence |
+| --- | --- | --- | --- | --- |
+| A1 admission | PASS | `git log -1`, `git status --porcelain`, lease read | 0 | record `notes.md` A1 row |
+| A2 admin-ops | PASS inherited | confirmed in the A5 focused run | 0 | r3 `raw/a2-admin-tests.log`; `raw/a5-focused.log` |
+| A3 receipt | PASS inherited | confirmed in the A5 focused run | 0 | r3 `raw/a3-receipt-tests.log`; `raw/a5-focused.log` |
+| A4 bb35 | PASS | `endpoint::exact_session_final_release_runs_finalizer_before_reader_join` | 0 | `raw/a5-focused.log` (4.197s PASS) |
+| A5 focused | PASS | `cargo nextest ... -p obscura-host --test endpoint --test persistent --test remote_admission_r1` | 0 | `raw/a5-focused.log`/`.exit` (68/68) |
+| A6 builds | PASS | media `--features webrtc`, host, cli `--features render` | 0 | `raw/a6-media-build.*`, `a6-host-build.*`, `a6-cli-build.*` |
+| A7 full suite | PASS | `cargo nextest run --locked --release --features render --no-fail-fast` | 0 | `raw/a7-full-suite-env2..5.log`/`.exit` (1798 passed, 4 skipped) |
+| A8 obstacle | NOT_RUN | `cargo tree -p obscura-cli --features render --locked` | 0 | `raw/a8-cli-tree-locked.log`/`.exit`; `raw/a8-cli-sha256.log` |
+| A10 stream-fixture | PASS | `cargo nextest ... -p obscura-media --test stream` | 0 | `raw/a12-stream-typed.log`/`.exit` (5/5) |
+| A11 scripted | PASS | `cargo nextest ... -p obscura-host --test webrtc_endpoint` | 0 | `raw/a11-webrtc-endpoint.log`/`.exit` (12/12) |
+| A12 typed-fixture | PASS | `serve_control` uses the product types | 0 | `raw/a12-stream-typed.log`/`.exit` |
+| A13 persistent | PASS | isolated + four full-parallel runs | 0 | `raw/a13-persistent-isolated.log`/`.exit`; `raw/a7-full-suite-env2..5.log` |
+| A9 docs | COMPLETE | this report, `result.json`, record docs, raw logs | 0 | worktree and record docs |
+
+### Blocker 1: the load-dependent `persistent` failure
+
+Root cause = the fixture, not the product. `sleeping_page_remains_responsive_and_fetch_finishes_after_disconnect`
+binds a nonblocking `TcpListener` to poll `accept`. On macOS the accepted
+`TcpStream` inherits `O_NONBLOCK`, so `stream.set_read_timeout(...)` (SO_RCVTIMEO)
+is inert and `read_complete_http_request` at `persistent.rs:657` returns `EAGAIN`
+(`Resource temporarily unavailable`, os error 35) whenever the client's request
+bytes have not yet arrived. Under 32-way load the accept/read races ahead of the
+fetch; in the focused run the bytes are usually buffered, so it passed at 6.5s.
+Fix (fixture setup only, all assertions untouched): restore blocking mode on the
+accepted socket before the read timeout.
+
+Sibling instance: `click_receipt_precedes_navigation_and_old_document_input_is_rejected`
+(`persistent.rs:562`) has the identical bug and flaked in `raw/a7-full-suite-env1.log`
+(EXIT=100, same `os error 35`); it received the same fix. This is a second
+instance in the same in-scope file and the same defect class as the named case.
+
+Stability: isolated 1/1 PASS (`raw/a13-persistent-isolated.log`/`.exit`); the
+case passes in 4/4 consecutive 32-way full-suite runs
+(`raw/a7-full-suite-env2..5.log`), each `1798 passed, 4 skipped`, EXIT=0.
+
+Out-of-scope sibling (disclosed, not fixed): `crates/obscura-browser`
+`page::tests::page_transport_prefetches_once_and_capture_reuses_the_bytes`
+(`page.rs:7247`) has the same macOS nonblocking-accept bug. It failed in 2 of the
+early full-suite runs and passed in the four env2-5 runs. `crates/obscura-browser`
+is untouched by the whole task delta and is outside this node's allowed write
+scope, so it was left unchanged.
+
+### Blocker 2: the typed `serve_control` fixture
+
+`crates/obscura-media/tests/stream.rs::serve_control` now decodes the adapter's
+frame into the product `EncoderControlRequest` and answers with
+`EncoderControlResponse`/`EncoderPermit::Granted`, replacing the hand-written
+`serde_json::Value` match. The product enum is
+`#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]`, so a
+renamed variant, an added field, a wrong tag, or a malformed payload now fails
+the decode and the case, where the old `request["op"].as_str()` match silently
+accepted anything tagged `acquire`/`register`/`revoke`/`settle`. The response is
+serialized from the product type, so the wire shape cannot drift. The five
+`public_adapter_*` cases pass (`raw/a12-stream-typed.log`/`.exit`, 5/5).
+
+### Full-suite gate
+
+`cargo nextest run --locked --release --features render --no-fail-fast`, with
+`OBSCURA_TEST_BINARY_DIR=<target>/release`, default 32 test threads. Four
+consecutive runs (env2-5) each reported `1798 tests run: 1798 passed, 4 skipped`,
+EXIT=0. Two runs carried a transient `LEAK` annotation on unrelated tests (an
+`obscura-js` runtime test; `obscura-host::lease_cancel_r2`), which is not a
+failure. Evidence: `raw/a7-full-suite-env2..5.log`/`.exit`.
+
+Disclosed non-gate runs:
+
+- `raw/a7-full-suite-1..4.log` (EXIT=100): `OBSCURA_TEST_BINARY_DIR` was unset,
+  so the `remote_admission_r1` and `webrtc_endpoint` fixtures could not find
+  `target/release/obscura-media` / `obscura-webrtc-receiver`. Invocation-env
+  mistake, not a product result.
+- `raw/a7-full-suite-env1.log` (EXIT=100): before the `click_receipt` fix, that
+  case failed with the same macOS nonblocking-accept `os error 35`, and the
+  `obscura-browser` case failed with the same class of bug.
+
+### A8 obstacle and CLI hash
+
+`cargo tree -p obscura-cli --features render --locked` exits 0 with zero
+`obscura-host` edges (`raw/a8-cli-tree-locked.log`/`.exit`), so the obstacle
+course was not run. The rebuilt CLI SHA256 is
+`c85e2790e948de877e9377367615813bfa5e256a919cd6775f23b0b142e3f4f9`, matching the
+r4 path-attributed value; the accepted r4 value
+`23eee1832f83d53e78dfaa3cf5f81727763e2b17d6b7544ac59893b759712592` came from a
+different worktree path. Record, not a gate.
+
+### Covered cases and controller next
+
+- Catalog create/select/info and membership grant/removal through the real
+  `host-admin.sock`, and the applied-receipt v1 cases, are green in
+  `raw/a5-focused.log`.
+- `BB-EX-MEDIA-35` `exact_session_final_release_runs_finalizer_before_reader_join`
+  is green in `raw/a5-focused.log` (4.197s) and the full suite.
+- The five `obscura-media::stream::public_adapter_*` cases and the twelve
+  `obscura-host::webrtc_endpoint` cases (incl. the three scripted) are green;
+  `webrtc_endpoint.rs` is byte-identical to the r5 checkpoint.
+- The NOT_EXECUTED list is unchanged from r4 (BB-EX-MEDIA-09/10/11/12/13/14/31/33/34
+  and the endpoint-side half of BB-EX-MEDIA-36); the exact missing affordances
+  are recorded in the record `report.md`. No mock promoted a real case.
+- Controller next: commit the two working-tree files and the rewritten docs as
+  the final candidate (do not rebase, squash, or rewrite the checkpoint chain);
+  run the independent architecture review; route the disclosed `obscura-browser`
+  nonblocking-accept flake to a browser-scope owner if it recurs.

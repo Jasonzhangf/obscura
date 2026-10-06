@@ -1,5 +1,6 @@
 #![cfg(unix)]
 use std::{os::unix::fs::{DirBuilderExt, PermissionsExt}, path::PathBuf, process::Stdio, time::Duration};
+use obscura_media::encoder_owner::{EncoderControlRequest, EncoderControlResponse, EncoderPermit};
 use obscura_host_protocol::{FrameInfo, FramePacket, PixelFormat, VideoPacket};
 use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::{UnixListener, UnixStream}};
 
@@ -28,13 +29,15 @@ async fn serve_control(listener: UnixListener) {
         let mut line = String::new();
         let count = match reader.read_line(&mut line).await { Ok(count) => count, Err(_) => return };
         if count == 0 { return; }
-        let request: serde_json::Value = match serde_json::from_str(line.trim_end()) { Ok(value) => value, Err(_) => return };
-        let response = match request["op"].as_str().unwrap_or_default() {
-            "acquire" => serde_json::json!({"op":"acquire","permit":"granted"}),
-            "register" => serde_json::json!({"op":"register","refused":false}),
-            "revoke" => serde_json::json!({"op":"revoke","refused":false}),
-            "settle" => serde_json::json!({"op":"settle"}),
-            _ => return,
+        // Decode the adapter's frame with the product enum. `deny_unknown_fields`
+        // plus the tagged variants make a drifted or malformed control request
+        // fail here instead of being silently accepted by a loose JSON match.
+        let request: EncoderControlRequest = match serde_json::from_str(line.trim_end()) { Ok(request) => request, Err(_) => return };
+        let response = match request {
+            EncoderControlRequest::Acquire { .. } => EncoderControlResponse::Acquire { permit: EncoderPermit::Granted },
+            EncoderControlRequest::Register { .. } => EncoderControlResponse::Register { refused: false },
+            EncoderControlRequest::Revoke { .. } => EncoderControlResponse::Revoke { refused: false },
+            EncoderControlRequest::Settle { .. } => EncoderControlResponse::Settle,
         };
         let mut bytes = serde_json::to_vec(&response).unwrap();
         bytes.push(b'\n');
