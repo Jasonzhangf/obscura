@@ -1,0 +1,172 @@
+{
+  "task": "m1-host-p3-implementation-r4-20261005",
+  "worker": "gcm-host-p3-r4",
+  "status": "INCOMPLETE",
+  "reason": "Full nextest gate is not green. Eight public cases fail because of test arrangements outside the allowed write scope, not because of a product defect in the r4 delta.",
+  "branch": "codex/m1-host-p3-implementation-20261005",
+  "source_head": "6d64a027d0f888b8c2a16a51281bc9649b3baacb",
+  "source_tree": "a027202f771a5e235f479491e8c0d24d8ea82a32",
+  "task_base": "9d02931f24631e3680b3038601f4e3efe288c0ab",
+  "target_dir": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target",
+  "env": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "OBSCURA_TEST_BINARY_DIR": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/release"
+  },
+  "changed_files_local": [
+    "crates/obscura-host/src/endpoint/server.rs",
+    "crates/obscura-host/tests/endpoint.rs"
+  ],
+  "local_file_sha256": {
+    "crates/obscura-host/src/endpoint/server.rs": "88cb53b756ab6edb9a1f800e2c4f84f6ad2779c6b7d37e8a34a382dc4c30512b",
+    "crates/obscura-host/tests/endpoint.rs": "09beb22274927948365a6cb58d1ac95686e1a591efcdf1c290c49d5cf4641c8d"
+  },
+  "milestones": {
+    "A1_admission": "PASS",
+    "A2_admin_ops": "PASS_INHERITED",
+    "A3_receipt": "PASS_INHERITED",
+    "A4_bb35": "PASS",
+    "A5_focused": "PARTIAL",
+    "A6_builds": "PASS",
+    "A7_full_suite": "FAIL",
+    "A8_obstacle": "NOT_RUN",
+    "A9_docs": "COMPLETE"
+  },
+  "commands": [
+    {
+      "node": "A4",
+      "command": "cargo nextest --test endpoint -E 'test(exact_session_final_release_runs_finalizer_before_reader_join)'",
+      "exit": 0,
+      "evidence": "raw/a4-fix4.log",
+      "summary": "1/1 PASS 6.847s"
+    },
+    {
+      "node": "A5_focused",
+      "command": "cargo nextest -p obscura-host --test endpoint --test persistent --test remote_admission_r1",
+      "exit": 0,
+      "evidence": "raw/a5-focused-r4.log",
+      "summary": "68/68 passed"
+    },
+    {
+      "node": "A5_webrtc",
+      "command": "cargo nextest -p obscura-host --test webrtc_endpoint",
+      "exit": 100,
+      "evidence": "raw/a5-webrtc-full.log",
+      "summary": "9 passed, 3 failed"
+    },
+    {
+      "node": "A6_media_build",
+      "command": "cargo build --locked --release -p obscura-media --features webrtc --bins",
+      "exit": 0,
+      "evidence": "raw/a6-media-build-r4.log"
+    },
+    {
+      "node": "A6_host_build",
+      "command": "cargo build --locked --release -p obscura-host --bins",
+      "exit": 0,
+      "evidence": "raw/a6-host-build.log"
+    },
+    {
+      "node": "A6_cli_build",
+      "command": "cargo build --locked --release -p obscura-cli --bins --features render",
+      "exit": 0,
+      "evidence": "raw/a6-cli-build.log"
+    },
+    {
+      "node": "A7_full_suite",
+      "command": "cargo nextest run --locked --release --features render --no-fail-fast",
+      "exit": 100,
+      "evidence": "raw/a7-full-suite.log",
+      "summary": "1798 tests: 1790 passed, 8 failed, 4 skipped"
+    },
+    {
+      "node": "A7_media_isolated",
+      "command": "cargo nextest -p obscura-media --test stream",
+      "exit": 100,
+      "evidence": "raw/a7-media-stream-isolated2.log",
+      "summary": "5 failed in isolation"
+    },
+    {
+      "node": "A8_cli_tree",
+      "command": "cargo tree -p obscura-cli --features render --edges normal --locked",
+      "exit": 0,
+      "evidence": "raw/a8-cli-tree-locked.log",
+      "summary": "0 obscura-host edges"
+    },
+    {
+      "node": "A8_cli_sha256",
+      "command": "shasum -a 256 target/release/obscura",
+      "exit": 0,
+      "evidence": "raw/a8-cli-sha256.log",
+      "summary": "rebuilt c85e2790e948de877e9377367615813bfa5e256a919cd6775f23b0b142e3f4f9 vs accepted 23eee1832f83d53e78dfaa3cf5f81727763e2b17d6b7544ac59893b759712592"
+    },
+    {
+      "node": "diff_check",
+      "command": "git diff --check -- crates/obscura-host/src/endpoint/server.rs crates/obscura-host/tests/endpoint.rs",
+      "exit": 0,
+      "evidence": "inline"
+    }
+  ],
+  "failures": [
+    {
+      "case": "obscura-media::stream::public_adapter_rejects_session_switch_and_exits",
+      "cause": "fixture starts adapter without encoder-control.sock listener",
+      "scope": "crates/obscura-media/tests/stream.rs (outside allowed write scope)"
+    },
+    {
+      "case": "obscura-media::stream::public_adapter_reports_encoder_failure_and_exits",
+      "cause": "fixture starts adapter without encoder-control.sock listener",
+      "scope": "crates/obscura-media/tests/stream.rs (outside allowed write scope)"
+    },
+    {
+      "case": "obscura-media::stream::public_adapter_preserves_host_identity_through_resize_and_close",
+      "cause": "fixture starts adapter without encoder-control.sock listener",
+      "scope": "crates/obscura-media/tests/stream.rs (outside allowed write scope)"
+    },
+    {
+      "case": "obscura-media::stream::public_adapter_stops_after_first_closed_packet",
+      "cause": "fixture starts adapter without encoder-control.sock listener",
+      "scope": "crates/obscura-media/tests/stream.rs (outside allowed write scope)"
+    },
+    {
+      "case": "obscura-media::stream::public_adapter_recovers_after_host_unavailable",
+      "cause": "fixture starts adapter without encoder-control.sock listener",
+      "scope": "crates/obscura-media/tests/stream.rs (outside allowed write scope)"
+    },
+    {
+      "case": "obscura-host::webrtc_endpoint::same_content_new_sequence_publishes_each_frame",
+      "cause": "fixture sends 12 frames after receiver exits at 3; designed control-close release removes encoded.sock; Broken pipe",
+      "scope": "crates/obscura-host/tests/webrtc_endpoint.rs (outside allowed write scope)"
+    },
+    {
+      "case": "obscura-host::webrtc_endpoint::foreign_session_then_matching_a_is_held_until_admitted",
+      "cause": "fixture sends 12 frames after receiver exits at 3; designed control-close release removes encoded.sock; Broken pipe",
+      "scope": "crates/obscura-host/tests/webrtc_endpoint.rs (outside allowed write scope)"
+    },
+    {
+      "case": "obscura-host::webrtc_endpoint::initial_none_waits_for_first_admitted_frame",
+      "cause": "fixture sends 12 frames after receiver exits at 3; designed control-close release removes encoded.sock; Broken pipe",
+      "scope": "crates/obscura-host/tests/webrtc_endpoint.rs (outside allowed write scope)"
+    }
+  ],
+  "not_executed": [
+    "BB-EX-MEDIA-09",
+    "BB-EX-MEDIA-10",
+    "BB-EX-MEDIA-11",
+    "BB-EX-MEDIA-12",
+    "BB-EX-MEDIA-13",
+    "BB-EX-MEDIA-14",
+    "BB-EX-MEDIA-31",
+    "BB-EX-MEDIA-33",
+    "BB-EX-MEDIA-34",
+    "BB-EX-MEDIA-36 (endpoint-side half)"
+  ],
+  "cli_sha256_rebuilt": "c85e2790e948de877e9377367615813bfa5e256a919cd6775f23b0b142e3f4f9",
+  "cli_sha256_accepted_r4": "23eee1832f83d53e78dfaa3cf5f81727763e2b17d6b7544ac59893b759712592",
+  "controller_next": [
+    "Do not review or merge this partial result.",
+    "Authorize test-only repairs in crates/obscura-media/tests/stream.rs and crates/obscura-host/tests/webrtc_endpoint.rs.",
+    "Reconcile the accepted CLI hash with the rebuilt hash.",
+    "Re-run the full suite and the A8 obstacle decision on the repaired tree."
+  ]
+}

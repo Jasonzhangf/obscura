@@ -446,6 +446,26 @@ async fn wait_dir(path: &std::path::Path, timeout: Duration) -> bool {
     true
 }
 
+async fn wait_pid_gone(pid: i32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        // Safety: signal 0 performs an existence/permission check only.
+        if unsafe { libc::kill(pid, 0) } != 0 { return true; }
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// PIDs whose full command line contains `needle`. Used to observe the real
+/// per-session adapter process without a product test hook.
+fn processes_matching(needle: &str) -> Vec<i32> {
+    let output = std::process::Command::new("ps").args(["-axww", "-o", "pid=,command="]).output().expect("ps");
+    String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| {
+        let (pid, command) = line.trim().split_once(' ')?;
+        command.contains(needle).then(|| pid.parse::<i32>().ok()).flatten()
+    }).collect()
+}
+
 /// Read A's public media consumer to its explicit terminal. Returns the
 /// terminal header (`closed` or `unavailable`).
 async fn media_terminal(
@@ -659,6 +679,15 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
         assert!(dir_a.join("encoded.sock").exists(), "A encoded socket missing while healthy");
         assert!(dir_a.join("encoder-control.sock").exists(), "A encoder-control socket missing while healthy");
 
+        // Observe A's and B's real adapter processes while both sessions are
+        // healthy. The per-session media directory path identifies the exact
+        // session's adapter; B's adapter must survive A's release.
+        let adapter_a = processes_matching(&dir_a.to_string_lossy());
+        let adapter_b = processes_matching(&dir_b.to_string_lossy());
+        assert_eq!(adapter_a.len(), 1, "A's adapter process was not observed: {adapter_a:?}");
+        assert_eq!(adapter_b.len(), 1, "B's adapter process was not observed: {adapter_b:?}");
+        let adapter_a_pid = adapter_a[0];
+
         // Release A's final control reference while its reader is live.
         drop(control_a);
         let terminal = media_terminal(&mut video_a).await;
@@ -666,13 +695,16 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
             matches!(terminal["type"].as_str(), Some("closed") | Some("unavailable") | Some("transport_end")),
             "A did not reach an explicit media terminal: {terminal}"
         );
-        eprintln!("BB35 endpoint.err:\n{}", std::fs::read_to_string(root.join("endpoint.err")).unwrap_or_default());
         assert!(
             wait_absent(&dir_a, Duration::from_secs(20)).await,
             "A's adapter/socket directory was not removed after final release"
         );
         assert!(!dir_a.join("encoded.sock").exists(), "A encoded socket survived finalization");
         assert!(!dir_a.join("encoder-control.sock").exists(), "A encoder-control socket survived finalization");
+
+        // A's adapter was reaped, and releasing A did not reap B's adapter.
+        assert!(wait_pid_gone(adapter_a_pid, Duration::from_secs(20)).await, "A's adapter process survived finalization");
+        assert!(processes_matching(&dir_b.to_string_lossy()).contains(&adapter_b[0]), "A's release reaped B's adapter");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
@@ -689,8 +721,6 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
         drop(video_a);
         drop(video_b);
         drop(control_b);
-        let err = std::fs::read_to_string(root.join("endpoint.err")).unwrap_or_default();
-        std::fs::write("/tmp/bb35-endpoint.err", err).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }).await.expect("BB-EX-MEDIA-35 case timed out");
 }
