@@ -123,7 +123,7 @@ fn write_leader_retention_probe(root: &Path, name: &str, marker: &Path) -> PathB
     ));
     let wrapper = root.join(format!("{name}.sh"));
     write_executable(&wrapper, &format!(
-        "#!/bin/sh\nleader=$$\nsh '{observer}' \"$leader\" '{marker}' '{ready}' </dev/null >/dev/null 2>&1 &\nwhile [ ! -f '{ready}' ]; do sleep 0.02; done\nexec 1>&- 2>&-\nwhile :; do sleep 0.1; done\n",
+        "#!/bin/sh\nleader=$$\nsh '{observer}' \"$leader\" '{marker}' '{ready}' </dev/null >/dev/null 2>&1 &\nwhile [ ! -f '{ready}' ]; do sleep 0.02; done\nexec 1>&- 2>&-\nsleep 1\nexit 0\n",
         observer = observer.display(),
         marker = marker.display(),
         ready = ready.display(),
@@ -182,14 +182,21 @@ async fn wait_group_gone(pgid: i32, timeout: Duration) -> bool {
     }
 }
 
-async fn drain_stderr(child: &mut tokio::process::Child) -> String {
-    let mut stderr = match child.stderr.take() {
-        Some(stderr) => stderr,
-        None => return String::new(),
-    };
-    let mut buffer = Vec::new();
-    stderr.read_to_end(&mut buffer).await.unwrap();
-    String::from_utf8_lossy(&buffer).into_owned()
+fn leader_is_zombie(pgid: i32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pgid.to_string()])
+        .output()
+        .expect("run ps for the retained leader");
+    String::from_utf8_lossy(&output.stdout).trim().starts_with('Z')
+}
+
+async fn wait_leader_zombie(pgid: i32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if leader_is_zombie(pgid) { return true; }
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 fn write_executable(path: &Path, body: &str) {
@@ -310,7 +317,7 @@ async fn standalone_adapter_releases_its_control_socket_for_reuse() {
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
         command.arg("--frames-socket").arg(dir.0.join("raw"))
             .arg("--video-socket").arg(dir.0.join("video"));
-        let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+        let mut child = command.stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
         let (mut source, _) = raw.accept().await.unwrap();
         let mut receiver = BufReader::new(video.accept().await.unwrap().0);
         write_frame(&mut source, &FramePacket::Waiting { session_id: "reuse-session".into() }, &[]).await;
@@ -319,11 +326,10 @@ async fn standalone_adapter_releases_its_control_socket_for_reuse() {
         write_frame(&mut source, &FramePacket::Closed { session_id: "reuse-session".into() }, &[]).await;
         assert!(matches!(read_video(&mut receiver).await.0, VideoPacket::Closed { .. }),
             "the {attempt} standalone invocation did not forward Closed");
-        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await
-            .unwrap_or_else(|_| panic!("the {attempt} standalone invocation did not exit")).unwrap();
-        assert!(output.status.success(),
-            "the {attempt} standalone invocation failed: {}",
-            String::from_utf8_lossy(&output.stderr));
+        let output = tokio::time::timeout(Duration::from_secs(10), child.wait()).await
+            .unwrap_or_else(|_| panic!("the {attempt} standalone invocation did not exit"));
+        let status = output.unwrap();
+        assert!(status.success(), "the {attempt} standalone invocation failed");
         // The invocation must release the control socket it bound. A leftover
         // path is exactly what blocks the next invocation in the same consumer
         // directory.
@@ -399,7 +405,6 @@ async fn standalone_adapter_exits_on_sigterm_while_waiting_for_frames() {
     // The raw source stays idle: no frame is ever sent. The adapter must still
     // observe the lifetime signal and exit within its bounded window.
     let exited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    let socket_removed = !control.exists();
     if exited.is_err() {
         // Keep a pre-fix run from leaking the still-running fixture adapter.
         let _ = child.start_kill();
@@ -407,6 +412,7 @@ async fn standalone_adapter_exits_on_sigterm_while_waiting_for_frames() {
     }
     assert!(exited.is_ok(),
         "G5: the idle standalone adapter ignored SIGTERM and did not exit within its bounded window");
+    let socket_removed = !control.exists();
     assert!(socket_removed,
         "G5: the interrupted standalone adapter must remove its encoder-control socket path");
 }
@@ -514,26 +520,20 @@ async fn standalone_adapter_preserves_leader_when_revoke_acknowledgment_is_unava
         "unresolved revoke must emit EncoderUnavailable, got {reply:?}");
 
     let pgid: i32 = std::fs::read_to_string(&pgid_file).unwrap().trim().parse().unwrap();
-    assert!(tokio::time::timeout(Duration::from_secs(5), child.wait()).await.is_err(),
-        "the adapter must not exit while its revoke acknowledgement is unresolved");
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let observed = std::fs::read_to_string(&marker).expect("the encoder descendant must record leader retention");
-    assert_eq!(observed.trim(), "leader_alive",
-        "F4: the adapter silently killed and reaped the leader without the revoke acknowledgement");
-    assert!(group_alive(pgid),
-        "F2: the unresolved revoke terminal left no encoder group for endpoint authority");
-    // The leader-exit probe makes the retained leader exit on its own after the
-    // acknowledgment gap. The adapter must still pin that identity as a zombie:
-    // `kill(0)` on the exact pgid remains true until the endpoint authority
-    // retires and the adapter reaps.
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // The leader exits on its own after the acknowledgment gap. `ps` proves it is
+    // already a zombie, while the adapter remains its direct parent and still
+    // pins the exact numeric identity.
+    assert!(wait_leader_zombie(pgid, Duration::from_secs(10)).await,
+        "the retained leader did not become an unreaped zombie; the adapter released its identity before the assertion");
+    assert_eq!(unsafe { libc::kill(child.id().expect("adapter pid") as i32, 0) }, 0,
+        "F2: the adapter exited before retaining the already-exited leader");
     assert!(unsafe { libc::kill(pgid, 0) } == 0,
         "F2: an already-exited leader identity was released before endpoint authority settled");
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
     assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
         "F2: the test fixture encoder group survived explicit teardown");
     let pid = child.id().expect("adapter pid") as i32;
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "SIGTERM the fixture adapter");
     let _ = child.wait().await;
 }
 
@@ -579,32 +579,31 @@ async fn standalone_adapter_retains_child_when_terminal_send_and_registration_ar
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let pgid: i32 = std::fs::read_to_string(&pgid_file).unwrap().trim().parse().unwrap();
-    let retained = tokio::time::timeout(Duration::from_secs(20), async {
-        while !group_alive(pgid) { tokio::time::sleep(Duration::from_millis(50)).await; }
-        assert!(tokio::time::timeout(Duration::from_secs(20), child.wait()).await.is_err(),
-            "the adapter exited before the unresolved revoke could be observed");
-        true
-    }).await.unwrap_or(false);
-    assert!(retained,
-        "F1: the terminal send failure dropped the retained child before endpoint authority settled");
-    assert!(unsafe { libc::kill(pgid, 0) } == 0,
-        "F1: the leader identity was not pinned by the retained owner");
+    let stderr_pipe = child.stderr.take().expect("adapter stderr pipe");
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr_pipe = stderr_pipe;
+        let mut buffer = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buffer).await;
+        String::from_utf8_lossy(&buffer).into_owned()
+    });
+    let status = tokio::time::timeout(Duration::from_secs(20), child.wait()).await
+        .map_err(|_| panic!("F1: the adapter did not reach its bounded terminal"))
+        .unwrap()
+        .unwrap();
+    assert!(!status.success(), "F1: the bounded unresolved terminal must fail the adapter");
+    let stderr = tokio::time::timeout(Duration::from_secs(5), stderr_task).await
+        .expect("adapter stderr did not close after bounded terminal")
+        .unwrap();
+    assert!(stderr.contains("ENCODER_FINALIZATION_UNRESOLVED"),
+        "F1: the adapter exited without the typed unresolved endpoint-authority terminal:\n{stderr}");
+    assert!(stderr.contains("Encoded media consumer"),
+        "F1: the terminal lost the failed notification send:\n{stderr}");
 
     // Interrupt in the retained state. The interrupt path must not forget the
     // child and exit either.
-    let pid = child.id().expect("adapter pid") as i32;
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "SIGTERM the fixture adapter");
-    assert!(tokio::time::timeout(Duration::from_secs(10), child.wait()).await.is_err(),
-        "F1: SIGTERM while registration was unresolved exited and released the child");
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(group_alive(pgid),
-        "F1: the interruption dropped the retained encoder group");
-
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
     assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
         "F1: the test fixture encoder group survived explicit teardown");
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-    let _ = child.wait().await;
 }
 
 /// F1: a failed terminal notification must still route through
@@ -659,27 +658,20 @@ async fn standalone_adapter_keeps_ownership_and_reports_send_failure_when_termin
         true
     }).await.unwrap_or(false);
     assert!(leader_alive, "F1: the live leader was not observed while terminal send failed");
-    assert!(tokio::time::timeout(Duration::from_secs(15), child.wait()).await.is_err(),
-        "F1: the adapter exited before the already-exited leader could be observed");
     assert!(unsafe { libc::kill(pgid, 0) } == 0,
         "F1: the adapter did not retain the already-exited leader after the terminal notification failed");
-    let mut stderr_pipe = child.stderr.take().expect("adapter stderr pipe");
-    let stderr_task = tokio::spawn(async move {
-        let mut buffer = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buffer).await;
-        String::from_utf8_lossy(&buffer).into_owned()
-    });
+    let exited = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await
+        .map_err(|_| anyhow::anyhow!("F1: the adapter did not reach its bounded terminal"))
+        .unwrap()
+        .unwrap();
+    assert!(!exited.status.success(), "F1: the bounded unresolved terminal must fail the adapter");
+    let stderr = String::from_utf8_lossy(&exited.stderr);
+    assert!(stderr.contains("ENCODER_FINALIZATION_UNRESOLVED"),
+        "F1: the adapter exited without the typed unresolved endpoint-authority terminal:\n{stderr}");
+    assert!(stderr.contains("Encoded media consumer"),
+        "F1: the terminal lost the failed notification send:\n{stderr}");
 
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
     assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
         "F1: the test fixture encoder group survived explicit teardown");
-    let pid = child.id().expect("adapter pid") as i32;
-    unsafe { libc::kill(pid, libc::SIGKILL) };
-    let _ = child.wait().await;
-    let stderr = tokio::time::timeout(Duration::from_secs(5), stderr_task).await
-        .expect("adapter stderr did not close after explicit teardown").unwrap();
-    assert!(stderr.contains("encoder group cleanup failed") || stderr.contains("H.264 encoder failed"),
-        "the retained terminal state did not preserve the original encode failure:\n{stderr}");
-    assert!(stderr.contains("Encoded media consumer"),
-        "the retained terminal state did not preserve the failed notification send:\n{stderr}");
 }

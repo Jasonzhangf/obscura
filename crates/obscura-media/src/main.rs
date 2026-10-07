@@ -184,7 +184,7 @@ async fn race<T>(
 async fn interrupt(owner: &mut obscura_media::encoder_owner::EncoderChildOwner, signal: &'static str) -> Result<()> {
     if owner.has_live_child() {
         let error = anyhow::anyhow!("Media adapter received {signal} before completion");
-        return retain_until_authority_retired(owner, format!("{signal} interrupt"), error).await;
+        return retain_unresolved_terminal(owner, "interrupt", error).await;
     }
     Err(anyhow::anyhow!("Media adapter received {signal} before completion"))
 }
@@ -195,33 +195,30 @@ async fn interrupt(owner: &mut obscura_media::encoder_owner::EncoderChildOwner, 
 /// finalizer retires endpoint signal authority and reaps the child.
 async fn terminal_ownership_exit(owner: &mut obscura_media::encoder_owner::EncoderChildOwner, error: anyhow::Error) -> Result<()> {
     if owner.has_live_child() {
-        return retain_until_authority_retired(owner, "terminal failure".to_string(), error).await;
+        return retain_unresolved_terminal(owner, "terminal failure", error).await;
     }
     Err(error)
 }
 
-/// Keep the retained encoder owner alive and re-try the one typed finalizer
-/// until endpoint signal authority is retired and the leader is reaped. The
-/// adapter is the direct-child parent, so its continued lifetime is what pins
-/// an already-exited leader as a zombie; only the typed finalize outcome may
-/// retire that identity.
-async fn retain_until_authority_retired(
+/// Keep the retained encoder owner alive for one bounded window when endpoint
+/// authority is unresolved. The adapter is the direct-child parent, so its
+/// continued lifetime is what pins an already-exited leader as a zombie; only
+/// the typed finalize outcome may retire that identity. When the typed control
+/// resource is permanently gone, return an explicit terminal error instead of
+/// retrying the same EOF/broken-pipe state forever.
+async fn retain_unresolved_terminal(
     owner: &mut obscura_media::encoder_owner::EncoderChildOwner,
-    reason: String,
+    reason: &str,
     error: anyhow::Error,
 ) -> Result<()> {
-    let mut reported_failure = false;
-    while owner.has_live_child() {
-        match owner.finalize().await {
-            Ok(_) => return Err(error),
-            Err(cleanup) => {
-                if !reported_failure {
-                    eprintln!("media adapter {reason}: retained encoder authority unresolved; keeping adapter and child pinned: {cleanup:#}; terminal error: {error:#}");
-                    reported_failure = true;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        }
+    let terminal = match owner.finalize().await {
+        Ok(_) => return Err(error),
+        Err(cleanup) => cleanup,
+    };
+    let retention = owner.retain_unresolved(terminal).await;
+    if let Err(retention_error) = retention {
+        eprintln!("media adapter {reason}: retained encoder authority unresolved: {retention_error:#}; terminal error: {error:#}");
+        return Err(error.context(retention_error));
     }
     Err(error)
 }

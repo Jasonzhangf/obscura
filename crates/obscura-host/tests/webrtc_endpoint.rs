@@ -941,7 +941,7 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
     let bytes = obscura_media::encode(std::path::Path::new("ffmpeg"), 160, 120, scripted_scene(160, 120)).await?;
     anyhow::ensure!(!bytes.is_empty(), "finalization-failure producer got no access unit");
     let session_socket = root.join(format!("endpoint/session-{session_id}/encoded.sock"));
-    let producer_task = tokio::spawn({
+    let mut producer_task = tokio::spawn({
         let session_socket = session_socket.clone();
         let session_id = session_id.clone();
         let bytes = bytes.clone();
@@ -1027,22 +1027,36 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
     anyhow::ensure!(output.status.success(),
         "retained-finalization-failure receiver failed: {}", String::from_utf8_lossy(&output.stderr));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    anyhow::ensure!(report["pass"] == true && report["browser_path"] == "webrtc_data_channel",
-        "retained-finalization-failure report not passing: {report}");
-    let receipt = &report["trigger_receipt"];
-    anyhow::ensure!(receipt["type"] == "error" && receipt["id"] == 200,
-        "the DataChannel rebind did not return a correlated error receipt: {receipt}");
-    anyhow::ensure!(receipt["code"] == "SESSION_MEDIA_FINALIZE_FAILED",
-        "the retained finalization failure was not projected to the DataChannel client: {receipt}");
-    anyhow::ensure!(receipt["message"].as_str().is_some_and(|message| message.contains("SESSION_ENCODER_PERMIT_UNSETTLED")),
-        "the retained finalization failure lost its cause: {receipt}");
-    anyhow::ensure!(report["frames_at_trigger"].as_u64().is_some_and(|count| count >= 1),
-        "the receiver had no frame before it triggered the rebind: {report}");
+    let verification = (|| -> anyhow::Result<()> {
+        anyhow::ensure!(report["pass"] == true && report["browser_path"] == "webrtc_data_channel",
+            "retained-finalization-failure report not passing: {report}");
+        let receipt = &report["trigger_receipt"];
+        anyhow::ensure!(receipt["type"] == "error" && receipt["id"] == 200,
+            "the DataChannel rebind did not return a correlated error receipt: {receipt}");
+        anyhow::ensure!(receipt["code"] == "SESSION_MEDIA_FINALIZE_FAILED",
+            "the retained finalization failure was not projected to the DataChannel client: {receipt}");
+        anyhow::ensure!(receipt["message"].as_str().is_some_and(|message| message.contains("SESSION_ENCODER_PERMIT_UNSETTLED")),
+            "the retained finalization failure lost its cause: {receipt}");
+        anyhow::ensure!(report["frames_at_trigger"].as_u64().is_some_and(|count| count >= 1),
+            "the receiver had no frame before it triggered the rebind: {report}");
+        Ok(())
+    })();
+    if let Err(error) = verification {
+        cleanup_final_failure_fixture(&p1_pid_file, &mut endpoint, &mut host, &mut producer_task, &root).await?;
+        return Err(error);
+    }
 
-    let mut endpoint = endpoint;
+    cleanup_final_failure_fixture(&p1_pid_file, &mut endpoint, &mut host, &mut producer_task, &root).await?;
+    Ok(())
+}
+
+async fn cleanup_final_failure_fixture(pid_file: &PathBuf, endpoint: &mut tokio::process::Child, host: &mut tokio::process::Child, producer_task: &mut tokio::task::JoinHandle<()>, root: &PathBuf) -> anyhow::Result<()> {
+    if pid_file.exists() {
+        let adapter_pid = wait_pid(pid_file, Duration::from_secs(30)).await?;
+        terminate_exact_pid("p1 fixture adapter", adapter_pid, Duration::from_secs(30)).await?;
+    }
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;
-    let mut host = host;
     let _ = host.kill().await;
     let _ = host.wait().await;
     producer_task.abort();
@@ -1090,6 +1104,45 @@ async fn wait_absent(path: &PathBuf, timeout: Duration) -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     Ok(())
+}
+
+async fn wait_pid(path: &PathBuf, timeout: Duration) -> anyhow::Result<i32> {
+    wait_file(path, timeout).await?;
+    let pid = std::fs::read_to_string(path)?.trim().parse::<i32>()?;
+    anyhow::ensure!(pid > 0, "fixture pid must be positive: {pid}");
+    Ok(pid)
+}
+
+async fn terminate_exact_pid(label: &str, pid: i32, timeout: Duration) -> anyhow::Result<()> {
+    // Safety: this signal targets the exact pid this fixture wrote.
+    anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGTERM) } == 0, "SIGTERM {label} pid {pid}");
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !pid_exited_or_zombie(pid) {
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::ensure!(unsafe { libc::kill(pid, libc::SIGKILL) } == 0, "SIGKILL {label} pid {pid}");
+            let kill_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !pid_exited_or_zombie(pid) {
+                anyhow::ensure!(tokio::time::Instant::now() < kill_deadline, "{label} pid {pid} survived SIGKILL");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+fn pid_exited_or_zombie(pid: i32) -> bool {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output();
+    match output {
+        Ok(output) => {
+            let stat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            stat.is_empty() || stat.starts_with("Z")
+        }
+        Err(_) => unsafe { libc::kill(pid, 0) != 0 },
+    }
 }
 
 async fn run_receiver(binary: &PathBuf, address: std::net::SocketAddr, root: &PathBuf, raw_root: &PathBuf, phase: &str, skip_click: bool, bad_binding: bool, expect_encoder_error: bool) -> anyhow::Result<std::process::Output> {

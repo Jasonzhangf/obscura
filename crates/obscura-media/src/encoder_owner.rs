@@ -6,7 +6,7 @@
 //! before reap, and stop/kill/reap on timeout or cancellation. No process id is
 //! ever recovered from stdout, stderr, a file or a log.
 
-use std::{path::Path, process::Stdio, time::Duration};
+use std::{path::Path, process::Stdio, time::{Duration, Instant}};
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -77,6 +77,9 @@ const REVOKE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const GROUP_GRACE: Duration = Duration::from_secs(1);
 /// Bounded leader reap deadline after group stop/kill.
 const REAP_DEADLINE: Duration = Duration::from_secs(3);
+/// Bounded window that an unresolved endpoint authority may remain pinned
+/// before the adapter reaches its explicit terminal outcome.
+pub const RETENTION_TERMINAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub enum EncoderStop {
@@ -111,6 +114,7 @@ pub struct EncoderChildOwner {
     control: EncoderControlClient,
     registration_id: u64,
     registration: RegistrationState,
+    retention_deadline: Option<Instant>,
 }
 
 impl EncoderChildOwner {
@@ -125,6 +129,7 @@ impl EncoderChildOwner {
             control: EncoderControlClient { reader: BufReader::new(read), writer: write },
             registration_id: 0,
             registration: RegistrationState::Unregistered,
+            retention_deadline: None,
         })
     }
 
@@ -360,6 +365,34 @@ impl EncoderChildOwner {
         } else {
             Ok(EncoderStop::Exited(status))
         }
+    }
+
+    /// Enter the unresolved endpoint-authority state and keep the exact child
+    /// retained for one bounded window. If the control resource is permanently
+    /// gone, this returns an explicit terminal instead of polling forever. The
+    /// child is deliberately not reaped here: only a typed `finalize` outcome
+    /// may clear the direct-child identity.
+    pub async fn retain_unresolved(&mut self, error: anyhow::Error) -> Result<EncoderStop> {
+        ensure!(self.has_live_child(), "No encoder child is retained");
+        ensure!(self.registration != RegistrationState::Unregistered,
+            "No endpoint registration is retained");
+        let deadline = match self.retention_deadline {
+            Some(deadline) => deadline,
+            None => {
+                let deadline = Instant::now() + RETENTION_TERMINAL_TIMEOUT;
+                self.retention_deadline = Some(deadline);
+                deadline
+            }
+        };
+        if Instant::now() >= deadline {
+            bail!("ENCODER_FINALIZATION_UNRESOLVED: endpoint authority was not retired within the bounded retention window: {error:#}");
+        }
+        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+        if !self.has_live_child() {
+            bail!("ENCODER_REGISTRATION_UNRESOLVED: encoder child was dropped before authority retirement");
+        }
+        ensure!(Instant::now() >= deadline, "Encoder retention window ended early");
+        bail!("ENCODER_FINALIZATION_UNRESOLVED: endpoint authority was not retired within the bounded retention window: {error:#}");
     }
 
     /// Reap the already-signalled leader and retire signal authority. This is
