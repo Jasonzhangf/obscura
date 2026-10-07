@@ -2,7 +2,9 @@
 
 use std::{path::PathBuf, time::Duration};
 
-use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, process::Command, net::TcpListener};
+use std::process::Stdio;
+
+use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, net::TcpListener, process::Command};
 use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}};
 
@@ -70,6 +72,16 @@ async fn active_receiver_observes_wss_detach_terminal() {
 async fn active_receiver_observes_wss_rebind_terminal_without_leak() {
     tokio::time::timeout(Duration::from_secs(240), run_terminal_lifecycle("wss-rebind"))
         .await.expect("WSS rebind terminal lifecycle timed out").unwrap();
+}
+
+/// A target session whose exact media binding could not be acquired must not
+/// be reported as a successful rebind. Over the DataChannel browser path the
+/// retained finalization failure has to become the correlated client error,
+/// exactly as the WSS control path returns it.
+#[tokio::test]
+async fn data_channel_rebind_projects_retained_finalization_failure() {
+    tokio::time::timeout(Duration::from_secs(240), run_retained_finalize_failure_data_channel())
+        .await.expect("retained finalization failure DataChannel case timed out").unwrap();
 }
 
 /// Two authorized receivers bound to two distinct Host profiles run at the same
@@ -212,9 +224,9 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     anyhow::ensure!(second_report["attachment_id"] != first_report["attachment_id"], "reconnect reused Host attachment identity");
 
     let mut endpoint = endpoint;
-    let mut host = host;
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;
+    let mut host = host;
     let _ = host.kill().await;
     let _ = host.wait().await;
     std::fs::remove_dir_all(root)?;
@@ -421,6 +433,7 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
     let mut endpoint = endpoint;
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;
+    let mut host = host;
     let _ = host.kill().await;
     let _ = host.wait().await;
     std::fs::remove_dir_all(root)?;
@@ -644,6 +657,7 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
     let mut endpoint = endpoint;
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;
+    let mut host = host;
     let _ = host.kill().await;
     let _ = host.wait().await;
     std::fs::remove_dir_all(root)?;
@@ -762,8 +776,277 @@ async fn run_two_session_isolation() -> anyhow::Result<()> {
     let mut endpoint = endpoint;
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;
+    let mut host = host;
     let _ = host.kill().await;
     let _ = host.wait().await;
+    std::fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+/// Real two-profile WebRTC regression with a retained failed target session.
+///
+/// The `p1` adapter acquires an encoder permit, never binds a pgid, and keeps
+/// the adapter alive through the endpoint's cooperative SIGTERM. The endpoint's
+/// `p1` media entry therefore runs its finalizer, cannot settle the permit, and
+/// is retained in `CompletionState::Failed`. A receiver on the default profile
+/// is then asked to rebind to `p1` over the authenticated DataChannel. The Host
+/// answers `ProfileSelected`; only the pre-dispatch acquisition result may turn
+/// that into the correlated `SESSION_MEDIA_FINALIZE_FAILED` error. Pre-fix the
+/// DataChannel path published the success and kept the failure on stderr.
+async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let root = PathBuf::from("/tmp").join(format!("ow-finalfail-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let raw_root = raw_webrtc_root("finalfail-dc");
+    std::fs::create_dir_all(&raw_root)?;
+    std::fs::write(raw_root.join("command.env"), format!(
+        "scenario=retained-finalization-failure-data-channel\nUTC={}\n",
+        std::process::Command::new("/bin/date").arg("-u").arg("+%Y-%m-%dT%H:%M:%SZ").output()
+            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .unwrap_or_default()
+    ))?;
+    let bind_ip = "127.0.0.1";
+    let ca_key = rcgen::KeyPair::generate()?;
+    let mut ca_params = rcgen::CertificateParams::new(vec![])?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Obscura final-failure CA");
+    let ca = ca_params.self_signed(&ca_key)?;
+    let server_key = rcgen::KeyPair::generate()?;
+    let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
+        .signed_by(&server_key, &ca, &ca_key)?;
+    let client_key = rcgen::KeyPair::generate()?;
+    let mut client_params = rcgen::CertificateParams::new(vec![])?;
+    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let client = client_params.signed_by(&client_key, &ca, &ca_key)?;
+    std::fs::write(root.join("server.der"), server.der())?;
+    std::fs::write(root.join("server.key"), server_key.serialize_der())?;
+    std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(root.join("ca.der"), ca.der())?;
+    std::fs::write(root.join("client.der"), client.der())?;
+    std::fs::write(root.join("client.key"), client_key.serialize_der())?;
+    std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
+    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"),
+        root.join("profiles"), &client.der().to_vec())?;
+
+    let mut host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+        .arg("--socket-dir").arg(root.join("host"))
+        .arg("--profile-root").arg(root.join("profiles"))
+        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
+        .kill_on_drop(true).spawn()?;
+    wait_socket(root.join("host/host.sock")).await;
+    let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await?;
+    let mut local = BufReader::new(local);
+    let mut line = String::new();
+    local.read_line(&mut line).await?;
+    let html = "data:text/html,<style>body{margin:0;background:white}</style><div style='width:160px;height:120px;background:red'></div>";
+    let mut state = local_request(&mut local, serde_json::json!({"id":1,"command":{"type":"attach","mode":"agent"}})).await?;
+    let session_id = state["session_id"].as_str().expect("Host session identity missing").to_owned();
+    state = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state),"command":{"type":"resize","width":160,"height":120}})).await?;
+    let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state),"command":{"type":"navigate","url":html}})).await?;
+    // Materialize the secondary profile and let its adapter fail so the
+    // endpoint retains a `CompletionState::Failed` entry for it.
+    let bound = local_request(&mut local, serde_json::json!({"id":4,"operation":identity(&state),"command":{"type":"profile_select","profile_id":"p1"}})).await?;
+    let secondary_session = bound["status"]["session_id"].as_str().expect("Host secondary session missing").to_owned();
+    anyhow::ensure!(session_id != secondary_session, "two profiles resolved to one session");
+    drop(local);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let reservation = TcpListener::bind((bind_ip, 0)).await?;
+    let address = reservation.local_addr()?;
+    drop(reservation);
+    let media_bin = release_binary("obscura-media");
+    let receiver_bin = release_binary("obscura-webrtc-receiver");
+    anyhow::ensure!(media_bin.is_file(), "Build release obscura-media with --features webrtc first");
+    anyhow::ensure!(receiver_bin.is_file(), "Build release obscura-webrtc-receiver with --features webrtc first");
+    // The wrapper is the real endpoint adapter entrypoint. It leaves the
+    // default profile to the test-owned encoded.sock producer and runs the
+    // failing adapter only for the already-materialized p1 session. The p1
+    // adapter acquires a permit, never binds a pgid, and ignores the
+    // endpoint's cooperative SIGTERM, so the real finalizer retains
+    // `CompletionState::Failed` with the exact unsettled permit.
+    let p1_marker = root.join("p1-session");
+    std::fs::write(&p1_marker, &secondary_session)?;
+    let p1_adapter = root.join("p1-adapter.py");
+    let p1_pid_file = root.join("p1-adapter.pid");
+    let p1_script = [
+        "#!/usr/bin/env python3",
+        "import json, os, signal, socket, sys, time",
+        "args = sys.argv[1:]",
+        "video = args[args.index('--video-socket') + 1]",
+        "control = os.path.dirname(video.rstrip('/')) + '/encoder-control.sock'",
+        &format!("pid_file = {pid:?}", pid = p1_pid_file.display().to_string()),
+        "def connect(path, timeout):",
+        "    handle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+        "    deadline = time.time() + timeout",
+        "    while True:",
+        "        try:",
+        "            handle.connect(path)",
+        "            return handle",
+        "        except OSError:",
+        "            if time.time() > deadline:",
+        "                raise",
+        "            time.sleep(0.05)",
+        "with open(pid_file, 'w') as handle:",
+        "    handle.write(str(os.getpid()))",
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+        "video_sock = connect(video, 20)",
+        "ctl = connect(control, 20)",
+        "ctl.sendall((json.dumps({'op': 'acquire', 'registration_id': 1}) + '\\n').encode())",
+        "buf = b''",
+        "while b'\\n' not in buf:",
+        "    chunk = ctl.recv(4096)",
+        "    if not chunk:",
+        "        raise SystemExit(3)",
+        "    buf += chunk",
+        "response = json.loads(buf.split(b'\\n', 1)[0])",
+        "if response.get('op') != 'acquire' or response.get('permit') != 'granted':",
+        "    raise SystemExit(4)",
+        "while True:",
+        "    time.sleep(0.2)",
+        "",
+    ].join("\n");
+    std::fs::write(&p1_adapter, p1_script)?;
+    std::fs::set_permissions(&p1_adapter, std::fs::Permissions::from_mode(0o755))?;
+    let adapter = root.join("adapter-wrapper.py");
+    let marker_literal = format!("{:?}", p1_marker.display().to_string());
+    let p1_literal = format!("{:?}", p1_adapter.display().to_string());
+    let wrapper = format!(
+        "#!/usr/bin/env python3\nimport os, sys\nargs = sys.argv[1:]\nvideo = args[args.index('--video-socket') + 1] if '--video-socket' in args else ''\nmarker = open({marker}).read().strip()\nif marker and marker in video:\n    os.execv(sys.executable, [sys.executable, {p1}] + args)\nos.execv('/usr/bin/true', ['true'] + args)\n",
+        marker = marker_literal,
+        p1 = p1_literal
+    );
+    std::fs::write(&adapter, wrapper)?;
+    std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755))?;
+    let mut endpoint = Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"))
+        .arg("--listen").arg(address.to_string())
+        .arg("--host-dir").arg(root.join("host"))
+        .arg("--socket-dir").arg(root.join("endpoint"))
+        .arg("--server-cert").arg(root.join("server.der"))
+        .arg("--server-key").arg(root.join("server.key"))
+        .arg("--client-ca").arg(root.join("ca.der"))
+        .arg("--media-bin").arg(&adapter)
+        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
+        .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip)
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(raw_root.join("endpoint.stderr"))?)
+        .kill_on_drop(true).spawn()?;
+    std::fs::write(raw_root.join("endpoint.pid"), endpoint.id().expect("endpoint pid").to_string())?;
+    wait_socket(root.join("endpoint")).await;
+
+    // Keep a real default-session source available while the prime attachment
+    // selects p1 and closes. The endpoint creates the exact encoded socket only
+    // after that attachment is admitted.
+    let bytes = obscura_media::encode(std::path::Path::new("ffmpeg"), 160, 120, scripted_scene(160, 120)).await?;
+    anyhow::ensure!(!bytes.is_empty(), "finalization-failure producer got no access unit");
+    let session_socket = root.join(format!("endpoint/session-{session_id}/encoded.sock"));
+    let producer_task = tokio::spawn({
+        let session_socket = session_socket.clone();
+        let session_id = session_id.clone();
+        let bytes = bytes.clone();
+        async move {
+            let mut sequence = 1u64;
+            loop {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+                while !session_socket.exists() {
+                    if tokio::time::Instant::now() >= deadline {
+                        eprintln!("default encoded socket did not reappear for the retained-failure rebind");
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                let Ok(mut producer) = tokio::net::UnixStream::connect(&session_socket).await else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                };
+                loop {
+                    let packet = scripted_access_unit(&session_id, sequence, bytes.len() as u64);
+                    if send_video_packet(&mut producer, &packet, &bytes).await.is_err() { break; }
+                    sequence = sequence.wrapping_add(1);
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    });
+
+    let prime_ready = root.join("ready-prime.json");
+    let mut prime_command = Command::new(&receiver_bin);
+    prime_command.arg("--address").arg(address.to_string())
+        .arg("--ca").arg(root.join("ca.der"))
+        .arg("--client-cert").arg(root.join("client.der"))
+        .arg("--client-key").arg(root.join("client.key"))
+        .arg("--bind-ip").arg(bind_ip)
+        .arg("--frames").arg("3").arg("--skip-click")
+        .arg("--terminal-trigger").arg("prime-finalize-failed")
+        .arg("--terminal-transport").arg("data-channel")
+        .arg("--ready-file").arg(&prime_ready)
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let prime_output = prime_command.output().await?;
+    let prime_dir = raw_root.join("prime");
+    std::fs::create_dir_all(&prime_dir)?;
+    std::fs::write(prime_dir.join("stdout.txt"), &prime_output.stdout)?;
+    std::fs::write(prime_dir.join("stderr.txt"), &prime_output.stderr)?;
+    std::fs::write(prime_dir.join("exit.txt"), format!("EXIT={:?}\n", prime_output.status.code()))?;
+    anyhow::ensure!(prime_output.status.success(),
+        "p1 prime attachment failed: {}", String::from_utf8_lossy(&prime_output.stderr));
+
+    // The prime attachment has closed. Wait for the endpoint's real finalizer
+    // to publish the retained failure before the DataChannel rebind.
+    let secondary_dir = root.join(format!("endpoint/session-{secondary_session}"));
+    wait_socket_deadline(secondary_dir.join("encoded.sock"), Duration::from_secs(30)).await?;
+    let endpoint_stderr_path = raw_root.join("endpoint.stderr");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let stderr = std::fs::read_to_string(&endpoint_stderr_path).unwrap_or_default();
+        if stderr.contains("SESSION_ENCODER_PERMIT_UNSETTLED") { break; }
+        anyhow::ensure!(tokio::time::Instant::now() < deadline,
+            "p1 finalizer did not publish a retained failure: {stderr}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let ready_file = root.join("ready-finalfail.json");
+    let mut command = Command::new(&receiver_bin);
+    command.arg("--address").arg(address.to_string())
+        .arg("--ca").arg(root.join("ca.der"))
+        .arg("--client-cert").arg(root.join("client.der"))
+        .arg("--client-key").arg(root.join("client.key"))
+        .arg("--bind-ip").arg(bind_ip)
+        .arg("--frames").arg("3").arg("--skip-click")
+        .arg("--terminal-trigger").arg("rebind-finalize-failed")
+        .arg("--terminal-transport").arg("data-channel")
+        .arg("--ready-file").arg(&ready_file)
+        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    let output = command.output().await?;
+    let phase_dir = raw_root.join("receiver");
+    std::fs::create_dir_all(&phase_dir)?;
+    std::fs::write(phase_dir.join("stdout.txt"), &output.stdout)?;
+    std::fs::write(phase_dir.join("stderr.txt"), &output.stderr)?;
+    std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", output.status.code()))?;
+    anyhow::ensure!(output.status.success(),
+        "retained-finalization-failure receiver failed: {}", String::from_utf8_lossy(&output.stderr));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    anyhow::ensure!(report["pass"] == true && report["browser_path"] == "webrtc_data_channel",
+        "retained-finalization-failure report not passing: {report}");
+    let receipt = &report["trigger_receipt"];
+    anyhow::ensure!(receipt["type"] == "error" && receipt["id"] == 200,
+        "the DataChannel rebind did not return a correlated error receipt: {receipt}");
+    anyhow::ensure!(receipt["code"] == "SESSION_MEDIA_FINALIZE_FAILED",
+        "the retained finalization failure was not projected to the DataChannel client: {receipt}");
+    anyhow::ensure!(receipt["message"].as_str().is_some_and(|message| message.contains("SESSION_ENCODER_PERMIT_UNSETTLED")),
+        "the retained finalization failure lost its cause: {receipt}");
+    anyhow::ensure!(report["frames_at_trigger"].as_u64().is_some_and(|count| count >= 1),
+        "the receiver had no frame before it triggered the rebind: {report}");
+
+    let mut endpoint = endpoint;
+    let _ = endpoint.kill().await;
+    let _ = endpoint.wait().await;
+    let mut host = host;
+    let _ = host.kill().await;
+    let _ = host.wait().await;
+    producer_task.abort();
+    let _ = producer_task.await;
     std::fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -1011,6 +1294,16 @@ async fn wait_socket(path: PathBuf) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+async fn wait_socket_deadline(path: PathBuf, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !path.exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "listener did not initialize: {} within {timeout:?}", path.display());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    Ok(())
 }
 
 #[allow(dead_code)]

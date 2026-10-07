@@ -434,3 +434,118 @@ fn write_authorized(
     std::fs::write(profile_root.join("catalog.json"), serde_json::to_string_pretty(&catalog)?)?;
     Ok(())
 }
+
+#[tokio::test]
+async fn real_endpoint_live_adapter_revoke_waits_for_endpoint_authority() {
+    tokio::time::timeout(Duration::from_secs(180), revoke_during_endpoint_cleanup())
+        .await
+        .expect("F4.2 case timed out")
+        .expect("F4.2 case failed");
+}
+
+/// F4.2: a live adapter that requests `Revoke` while the real endpoint owns the
+/// group cleanup must not reap its leader before the endpoint retires signal
+/// authority. The endpoint's typed revoke acknowledgement is the public signal
+/// that authority is retired: `stop_armed_encoder_group` moves the registration
+/// to `Revoking`, signals the group, and only calls `mark_revoked` after the
+/// group settles. The group here ignores SIGTERM, so the endpoint spends its
+/// full two second SIGTERM grace in `Revoking`; an adapter that reaped without
+/// waiting would drop the leader inside its own one second grace.
+async fn revoke_during_endpoint_cleanup() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("ob10d")?;
+    let root = fixture.root.clone();
+    let mut host = fixture.start_host().await?;
+
+    let group_pgid = root.join("group.pgid");
+    let adapter_pid_file = root.join("adapter.pid");
+    let group_signals = root.join("group.signals");
+    let helper = root.join("group.sh");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{pgid}'\nprintf '%s\\n' \"$PPID\" > '{adapter}'\ntrap 'printf \"15\\n\" >> \"{signals}\"' TERM\nwhile :; do sleep 0.05; done\n",
+        pgid = group_pgid.display(),
+        adapter = adapter_pid_file.display(),
+        signals = group_signals.display(),
+    );
+    std::fs::write(&helper, script)?;
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))?;
+
+    let mut endpoint = fixture.endpoint(Some(&helper))?;
+    wait_socket(root.join("endpoint")).await;
+
+    let connector = fixture.connector()?;
+    let (mut control_socket, _token) = connect_control(&connector, fixture.address()).await?;
+    let ready = next_json(&mut control_socket).await?;
+    anyhow::ensure!(ready["session_id"].as_str() == Some(fixture.session_id().as_str()), "Ready session changed: {ready}");
+    control_socket.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
+    let attached = next_json(&mut control_socket).await?;
+    anyhow::ensure!(attached["type"] == "result", "observe attach failed: {attached}");
+
+    wait_file(&group_pgid, Duration::from_secs(60)).await?;
+    wait_file(&adapter_pid_file, Duration::from_secs(15)).await?;
+    let adapter_pid: i32 = std::fs::read_to_string(&adapter_pid_file)?.trim().parse()?;
+    let pgid = read_pgid(&group_pgid)?;
+    // Let the real adapter commit `Armed` and block inside the encode.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    anyhow::ensure!(process_group_alive(pgid), "the registered group died before the endpoint took authority");
+
+    // Release the final control reference. The real endpoint finalizer moves the
+    // registration to `Revoking`, takes signal authority and signals the group.
+    control_socket.send(Message::Close(None)).await?;
+    drop(control_socket);
+    let signals = wait_signals(&group_signals, Duration::from_secs(20)).await?;
+    anyhow::ensure!(signals.contains("15"),
+        "F4.2: the endpoint did not take signal authority over the registered group: {signals:?}");
+    anyhow::ensure!(process_group_alive(pgid), "the group settled before the adapter requested revoke");
+
+    // Interrupt the live adapter. Its `finalize()` must request revoke and wait
+    // for the endpoint's typed acknowledgement before it reaps the leader.
+    anyhow::ensure!(unsafe { libc::kill(adapter_pid, libc::SIGTERM) } == 0, "SIGTERM the live adapter");
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    anyhow::ensure!(process_group_alive(pgid),
+        "F4.2: the adapter reaped the registered leader before the endpoint retired signal authority");
+    anyhow::ensure!(process_alive(adapter_pid),
+        "F4.2: the adapter exited before it consumed the endpoint's revoke acknowledgement");
+
+    // The endpoint's SIGTERM grace ends, `mark_revoked` retires authority, the
+    // adapter consumes the acknowledgement and reaps the retained leader.
+    anyhow::ensure!(wait_group_reaped(pgid, Duration::from_secs(15)).await,
+        "F4.2: the adapter never reaped the retained leader");
+    anyhow::ensure!(wait_process_gone(adapter_pid, Duration::from_secs(15)).await,
+        "F4.2: the adapter did not exit after reaping its leader");
+
+    let session_dir = root.join(format!("endpoint/session-{}", fixture.session_id()));
+    wait_dir_gone(&session_dir, Duration::from_secs(20)).await?;
+    eprintln!("F4.2: live adapter revoke waited for endpoint authority before leader reap");
+
+    let _ = endpoint.kill().await;
+    let _ = endpoint.wait().await;
+    let _ = host.kill().await;
+    let _ = host.wait().await;
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+fn group_reaped(pgid: i32) -> bool {
+    // Safety: signal 0 performs an existence/permission check only.
+    let result = unsafe { libc::kill(-pgid, 0) };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
+async fn wait_group_reaped(pgid: i32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if group_reaped(pgid) { return true; }
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_process_gone(pid: i32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !process_alive(pid) { return true; }
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}

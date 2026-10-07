@@ -229,7 +229,7 @@ pub async fn control(
                 let result = forward_remote_request(&mut write, &mut reader, request).await?;
                 let terminal_denial = is_terminal_authorization_denial(&result, request_id);
                 let admitted = active.borrow().clone();
-                let terminal = terminal_response(&admitted, &result, request_id);
+                let mut terminal = terminal_response(&admitted, &result, request_id);
                 // Commit the terminal disposition and the reserved terminal
                 // dispatch BEFORE the media fence, so closing the filtered frame
                 // watch cannot end `run_inner` before the correlated response is
@@ -242,11 +242,38 @@ pub async fn control(
                 if terminal_denial {
                     fence_media_state(&active);
                 }
+                let detached = update_media_state(&active, &result);
+                // Resolve the exact media binding before publishing the Host
+                // result. A retained finalization failure is an explicit
+                // attachment terminal: the client must not receive the
+                // published ProfileSelected success for a session whose media
+                // binding could not be acquired. A terminal authorization
+                // denial is fenced separately and must still receive its
+                // correlated response before attachment cleanup.
+                let mut response = result.clone();
+                let mut finalization_terminal = false;
+                if !terminal_denial {
+                    if let Err(error) = reconcile_binding(&grant, &active, &mut binding).await {
+                        match error {
+                            AcquireError::FinalizationFailed(failure) => {
+                                response = media_binding_failure(request_id, &failure);
+                                finalization_terminal = true;
+                            }
+                            AcquireError::Acquire(error) => eprintln!("media binding acquire failed: {error:#}"),
+                        }
+                    }
+                }
+                if finalization_terminal {
+                    terminal = true;
+                    let _ = terminal_pending.as_ref().context("WebRTC terminal-pending sender unavailable")?
+                        .send(true);
+                    fence_media_state(&active);
+                }
                 let response_tx = browser_responses.as_ref().context("WebRTC browser response pump unavailable")?;
                 if terminal {
                     let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
                     response_tx.send(BrowserResponseDispatch::Terminal {
-                        response: result.clone(),
+                        response: response.clone(),
                         completion: completion_tx,
                     }).await.context("WebRTC terminal browser response receiver ended before terminal dispatch")?;
                     match tokio::time::timeout(SETTLEMENT_DEADLINE, completion_rx).await {
@@ -256,24 +283,14 @@ pub async fn control(
                         Err(_) => bail!("WebRTC terminal browser response settlement deadline exceeded"),
                     }
                 } else {
-                    response_tx.send(BrowserResponseDispatch::Ordinary(result.clone())).await
+                    response_tx.send(BrowserResponseDispatch::Ordinary(response)).await
                         .context("WebRTC browser response receiver ended")?;
                 }
-                let detached = update_media_state(&active, &result);
                 if terminal_denial {
                     release_binding(&grant, &mut binding).await;
                     fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
                         &mut browser_responses, &mut terminal_pending);
                     continue;
-                }
-                if let Err(error) = reconcile_binding(&grant, &active, &mut binding).await {
-                    // The browser response is already dispatched on this path;
-                    // surface the retained failure for diagnosis without
-                    // abandoning the surviving WebRTC/control attachment.
-                    match error {
-                        AcquireError::FinalizationFailed(failure) => eprintln!("media binding finalization failed: {failure}"),
-                        AcquireError::Acquire(error) => eprintln!("media binding acquire failed: {error:#}"),
-                    }
                 }
                 if terminal || detached {
                     fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,

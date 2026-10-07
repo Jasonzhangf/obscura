@@ -275,25 +275,6 @@ impl EncoderChildOwner {
     pub fn has_live_child(&self) -> bool {
         self.child.is_some()
     }
-
-    /// Relinquish direct-child ownership without killing, reaping or signalling
-    /// the group. It is used only when endpoint signal authority is still
-    /// unsettled: the leader must survive this adapter's exit so the endpoint
-    /// can finish the acknowledged cleanup. Forgetting the retained `Child`
-    /// disarms its `kill_on_drop`, and clearing the group identity makes any
-    /// later signal from this owner impossible. Returns the abandoned pgid.
-    pub fn relinquish_live_child(&mut self) -> Option<i32> {
-        let pgid = self.group.take();
-        if let Some(child) = self.child.take() {
-            // `Child::drop` with `kill_on_drop(true)` would SIGKILL the leader;
-            // forgetting the handle leaves the process running for the endpoint
-            // that still owns signal authority over it.
-            std::mem::forget(child);
-        }
-        self.registration = RegistrationState::Unregistered;
-        pgid
-    }
-
     /// Cooperative group stop/kill/reap for a registered group. It revokes
     /// before reaping the leader so the endpoint signal cannot address a
     /// reused process id.

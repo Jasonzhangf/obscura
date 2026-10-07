@@ -487,14 +487,40 @@ async fn run_terminal_mode(
                     let response = fence(data_channel, control, control_rx, track, media, session_id, transport, request, deadline).await?;
                     trigger_receipt = Some(serde_json::to_value(response)?);
                 }
-                "rebind" => {
+                "rebind" | "rebind-finalize-failed" => {
                     let request = Request {
                         id: TRIGGER_REQUEST_ID,
                         command: Command::ProfileSelect { profile_id: "p1".into() },
                         operation: Some(operation_for(status)?),
                     };
                     let response = fence(data_channel, control, control_rx, track, media, session_id, transport, request, deadline).await?;
-                    trigger_receipt = Some(serde_json::to_value(response)?);
+                    trigger_receipt = Some(serde_json::to_value(response.clone())?);
+                    if trigger == "rebind-finalize-failed" {
+                        expect_error(response, "SESSION_MEDIA_FINALIZE_FAILED")?;
+                    }
+                }
+                "prime-finalize-failed" => {
+                    let request = Request {
+                        id: TRIGGER_REQUEST_ID,
+                        command: Command::ProfileSelect { profile_id: "p1".into() },
+                        operation: Some(operation_for(status)?),
+                    };
+                    let response = fence(data_channel, control, control_rx, track, media, session_id, transport, request, deadline).await?;
+                    trigger_receipt = Some(serde_json::to_value(response.clone())?);
+                    println!("{}", serde_json::json!({
+                        "pass": true,
+                        "browser_path": "webrtc_data_channel",
+                        "session_id": session_id,
+                        "attachment_id": attachment_id,
+                        "trigger": trigger,
+                        "trigger_receipt": trigger_receipt,
+                    }));
+                    // Keep the peer alive briefly after the prime response. The
+                    // pre-fix control path dispatches the response before it
+                    // acquires the rebound binding, so this lets that path
+                    // reach the same retained-finalization state as the fix.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    return Ok(());
                 }
                 "detach-backpressure" => {
                     send_control(data_channel, &WebRtcControlMessage::BrowserRequest {
