@@ -208,11 +208,19 @@ async fn standalone_adapter_resolves_pending_registration_before_reaping() {
 
     let pid = child.id().expect("adapter pid") as i32;
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "SIGTERM the standalone adapter");
-    // Hold the Register acknowledgement until the adapter has observed the
-    // lifetime signal and dropped the in-flight registration. The endpoint
-    // committed `Armed` before it answered, so an adapter that treats the unread
-    // acknowledgement as unregistered reaps the leader without resolving it.
+    // Hold the Register acknowledgement while the adapter observes the lifetime
+    // signal and enters its ownership-preserving retention boundary. The
+    // endpoint committed `Armed` before it answered, so an adapter that treats
+    // the unread acknowledgement as unregistered reaps the leader here, before
+    // the typed revoke is even requested.
     tokio::time::sleep(Duration::from_millis(1000)).await;
+    // Observable pre-ack retention assertion: while the acknowledgement is
+    // still withheld, no reap has happened. The wrapper spawned a live `sleep`
+    // tree in the registered group, so that exact group must still exist. An
+    // adapter that treats the unread acknowledgement as an unregistered group
+    // reaps the retained leader here, before the acknowledgement is released.
+    assert!(group_alive(pgid),
+        "G2: the adapter reaped the retained leader while the Register acknowledgement was still withheld");
     let _ = ack_tx.send(());
 
     let saw_revoke = tokio::time::timeout(Duration::from_secs(10), revoke_rx)

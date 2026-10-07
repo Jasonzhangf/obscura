@@ -57,80 +57,6 @@ async fn serve_control(listener: UnixListener) {
     }
 }
 
-/// Real control peer that grants acquisition, commits registration, then closes
-/// the stream without answering `Revoke`. The adapter therefore reaches an
-/// explicit unresolved revoke terminal.
-async fn serve_control_register_then_close(listener: UnixListener) {
-    let Ok((stream, _)) = listener.accept().await else { return; };
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
-    loop {
-        let mut line = String::new();
-        let count = match reader.read_line(&mut line).await { Ok(count) => count, Err(_) => return };
-        if count == 0 { return; }
-        let request: EncoderControlRequest = match serde_json::from_str(line.trim_end()) { Ok(request) => request, Err(_) => return };
-        let response = match request {
-            EncoderControlRequest::Acquire { .. } => EncoderControlResponse::Acquire { permit: EncoderPermit::Granted },
-            EncoderControlRequest::Register { .. } => EncoderControlResponse::Register { refused: false },
-            EncoderControlRequest::Revoke { .. } => return,
-            EncoderControlRequest::Settle { .. } => EncoderControlResponse::Settle,
-        };
-        let mut bytes = serde_json::to_vec(&response).unwrap();
-        bytes.push(b'\n');
-        if write.write_all(&bytes).await.is_err() { return; }
-        if matches!(request, EncoderControlRequest::Register { .. }) { return; }
-    }
-}
-
-/// Real control peer that answers `Acquire`, answers `Register`, then
-/// closes without answering the outstanding `Revoke`.
-/// The adapter therefore reaches an unresolved revoke terminal.
-async fn serve_control_register_unanswered(listener: UnixListener) {
-    let Ok((stream, _)) = listener.accept().await else { return; };
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
-    loop {
-        let mut line = String::new();
-        let count = match reader.read_line(&mut line).await { Ok(count) => count, Err(_) => return };
-        if count == 0 { return; }
-        let request: EncoderControlRequest = match serde_json::from_str(line.trim_end()) { Ok(request) => request, Err(_) => return };
-        let response = match request {
-            EncoderControlRequest::Acquire { .. } => EncoderControlResponse::Acquire { permit: EncoderPermit::Granted },
-            EncoderControlRequest::Register { .. } => {
-                let mut pending = serde_json::to_vec(&EncoderControlResponse::Register { refused: false }).unwrap();
-                pending.push(b'\n');
-                let _ = write.write_all(&pending).await;
-                return;
-            }
-            EncoderControlRequest::Revoke { .. } => EncoderControlResponse::Revoke { refused: false },
-            EncoderControlRequest::Settle { .. } => EncoderControlResponse::Settle,
-        };
-        let mut bytes = serde_json::to_vec(&response).unwrap();
-        bytes.push(b'\n');
-        if write.write_all(&bytes).await.is_err() { return; }
-    }
-}
-
-/// Write a wrapper encoder whose leader exits on its own while a same-group
-/// descendant records whether the leader is still present. When the leader is
-/// reaped before acknowledgement, `leader_gone` is written while the
-/// descendant is still alive.
-fn write_leader_retention_probe(root: &Path, name: &str, marker: &Path) -> PathBuf {
-    let observer = root.join(format!("{name}-observer.sh"));
-    let ready = root.join(format!("{name}.ready"));
-    write_executable(&observer, &format!(
-        "#!/bin/sh\nleader=\"$1\"\nmarker=\"$2\"\nready=\"$3\"\n: > \"$ready\"\necho leader_alive > \"$marker\"\nwhile kill -0 \"$leader\" 2>/dev/null; do sleep 0.01; done\necho leader_gone > \"$marker\"\nexit 0\n"
-    ));
-    let wrapper = root.join(format!("{name}.sh"));
-    write_executable(&wrapper, &format!(
-        "#!/bin/sh\nleader=$$\nsh '{observer}' \"$leader\" '{marker}' '{ready}' </dev/null >/dev/null 2>&1 &\nwhile [ ! -f '{ready}' ]; do sleep 0.02; done\nexec 1>&- 2>&-\nsleep 1\nexit 0\n",
-        observer = observer.display(),
-        marker = marker.display(),
-        ready = ready.display(),
-    ));
-    wrapper
-}
-
 async fn write_frame(socket: &mut UnixStream, packet: &FramePacket, pixels: &[u8]) {
     let mut header = serde_json::to_vec(packet).unwrap();
     header.push(b'\n');
@@ -474,204 +400,395 @@ async fn standalone_adapter_pins_leader_identity_until_group_settled() {
         "F3: the encoder leader was reaped while a same-group descendant was still alive, so the escalation signalled a reaped identity");
 }
 
-/// F2: when the endpoint commits a registration but the revoke acknowledgement
-/// is never delivered, the standalone adapter must keep direct-child ownership
-/// until the typed authority retires. It may not drop its retained `Child`
-/// (SIGKILL/reap without acknowledgement) and it may not forget it and exit
-/// (the OS then reaps an already-exited leader early, releasing the numeric
-/// identity during the endpoint's group-signaling window). The same-group
-/// observer records whether the leader survived.
-#[tokio::test]
-async fn standalone_adapter_preserves_leader_when_revoke_acknowledgment_is_unavailable() {
-    let dir = Directory::new();
-    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
-    let video = UnixListener::bind(dir.0.join("video")).unwrap();
-    let control = UnixListener::bind(dir.0.join("encoder-control.sock")).unwrap();
-    std::fs::set_permissions(dir.0.join("encoder-control.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
-    drop(tokio::spawn(serve_control_register_then_close(control)));
-
-    let marker = dir.0.join("leader-retention.marker");
-    let pgid_file = dir.0.join("leader.pgid");
-    let wrapper = write_leader_retention_probe(&dir.0, "leaderretention", &marker);
-    let wrapper = {
-        let wrapper = wrapper.display().to_string();
-        let pgid = pgid_file.display().to_string();
-        let wrapper_text = format!(
-            "#!/bin/sh\necho \"$$\" > {pgid}\nexec {wrapper}\n",
-        );
-        let wrapper_path = dir.0.join("leaderretention-pgid.sh");
-        write_executable(&wrapper_path, &wrapper_text);
-        wrapper_path
-    };
-
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
-    command.arg("--frames-socket").arg(dir.0.join("raw"))
-        .arg("--video-socket").arg(dir.0.join("video"))
-        .arg("--ffmpeg").arg(&wrapper);
-    let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
-    let (mut source, _) = raw.accept().await.unwrap();
-    let mut receiver = BufReader::new(video.accept().await.unwrap().0);
-
-    let (packet, pixels) = frame(64, 48);
-    write_frame(&mut source, &packet, &pixels).await;
-    let (reply, _) = tokio::time::timeout(Duration::from_secs(15), read_video(&mut receiver)).await
-        .expect("the adapter never emitted a packet for the unresolved revoke");
-    assert!(matches!(reply, VideoPacket::EncoderUnavailable { .. }),
-        "unresolved revoke must emit EncoderUnavailable, got {reply:?}");
-
-    let pgid: i32 = std::fs::read_to_string(&pgid_file).unwrap().trim().parse().unwrap();
-    // The leader exits on its own after the acknowledgment gap. `ps` proves it is
-    // already a zombie, while the adapter remains its direct parent and still
-    // pins the exact numeric identity.
-    assert!(wait_leader_zombie(pgid, Duration::from_secs(10)).await,
-        "the retained leader did not become an unreaped zombie; the adapter released its identity before the assertion");
-    assert_eq!(unsafe { libc::kill(child.id().expect("adapter pid") as i32, 0) }, 0,
-        "F2: the adapter exited before retaining the already-exited leader");
-    assert!(unsafe { libc::kill(pgid, 0) } == 0,
-        "F2: an already-exited leader identity was released before endpoint authority settled");
-    unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
-        "F2: the test fixture encoder group survived explicit teardown");
-    let pid = child.id().expect("adapter pid") as i32;
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "SIGTERM the fixture adapter");
-    let _ = child.wait().await;
-}
-
-/// F1: a failed terminal send must not drop the retained owner. The encoded
-/// consumer closes after the leader is spawned, so the adapter emits
-/// `EncoderUnavailable` to a dead socket and the two-second send deadline
-/// expires. The unresolved revoke still owes endpoint signal authority,
-/// so the adapter must keep the leader pinned instead of returning from main.
-/// A SIGTERM interruption while in that state must take the same retained
-/// ownership path, not a second parallel retention path.
-#[tokio::test]
-async fn standalone_adapter_retains_child_when_terminal_send_and_registration_are_unavailable() {
-    let dir = Directory::new();
-    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
-    let video = UnixListener::bind(dir.0.join("video")).unwrap();
-    let control = UnixListener::bind(dir.0.join("encoder-control.sock")).unwrap();
-    std::fs::set_permissions(dir.0.join("encoder-control.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
-    drop(tokio::spawn(serve_control_register_unanswered(control)));
-
-    let pgid_file = dir.0.join("terminal-send.pgid");
-    let wrapper = dir.0.join("terminal-send.sh");
-    write_executable(&wrapper, &format!(
-        "#!/bin/sh\necho \"$$\" > {pgid}\nexec 1>&- 2>&-\nwhile :; do sleep 0.1; done\n",
-        pgid = pgid_file.display()
-    ));
-
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
-    command.arg("--frames-socket").arg(dir.0.join("raw"))
-        .arg("--video-socket").arg(dir.0.join("video"))
-        .arg("--ffmpeg").arg(&wrapper);
-    let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
-    let (mut source, _) = raw.accept().await.unwrap();
-    // The encoded consumer closes before reading, so the terminal failure send
-    // fails instead of succeeding.
-    drop(video.accept().await.unwrap().0);
-
-    let (packet, pixels) = frame(64, 48);
-    write_frame(&mut source, &packet, &pixels).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while !pgid_file.exists() {
-        assert!(tokio::time::Instant::now() < deadline, "terminal-send fixture never wrote its pgid");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let pgid: i32 = std::fs::read_to_string(&pgid_file).unwrap().trim().parse().unwrap();
-    let stderr_pipe = child.stderr.take().expect("adapter stderr pipe");
-    let stderr_task = tokio::spawn(async move {
-        let mut stderr_pipe = stderr_pipe;
-        let mut buffer = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buffer).await;
-        String::from_utf8_lossy(&buffer).into_owned()
-    });
-    let status = tokio::time::timeout(Duration::from_secs(20), child.wait()).await
-        .map_err(|_| panic!("F1: the adapter did not reach its bounded terminal"))
-        .unwrap()
-        .unwrap();
-    assert!(!status.success(), "F1: the bounded unresolved terminal must fail the adapter");
-    let stderr = tokio::time::timeout(Duration::from_secs(5), stderr_task).await
-        .expect("adapter stderr did not close after bounded terminal")
-        .unwrap();
-    assert!(stderr.contains("ENCODER_FINALIZATION_UNRESOLVED"),
-        "F1: the adapter exited without the typed unresolved endpoint-authority terminal:\n{stderr}");
-    assert!(stderr.contains("Encoded media consumer"),
-        "F1: the terminal lost the failed notification send:\n{stderr}");
-
-    // Interrupt in the retained state. The interrupt path must not forget the
-    // child and exit either.
-    unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
-        "F1: the test fixture encoder group survived explicit teardown");
-}
-
-/// F1: a failed terminal notification must still route through
-/// `terminal_ownership_exit`. The encoded consumer closes after the leader is
-/// spawned, so the `EncoderUnavailable` send fails. The unresolved revoke
-/// keeps the terminal unresolved, so the adapter must retain direct ownership
-/// while preserving both the original encode error and the send error.
-#[tokio::test]
-async fn standalone_adapter_keeps_ownership_and_reports_send_failure_when_terminal_notification_cannot_be_sent() {
-    let dir = Directory::new();
-    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
-    let video = UnixListener::bind(dir.0.join("video")).unwrap();
-    let control = UnixListener::bind(dir.0.join("encoder-control.sock")).unwrap();
-    std::fs::set_permissions(dir.0.join("encoder-control.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
-    drop(tokio::spawn(serve_control_register_then_close(control)));
-
-    let pgid_file = dir.0.join("send-failure.pgid");
-    let wrapper = dir.0.join("send-failure.sh");
-    write_executable(&wrapper, &format!(
-        "#!/bin/sh\necho \"$$\" > {pgid}\nexec 1>&- 2>&-\nsleep 1\nwhile :; do sleep 0.1; done\n",
-        pgid = pgid_file.display()
-    ));
-
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
-    command.arg("--frames-socket").arg(dir.0.join("raw"))
-        .arg("--video-socket").arg(dir.0.join("video"))
-        .arg("--ffmpeg").arg(&wrapper);
-    let mut child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
-    let (mut source, _) = raw.accept().await.unwrap();
-    // Accept the encoded stream but close it immediately, so every send to the
-    // encoded consumer fails.
-    drop(video.accept().await.unwrap().0);
-
-    let (packet, pixels) = frame(64, 48);
-    write_frame(&mut source, &packet, &pixels).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    while !pgid_file.exists() {
-        assert!(tokio::time::Instant::now() < deadline, "send-failure fixture never wrote its pgid");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let pgid: i32 = std::fs::read_to_string(&pgid_file).unwrap().trim().parse().unwrap();
-    // The wrapper leader exits on its own. The adapter must first stay alive as
-    // the direct parent, then retain the exited leader as an unreaped zombie.
-    // Checking the pgid after the adapter exits would release that zombie.
-    let leader_alive = tokio::time::timeout(Duration::from_secs(20), async {
-        while !group_alive(pgid) {
-            assert!(child.try_wait().unwrap().is_none(),
-                "F1: the adapter exited while the live leader was still present");
-            tokio::time::sleep(Duration::from_millis(20)).await;
+/// A real control peer that grants `Acquire`, commits `Register`, then holds the
+/// connection open without answering `Revoke`. While it holds, endpoint signal
+/// authority over the registered group is unresolved, so the adapter must keep
+/// its retained direct child pinned. Sending on `retire` closes the peer's side
+/// of the connection. That close is the actual authority-retirement edge the
+/// adapter waits for before it settles the group locally and reaps the leader.
+async fn serve_control_hold_until_retired(
+    listener: UnixListener,
+    retire: tokio::sync::oneshot::Receiver<()>,
+    retired: tokio::sync::oneshot::Sender<()>,
+) {
+    let Ok((stream, _)) = listener.accept().await else { let _ = retired.send(()); return; };
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let mut retire = std::pin::pin!(retire);
+    loop {
+        let mut line = String::new();
+        let request = tokio::select! {
+            biased;
+            _ = &mut retire => { let _ = retired.send(()); return; }
+            read = reader.read_line(&mut line) => match read {
+                Ok(0) => { let _ = retired.send(()); return; }
+                Ok(_) => match serde_json::from_str::<EncoderControlRequest>(line.trim_end()) {
+                    Ok(request) => request,
+                    Err(_) => { let _ = retired.send(()); return; }
+                },
+                Err(_) => { let _ = retired.send(()); return; }
+            }
+        };
+        let response = match request {
+            EncoderControlRequest::Acquire { .. } => Some(EncoderControlResponse::Acquire { permit: EncoderPermit::Granted }),
+            EncoderControlRequest::Register { .. } => Some(EncoderControlResponse::Register { refused: false }),
+            // Withhold the revoke acknowledgement while the connection stays
+            // open: endpoint signal authority is unresolved and the adapter must
+            // retain the exact direct child.
+            EncoderControlRequest::Revoke { .. } => None,
+            EncoderControlRequest::Settle { .. } => Some(EncoderControlResponse::Settle),
+        };
+        if let Some(response) = response {
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            if write.write_all(&bytes).await.is_err() { let _ = retired.send(()); return; }
         }
-        true
-    }).await.unwrap_or(false);
-    assert!(leader_alive, "F1: the live leader was not observed while terminal send failed");
-    assert!(unsafe { libc::kill(pgid, 0) } == 0,
-        "F1: the adapter did not retain the already-exited leader after the terminal notification failed");
-    let exited = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await
-        .map_err(|_| anyhow::anyhow!("F1: the adapter did not reach its bounded terminal"))
-        .unwrap()
-        .unwrap();
-    assert!(!exited.status.success(), "F1: the bounded unresolved terminal must fail the adapter");
-    let stderr = String::from_utf8_lossy(&exited.stderr);
-    assert!(stderr.contains("ENCODER_FINALIZATION_UNRESOLVED"),
-        "F1: the adapter exited without the typed unresolved endpoint-authority terminal:\n{stderr}");
-    assert!(stderr.contains("Encoded media consumer"),
-        "F1: the terminal lost the failed notification send:\n{stderr}");
+    }
+}
 
-    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+/// SIGKILLs the exact fixture group this test created when it drops. Disarmed
+/// once the test has proven the group is gone, so a passing test never signals a
+/// reused identity.
+struct GroupGuard(i32);
+impl GroupGuard {
+    fn disarm(&mut self) { self.0 = 0; }
+}
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if self.0 > 0 {
+            // Safety: signal the exact group this test created.
+            unsafe { libc::kill(-self.0, libc::SIGKILL) };
+        }
+    }
+}
+
+/// One standalone adapter whose control peer withholds the revoke
+/// acknowledgement, so endpoint signal authority is unresolved after the first
+/// encode attempt.
+struct HeldAdapter {
+    dir: Directory,
+    child: tokio::process::Child,
+    source: UnixStream,
+    receiver: Option<BufReader<UnixStream>>,
+    pgid_file: PathBuf,
+    retire: tokio::sync::oneshot::Sender<()>,
+    retired: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Spawn the real standalone adapter against a control peer that withholds the
+/// revoke acknowledgement. `leader_body` is appended after the wrapper records
+/// its own pgid, so each case controls whether the leader stays live, exits on
+/// its own, or floods its output past the bounded access-unit limit.
+async fn launch_held_adapter(leader_body: &str, close_consumer: bool) -> HeldAdapter {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let control = UnixListener::bind(dir.0.join("encoder-control.sock")).unwrap();
+    std::fs::set_permissions(dir.0.join("encoder-control.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (retire, retire_rx) = tokio::sync::oneshot::channel();
+    let (retired_tx, retired) = tokio::sync::oneshot::channel();
+    drop(tokio::spawn(serve_control_hold_until_retired(control, retire_rx, retired_tx)));
+
+    let pgid_file = dir.0.join("leader.pgid");
+    let wrapper = dir.0.join("wrapper.sh");
+    write_executable(&wrapper, &format!(
+        "#!/bin/sh\necho \"$$\" > {pgid}\n{body}\n",
+        pgid = pgid_file.display(),
+        body = leader_body,
+    ));
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw"))
+        .arg("--video-socket").arg(dir.0.join("video"))
+        .arg("--ffmpeg").arg(&wrapper);
+    let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (source, _) = raw.accept().await.unwrap();
+    let receiver = if close_consumer {
+        // The encoded consumer closes before it reads, so the terminal failure
+        // notification send fails instead of succeeding.
+        drop(video.accept().await.unwrap().0);
+        None
+    } else {
+        Some(BufReader::new(video.accept().await.unwrap().0))
+    };
+    HeldAdapter { dir, child, source, receiver, pgid_file, retire, retired }
+}
+
+async fn wait_pgid_file(path: &Path) -> i32 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Ok(text) = std::fs::read_to_string(path) {
+            if let Ok(pgid) = text.trim().parse::<i32>() { return pgid; }
+        }
+        assert!(tokio::time::Instant::now() < deadline,
+            "the fixture encoder never wrote its pgid: {}", path.display());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The bounded retention window the pre-fix adapter used before it dropped the
+/// retained owner. Every retention assertion waits strictly longer than this so
+/// a bounded-drop implementation fails and an authority-bound one passes.
+const PRE_FIX_RETENTION_WINDOW: Duration = Duration::from_secs(20);
+
+/// The full pre-fix bounded window for the send-error and terminal-failure
+/// paths. Those paths run one extra bounded revoke exchange (`REVOKE_ACK_TIMEOUT`,
+/// ten seconds) before the retention window: the encode failure runs
+/// `finalize_after_terminal_error` first and the terminal boundary finalizes
+/// again. The assertion must wait past the whole pre-fix total, so a
+/// bounded-drop implementation has already exited and an authority-bound one is
+/// still retained.
+const PRE_FIX_TERMINAL_WINDOW: Duration = Duration::from_secs(40);
+
+/// Interruption path with a live leader: SIGTERM during the unresolved
+/// registration must not drop the retained owner, and a second SIGTERM during
+/// retention must not drop it either. Only the control connection closing
+/// (authority retirement) releases the group.
+#[tokio::test]
+async fn standalone_adapter_pins_live_leader_until_control_retires() {
+    let mut held = launch_held_adapter("cat > /dev/null\nwhile :; do sleep 0.1; done\n", false).await;
+    let (packet, pixels) = frame(64, 48);
+    write_frame(&mut held.source, &packet, &pixels).await;
+    let pgid = wait_pgid_file(&held.pgid_file).await;
+    let mut group = GroupGuard(pgid);
+    let adapter_pid = held.child.id().expect("adapter pid") as i32;
+
+    // SIGTERM during the unresolved registration: the adapter must take the
+    // ownership-preserving interrupt boundary, not exit.
+    assert_eq!(unsafe { libc::kill(adapter_pid, libc::SIGTERM) }, 0, "SIGTERM the adapter");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(unsafe { libc::kill(adapter_pid, libc::SIGTERM) }, 0, "SIGTERM the retaining adapter");
+    tokio::time::sleep(PRE_FIX_RETENTION_WINDOW).await;
+
+    assert!(held.child.try_wait().unwrap().is_none(),
+        "F1: the adapter dropped the retained owner while endpoint authority was unresolved");
+    assert!(group_alive(pgid), "F1: the live leader was killed while endpoint authority was unresolved");
+
+    // Authority-retirement edge: the control peer closes the connection.
+    let _ = held.retire.send(());
+    let _ = held.retired.await;
+    let status = tokio::time::timeout(Duration::from_secs(20), held.child.wait()).await
+        .expect("F1: the adapter did not exit after authority retirement").unwrap();
+    assert!(!status.success(), "the retained terminal must fail the adapter");
     assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
-        "F1: the test fixture encoder group survived explicit teardown");
+        "F1: the encoder group survived after authority retirement");
+    group.disarm();
+    drop(held.receiver.take());
+    drop(held.dir);
+}
+
+/// Interruption path with a leader that exits on its own. The leader must be
+/// observed as an unreaped zombie before the identity assertion, and that
+/// numeric identity must stay pinned until the control connection actually
+/// retires authority. This replaces the R6-F2 fixture that never exited.
+#[tokio::test]
+async fn standalone_adapter_pins_exited_leader_until_control_retires() {
+    let mut held = launch_held_adapter("cat > /dev/null\nexit 0\n", false).await;
+    let (packet, pixels) = frame(64, 48);
+    write_frame(&mut held.source, &packet, &pixels).await;
+    let pgid = wait_pgid_file(&held.pgid_file).await;
+    let mut group = GroupGuard(pgid);
+
+    assert!(wait_leader_zombie(pgid, Duration::from_secs(20)).await,
+        "the retained leader did not become an unreaped zombie while authority was unresolved");
+    let adapter_pid = held.child.id().expect("adapter pid") as i32;
+    assert_eq!(unsafe { libc::kill(adapter_pid, libc::SIGTERM) }, 0, "SIGTERM the retaining adapter");
+    tokio::time::sleep(PRE_FIX_RETENTION_WINDOW).await;
+
+    assert!(held.child.try_wait().unwrap().is_none(),
+        "F1: the adapter exited while an already-exited leader identity was unresolved");
+    assert!(leader_is_zombie(pgid),
+        "the retained leader must still be an unreaped zombie before the identity assertion");
+    assert!(unsafe { libc::kill(pgid, 0) } == 0,
+        "F1: an already-exited leader identity was released before authority retired");
+
+    let _ = held.retire.send(());
+    let _ = held.retired.await;
+    let status = tokio::time::timeout(Duration::from_secs(20), held.child.wait()).await
+        .expect("F1: the adapter did not exit after authority retirement").unwrap();
+    assert!(!status.success(), "the retained terminal must fail the adapter");
+    assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
+        "F1: the encoder group survived after authority retirement");
+    group.disarm();
+    drop(held.dir);
+}
+
+/// Send-error path: the encoded consumer is closed, so the terminal failure
+/// notification cannot be delivered. The adapter must still keep the retained
+/// direct child pinned until authority retires, and report the failed
+/// notification on stderr.
+#[tokio::test]
+async fn standalone_adapter_pins_exited_leader_when_terminal_notification_fails() {
+    let mut held = launch_held_adapter("dd if=/dev/zero bs=1024 count=6000 2>/dev/null\nexit 0\n", true).await;
+    let (packet, pixels) = frame(64, 48);
+    write_frame(&mut held.source, &packet, &pixels).await;
+    let pgid = wait_pgid_file(&held.pgid_file).await;
+    let mut group = GroupGuard(pgid);
+
+    assert!(wait_leader_zombie(pgid, Duration::from_secs(20)).await,
+        "the retained leader did not become an unreaped zombie while authority was unresolved");
+    tokio::time::sleep(PRE_FIX_TERMINAL_WINDOW).await;
+    assert!(held.child.try_wait().unwrap().is_none(),
+        "F1: the send-error path dropped the retained owner while authority was unresolved");
+    assert!(unsafe { libc::kill(pgid, 0) } == 0,
+        "F1: an already-exited leader identity was released before authority retired");
+
+    let _ = held.retire.send(());
+    let _ = held.retired.await;
+    let output = tokio::time::timeout(Duration::from_secs(20), held.child.wait_with_output()).await
+        .expect("F1: the adapter did not exit after authority retirement").unwrap();
+    assert!(!output.status.success(), "the retained terminal must fail the adapter");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Encoded media consumer"),
+        "the send-error path lost the failed notification cause:\n{stderr}");
+    assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
+        "F1: the encoder group survived after authority retirement");
+    group.disarm();
+    drop(held.dir);
+}
+
+/// Terminal-failure path with a live leader: the encode fails on the bounded
+/// output limit while the leader stays alive. The adapter must keep the live
+/// leader pinned until authority retires.
+#[tokio::test]
+async fn standalone_adapter_pins_live_leader_when_encode_fails() {
+    let mut held = launch_held_adapter("dd if=/dev/zero bs=1024 count=6000 2>/dev/null\nwhile :; do sleep 0.1; done\n", false).await;
+    let (packet, pixels) = frame(64, 48);
+    write_frame(&mut held.source, &packet, &pixels).await;
+    let pgid = wait_pgid_file(&held.pgid_file).await;
+    let mut group = GroupGuard(pgid);
+
+    tokio::time::sleep(PRE_FIX_TERMINAL_WINDOW).await;
+    assert!(held.child.try_wait().unwrap().is_none(),
+        "F1: the terminal-failure path dropped the retained owner while authority was unresolved");
+    assert!(group_alive(pgid), "F1: the live leader was killed while endpoint authority was unresolved");
+
+    let _ = held.retire.send(());
+    let _ = held.retired.await;
+    let status = tokio::time::timeout(Duration::from_secs(20), held.child.wait()).await
+        .expect("F1: the adapter did not exit after authority retirement").unwrap();
+    assert!(!status.success(), "the retained terminal must fail the adapter");
+    assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
+        "F1: the encoder group survived after authority retirement");
+    group.disarm();
+    drop(held.receiver.take());
+    drop(held.dir);
+}
+
+/// A real control peer that grants `Acquire` and then withholds the `Register`
+/// acknowledgement, keeping the connection open. Endpoint signal authority is
+/// therefore unresolved from the adapter's perspective even though it already
+/// bound a pgid. Closing the peer's side is the authority-retirement edge.
+async fn serve_control_hold_register_until_retired(
+    listener: UnixListener,
+    retire: tokio::sync::oneshot::Receiver<()>,
+    retired: tokio::sync::oneshot::Sender<()>,
+) {
+    let Ok((stream, _)) = listener.accept().await else { let _ = retired.send(()); return; };
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    let mut retire = std::pin::pin!(retire);
+    loop {
+        let mut line = String::new();
+        let request = tokio::select! {
+            biased;
+            _ = &mut retire => { let _ = retired.send(()); return; }
+            read = reader.read_line(&mut line) => match read {
+                Ok(0) => { let _ = retired.send(()); return; }
+                Ok(_) => match serde_json::from_str::<EncoderControlRequest>(line.trim_end()) {
+                    Ok(request) => request,
+                    Err(_) => { let _ = retired.send(()); return; }
+                },
+                Err(_) => { let _ = retired.send(()); return; }
+            }
+        };
+        let response = match request {
+            EncoderControlRequest::Acquire { .. } => Some(EncoderControlResponse::Acquire { permit: EncoderPermit::Granted }),
+            // Withhold the register acknowledgement while the connection stays
+            // open: the adapter never observes the endpoint's registration
+            // decision, so it must retain the bound child.
+            EncoderControlRequest::Register { .. } => None,
+            EncoderControlRequest::Revoke { .. } => Some(EncoderControlResponse::Revoke { refused: false }),
+            EncoderControlRequest::Settle { .. } => Some(EncoderControlResponse::Settle),
+        };
+        if let Some(response) = response {
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            if write.write_all(&bytes).await.is_err() { let _ = retired.send(()); return; }
+        }
+    }
+}
+
+/// Spawn the real standalone adapter with the register acknowledgement withheld.
+async fn launch_pending_adapter(leader_body: &str) -> HeldAdapter {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let control = UnixListener::bind(dir.0.join("encoder-control.sock")).unwrap();
+    std::fs::set_permissions(dir.0.join("encoder-control.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let (retire, retire_rx) = tokio::sync::oneshot::channel();
+    let (retired_tx, retired) = tokio::sync::oneshot::channel();
+    drop(tokio::spawn(serve_control_hold_register_until_retired(control, retire_rx, retired_tx)));
+
+    let pgid_file = dir.0.join("leader.pgid");
+    let wrapper = dir.0.join("wrapper.sh");
+    write_executable(&wrapper, &format!(
+        "#!/bin/sh\necho \"$$\" > {pgid}\n{body}\n",
+        pgid = pgid_file.display(),
+        body = leader_body,
+    ));
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw"))
+        .arg("--video-socket").arg(dir.0.join("video"))
+        .arg("--ffmpeg").arg(&wrapper);
+    let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (source, _) = raw.accept().await.unwrap();
+    let receiver = Some(BufReader::new(video.accept().await.unwrap().0));
+    HeldAdapter { dir, child, source, receiver, pgid_file, retire, retired }
+}
+
+/// F3: a leader that exits while the registration acknowledgement is still
+/// unconsumed must stay an unreaped zombie. SIGTERM during that unresolved
+/// registration, and a second SIGTERM during retention, must not release the
+/// identity. Only the control connection closing releases the group.
+#[tokio::test]
+async fn standalone_adapter_pins_exited_leader_while_registration_is_unresolved() {
+    // The leader must exit on its own while the registration acknowledgement
+    // is still withheld. It must not depend on the adapter closing stdin,
+    // because a withheld `Register` acknowledgement means `run_encode` (which
+    // closes stdin) is never reached, so a stdin-reading leader would block
+    // forever and never become a zombie.
+    let mut held = launch_pending_adapter("exit 0\n").await;
+    let (packet, pixels) = frame(64, 48);
+    write_frame(&mut held.source, &packet, &pixels).await;
+    let pgid = wait_pgid_file(&held.pgid_file).await;
+    let mut group = GroupGuard(pgid);
+    let adapter_pid = held.child.id().expect("adapter pid") as i32;
+
+    assert!(wait_leader_zombie(pgid, Duration::from_secs(20)).await,
+        "the retained leader did not become an unreaped zombie while the registration was unresolved");
+    // SIGTERM during the unresolved registration, then again during retention.
+    assert_eq!(unsafe { libc::kill(adapter_pid, libc::SIGTERM) }, 0, "SIGTERM the adapter");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(unsafe { libc::kill(adapter_pid, libc::SIGTERM) }, 0, "SIGTERM the retaining adapter");
+    tokio::time::sleep(PRE_FIX_RETENTION_WINDOW).await;
+
+    assert!(held.child.try_wait().unwrap().is_none(),
+        "F3: the adapter exited before the registration authority retired");
+    assert!(leader_is_zombie(pgid),
+        "the retained leader must still be an unreaped zombie before the identity assertion");
+    assert!(unsafe { libc::kill(pgid, 0) } == 0,
+        "F3: an already-exited leader identity was released before authority retired");
+
+    let _ = held.retire.send(());
+    let _ = held.retired.await;
+    let status = tokio::time::timeout(Duration::from_secs(20), held.child.wait()).await
+        .expect("F3: the adapter did not exit after authority retirement").unwrap();
+    assert!(!status.success(), "the retained terminal must fail the adapter");
+    assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
+        "F3: the encoder group survived after authority retirement");
+    group.disarm();
+    drop(held.receiver.take());
+    drop(held.dir);
 }

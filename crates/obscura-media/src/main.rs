@@ -200,27 +200,25 @@ async fn terminal_ownership_exit(owner: &mut obscura_media::encoder_owner::Encod
     Err(error)
 }
 
-/// Keep the retained encoder owner alive for one bounded window when endpoint
-/// authority is unresolved. The adapter is the direct-child parent, so its
-/// continued lifetime is what pins an already-exited leader as a zombie; only
-/// the typed finalize outcome may retire that identity. When the typed control
-/// resource is permanently gone, return an explicit terminal error instead of
-/// retrying the same EOF/broken-pipe state forever.
+/// Keep the retained encoder owner alive until endpoint authority retires. The
+/// adapter is the direct-child parent, so its continued lifetime is what pins
+/// an already-exited leader as a zombie; only the typed finalize outcome or the
+/// authority-retirement edge may retire that identity. The active exchange is
+/// bounded, but retention is not: elapsed time is never permission to drop the
+/// child. Only when the control connection closes is the group settled locally
+/// and the leader reaped, after which the adapter may exit.
 async fn retain_unresolved_terminal(
     owner: &mut obscura_media::encoder_owner::EncoderChildOwner,
     reason: &str,
     error: anyhow::Error,
 ) -> Result<()> {
-    let terminal = match owner.finalize().await {
-        Ok(_) => return Err(error),
-        Err(cleanup) => cleanup,
-    };
-    let retention = owner.retain_unresolved(terminal).await;
-    if let Err(retention_error) = retention {
-        eprintln!("media adapter {reason}: retained encoder authority unresolved: {retention_error:#}; terminal error: {error:#}");
-        return Err(error.context(retention_error));
+    match owner.settle_until_retired().await {
+        Ok(_) => Err(error),
+        Err(retention_error) => {
+            eprintln!("media adapter {reason}: retained encoder authority unresolved: {retention_error:#}; terminal error: {error:#}");
+            Err(error.context(retention_error))
+        }
     }
-    Err(error)
 }
 
 /// Owns the standalone `encoder-control.sock` path this invocation bound. It

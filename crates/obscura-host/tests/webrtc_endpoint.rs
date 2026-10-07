@@ -84,6 +84,29 @@ async fn data_channel_rebind_projects_retained_finalization_failure() {
         .await.expect("retained finalization failure DataChannel case timed out").unwrap();
 }
 
+/// F2: the fixture launches the p1 adapter as part of the prime attachment. A
+/// post-launch receiver failure must still remove that exact adapter pid before
+/// host and endpoint teardown, even though the case returns before the report
+/// verification runs.
+#[tokio::test]
+async fn retained_finalization_failure_receiver_error_cleans_up_launched_adapter() {
+    let sink = fixture_pid_sink();
+    let outcome = run_fixture_fault("error", &sink, Duration::from_secs(240)).await;
+    assert!(outcome.is_err(), "the injected post-launch receiver failure must fail the case");
+    assert_recorded_adapter_gone(&sink).await;
+}
+
+/// F2: the outer case timeout must also reach cleanup. `hang` blocks after the
+/// p1 adapter is launched, so the watchdog drops the case future; the fixture's
+/// backstop must still remove the recorded adapter pid.
+#[tokio::test]
+async fn retained_finalization_failure_timeout_cleans_up_launched_adapter() {
+    let sink = fixture_pid_sink();
+    let outcome = run_fixture_fault("hang", &sink, Duration::from_secs(90)).await;
+    assert!(outcome.is_err(), "the hanging case must be cancelled by the case timeout");
+    assert_recorded_adapter_gone(&sink).await;
+}
+
 /// Two authorized receivers bound to two distinct Host profiles run at the same
 /// time. Each exact session owns its own adapter and encoded socket, so every
 /// frame a receiver decodes must carry its own session identity.
@@ -869,7 +892,13 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
     let p1_marker = root.join("p1-session");
     std::fs::write(&p1_marker, &secondary_session)?;
     let p1_adapter = root.join("p1-adapter.py");
-    let p1_pid_file = root.join("p1-adapter.pid");
+    // The fixture's own scratch root is torn down by the cleanup owner, so the
+    // fault cases redirect the adapter pid record to an external sink. The
+    // recorded pid then outlives the root and can be checked after every exit.
+    let p1_pid_file = match std::env::var_os("OBSCURA_FIXTURE_PID_SINK") {
+        Some(sink) => PathBuf::from(sink),
+        None => root.join("p1-adapter.pid"),
+    };
     let p1_script = [
         "#!/usr/bin/env python3",
         "import json, os, signal, socket, sys, time",
@@ -941,7 +970,7 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
     let bytes = obscura_media::encode(std::path::Path::new("ffmpeg"), 160, 120, scripted_scene(160, 120)).await?;
     anyhow::ensure!(!bytes.is_empty(), "finalization-failure producer got no access unit");
     let session_socket = root.join(format!("endpoint/session-{session_id}/encoded.sock"));
-    let mut producer_task = tokio::spawn({
+    let producer_task = tokio::spawn({
         let session_socket = session_socket.clone();
         let session_id = session_id.clone();
         let bytes = bytes.clone();
@@ -971,63 +1000,87 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
         }
     });
 
-    let prime_ready = root.join("ready-prime.json");
-    let mut prime_command = Command::new(&receiver_bin);
-    prime_command.arg("--address").arg(address.to_string())
-        .arg("--ca").arg(root.join("ca.der"))
-        .arg("--client-cert").arg(root.join("client.der"))
-        .arg("--client-key").arg(root.join("client.key"))
-        .arg("--bind-ip").arg(bind_ip)
-        .arg("--frames").arg("3").arg("--skip-click")
-        .arg("--terminal-trigger").arg("prime-finalize-failed")
-        .arg("--terminal-transport").arg("data-channel")
-        .arg("--ready-file").arg(&prime_ready)
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let prime_output = prime_command.output().await?;
-    let prime_dir = raw_root.join("prime");
-    std::fs::create_dir_all(&prime_dir)?;
-    std::fs::write(prime_dir.join("stdout.txt"), &prime_output.stdout)?;
-    std::fs::write(prime_dir.join("stderr.txt"), &prime_output.stderr)?;
-    std::fs::write(prime_dir.join("exit.txt"), format!("EXIT={:?}\n", prime_output.status.code()))?;
-    anyhow::ensure!(prime_output.status.success(),
-        "p1 prime attachment failed: {}", String::from_utf8_lossy(&prime_output.stderr));
+    // From here the p1 adapter is launched and every fallible operation runs
+    // inside the fixture's single cleanup owner, so no early return or outer
+    // timeout can orphan the exact p1 pid or the endpoint/host teardown.
+    let fixture = FinalFailureFixture {
+        label: "p1 fixture adapter",
+        pid_file: p1_pid_file,
+        endpoint,
+        host,
+        producer_task: Some(producer_task),
+        root: root.clone(),
+    };
+    let receiver_bin = receiver_bin.clone();
+    let root = root.clone();
+    let raw_root = raw_root.clone();
+    let bind_ip = bind_ip.to_string();
+    fixture.run(async move {
+        let prime_ready = root.join("ready-prime.json");
+        let mut prime_command = Command::new(&receiver_bin);
+        prime_command.arg("--address").arg(address.to_string())
+            .arg("--ca").arg(root.join("ca.der"))
+            .arg("--client-cert").arg(root.join("client.der"))
+            .arg("--client-key").arg(root.join("client.key"))
+            .arg("--bind-ip").arg(&bind_ip)
+            .arg("--frames").arg("3").arg("--skip-click")
+            .arg("--terminal-trigger").arg("prime-finalize-failed")
+            .arg("--terminal-transport").arg("data-channel")
+            .arg("--ready-file").arg(&prime_ready)
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let prime_output = prime_command.output().await?;
+        let prime_dir = raw_root.join("prime");
+        std::fs::create_dir_all(&prime_dir)?;
+        std::fs::write(prime_dir.join("stdout.txt"), &prime_output.stdout)?;
+        std::fs::write(prime_dir.join("stderr.txt"), &prime_output.stderr)?;
+        std::fs::write(prime_dir.join("exit.txt"), format!("EXIT={:?}\n", prime_output.status.code()))?;
+        anyhow::ensure!(prime_output.status.success(),
+            "p1 prime attachment failed: {}", String::from_utf8_lossy(&prime_output.stderr));
+        // F2 fault injection. The prime attachment has now launched the p1
+        // adapter, so these faults fall inside the exact lifetime the fixture
+        // cleanup owner must cover. `error` fails the case immediately; `hang`
+        // blocks so the outer `tokio::time::timeout` cancels this future.
+        match std::env::var("OBSCURA_FIXTURE_FAULT").as_deref() {
+            Ok("error") => { return Err(anyhow::anyhow!("injected post-launch receiver failure")); }
+            Ok("hang") => { tokio::time::sleep(Duration::from_secs(600)).await; }
+            _ => {}
+        }
 
-    // The prime attachment has closed. Wait for the endpoint's real finalizer
-    // to publish the retained failure before the DataChannel rebind.
-    let secondary_dir = root.join(format!("endpoint/session-{secondary_session}"));
-    wait_socket_deadline(secondary_dir.join("encoded.sock"), Duration::from_secs(30)).await?;
-    let endpoint_stderr_path = raw_root.join("endpoint.stderr");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let stderr = std::fs::read_to_string(&endpoint_stderr_path).unwrap_or_default();
-        if stderr.contains("SESSION_ENCODER_PERMIT_UNSETTLED") { break; }
-        anyhow::ensure!(tokio::time::Instant::now() < deadline,
-            "p1 finalizer did not publish a retained failure: {stderr}");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+        // The prime attachment has closed. Wait for the endpoint's real finalizer
+        // to publish the retained failure before the DataChannel rebind.
+        let secondary_dir = root.join(format!("endpoint/session-{secondary_session}"));
+        wait_socket_deadline(secondary_dir.join("encoded.sock"), Duration::from_secs(30)).await?;
+        let endpoint_stderr_path = raw_root.join("endpoint.stderr");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let stderr = std::fs::read_to_string(&endpoint_stderr_path).unwrap_or_default();
+            if stderr.contains("SESSION_ENCODER_PERMIT_UNSETTLED") { break; }
+            anyhow::ensure!(tokio::time::Instant::now() < deadline,
+                "p1 finalizer did not publish a retained failure: {stderr}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
 
-    let ready_file = root.join("ready-finalfail.json");
-    let mut command = Command::new(&receiver_bin);
-    command.arg("--address").arg(address.to_string())
-        .arg("--ca").arg(root.join("ca.der"))
-        .arg("--client-cert").arg(root.join("client.der"))
-        .arg("--client-key").arg(root.join("client.key"))
-        .arg("--bind-ip").arg(bind_ip)
-        .arg("--frames").arg("3").arg("--skip-click")
-        .arg("--terminal-trigger").arg("rebind-finalize-failed")
-        .arg("--terminal-transport").arg("data-channel")
-        .arg("--ready-file").arg(&ready_file)
-        .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
-    let output = command.output().await?;
-    let phase_dir = raw_root.join("receiver");
-    std::fs::create_dir_all(&phase_dir)?;
-    std::fs::write(phase_dir.join("stdout.txt"), &output.stdout)?;
-    std::fs::write(phase_dir.join("stderr.txt"), &output.stderr)?;
-    std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", output.status.code()))?;
-    anyhow::ensure!(output.status.success(),
-        "retained-finalization-failure receiver failed: {}", String::from_utf8_lossy(&output.stderr));
-    let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let verification = (|| -> anyhow::Result<()> {
+        let ready_file = root.join("ready-finalfail.json");
+        let mut command = Command::new(&receiver_bin);
+        command.arg("--address").arg(address.to_string())
+            .arg("--ca").arg(root.join("ca.der"))
+            .arg("--client-cert").arg(root.join("client.der"))
+            .arg("--client-key").arg(root.join("client.key"))
+            .arg("--bind-ip").arg(&bind_ip)
+            .arg("--frames").arg("3").arg("--skip-click")
+            .arg("--terminal-trigger").arg("rebind-finalize-failed")
+            .arg("--terminal-transport").arg("data-channel")
+            .arg("--ready-file").arg(&ready_file)
+            .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        let output = command.output().await?;
+        let phase_dir = raw_root.join("receiver");
+        std::fs::create_dir_all(&phase_dir)?;
+        std::fs::write(phase_dir.join("stdout.txt"), &output.stdout)?;
+        std::fs::write(phase_dir.join("stderr.txt"), &output.stderr)?;
+        std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", output.status.code()))?;
+        anyhow::ensure!(output.status.success(),
+            "retained-finalization-failure receiver failed: {}", String::from_utf8_lossy(&output.stderr));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         anyhow::ensure!(report["pass"] == true && report["browser_path"] == "webrtc_data_channel",
             "retained-finalization-failure report not passing: {report}");
         let receipt = &report["trigger_receipt"];
@@ -1040,30 +1093,127 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
         anyhow::ensure!(report["frames_at_trigger"].as_u64().is_some_and(|count| count >= 1),
             "the receiver had no frame before it triggered the rebind: {report}");
         Ok(())
-    })();
-    if let Err(error) = verification {
-        cleanup_final_failure_fixture(&p1_pid_file, &mut endpoint, &mut host, &mut producer_task, &root).await?;
-        return Err(error);
-    }
-
-    cleanup_final_failure_fixture(&p1_pid_file, &mut endpoint, &mut host, &mut producer_task, &root).await?;
-    Ok(())
+    }).await
 }
 
-async fn cleanup_final_failure_fixture(pid_file: &PathBuf, endpoint: &mut tokio::process::Child, host: &mut tokio::process::Child, producer_task: &mut tokio::task::JoinHandle<()>, root: &PathBuf) -> anyhow::Result<()> {
-    if pid_file.exists() {
-        let adapter_pid = wait_pid(pid_file, Duration::from_secs(30)).await?;
-        terminate_exact_pid("p1 fixture adapter", adapter_pid, Duration::from_secs(30)).await?;
-    }
-    let _ = endpoint.kill().await;
-    let _ = endpoint.wait().await;
-    let _ = host.kill().await;
-    let _ = host.wait().await;
-    producer_task.abort();
-    let _ = producer_task.await;
-    std::fs::remove_dir_all(root)?;
-    Ok(())
+/// Owns the full post-adapter-launch lifetime of the retained-failure fixture.
+/// Its async `cleanup` removes each exact resource this fixture created: the
+/// exact p1 adapter pid (SIGTERM then SIGKILL), the endpoint and host direct
+/// children, the default-frame producer task, and the scratch root. The `Drop`
+/// impl is a synchronous backstop, so the outer `tokio::time::timeout`
+/// cancelling the case future still reaches cleanup and cannot orphan the p1
+/// fixture.
+struct FinalFailureFixture {
+    label: &'static str,
+    pid_file: PathBuf,
+    endpoint: tokio::process::Child,
+    host: tokio::process::Child,
+    producer_task: Option<tokio::task::JoinHandle<()>>,
+    root: PathBuf,
 }
+
+impl FinalFailureFixture {
+    /// Always run `work`, then remove every owned resource. The result of
+    /// `work` is returned only after cleanup has run, so every fallible
+    /// operation between the two is covered by this single owner.
+    async fn run<F, T>(mut self, work: F) -> anyhow::Result<T>
+    where
+        F: std::future::Future<Output = anyhow::Result<T>>,
+    {
+        let outcome = work.await;
+        self.cleanup().await;
+        outcome
+    }
+
+    async fn cleanup(&mut self) {
+        if self.pid_file.exists() {
+            match wait_pid(&self.pid_file, Duration::from_secs(30)).await {
+                Ok(adapter_pid) => {
+                    if let Err(error) = terminate_exact_pid(self.label, adapter_pid, Duration::from_secs(30)).await {
+                        eprintln!("{} cleanup: exact-pid termination failed: {error:#}", self.label);
+                    }
+                }
+                Err(error) => eprintln!("{} cleanup: adapter pid unavailable: {error:#}", self.label),
+            }
+        }
+        let _ = self.endpoint.kill().await;
+        let _ = self.endpoint.wait().await;
+        let _ = self.host.kill().await;
+        let _ = self.host.wait().await;
+        if let Some(task) = self.producer_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        let root = std::mem::take(&mut self.root);
+        if !root.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+}
+
+impl Drop for FinalFailureFixture {
+    fn drop(&mut self) {
+        // Cancellation backstop. On the normal path `cleanup` has already
+        // removed the pid file by tearing down the root, so this only fires when
+        // the outer timeout drops the future while a resource is still live.
+        if let Some(task) = self.producer_task.take() {
+            task.abort();
+        }
+        if self.pid_file.exists() {
+            if let Ok(text) = std::fs::read_to_string(&self.pid_file) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    // Safety: this signal targets the exact pid this fixture wrote.
+                    let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+            }
+        }
+    }
+}
+
+/// A unique scratch path for the recorded p1 adapter pid. It lives outside the
+/// fixture root, so the recorded pid survives the root teardown and can be
+/// checked after the case future has been dropped.
+fn fixture_pid_sink() -> PathBuf {
+    std::env::temp_dir().join(format!("oc-fixpid-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]))
+}
+
+/// Run one retained-failure case with a post-launch fault and an external pid
+/// sink. The case timeout is applied here so a hanging case is cancelled while
+/// the fixture's `Drop` backstop still removes the recorded adapter pid.
+async fn run_fixture_fault(fault: &str, sink: &PathBuf, timeout: Duration) -> anyhow::Result<()> {
+    std::env::set_var("OBSCURA_FIXTURE_FAULT", fault);
+    std::env::set_var("OBSCURA_FIXTURE_PID_SINK", sink);
+    let outcome = tokio::time::timeout(timeout, run_retained_finalize_failure_data_channel()).await;
+    std::env::remove_var("OBSCURA_FIXTURE_FAULT");
+    std::env::remove_var("OBSCURA_FIXTURE_PID_SINK");
+    match outcome {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!("fixture case timed out after {timeout:?}")),
+    }
+}
+
+/// Assert the pid the fixture recorded is no longer a live process. The pid
+/// file is external, so it is read directly. Zombies count as not live: the
+/// adapter may briefly remain an unreaped zombie of the endpoint child.
+async fn assert_recorded_adapter_gone(sink: &PathBuf) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(sink) {
+            if let Ok(pid) = text.trim().parse::<i32>() { break pid; }
+        }
+        assert!(tokio::time::Instant::now() < deadline,
+            "F2: the fixture never recorded the launched adapter pid at {}", sink.display());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let live_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !pid_exited_or_zombie(pid) {
+        assert!(tokio::time::Instant::now() < live_deadline,
+            "F2: the recorded adapter pid {pid} was still live after fixture cleanup");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = std::fs::remove_file(sink);
+}
+
 
 async fn run_receiver_cert(
     binary: &PathBuf,

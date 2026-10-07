@@ -6,7 +6,7 @@
 //! before reap, and stop/kill/reap on timeout or cancellation. No process id is
 //! ever recovered from stdout, stderr, a file or a log.
 
-use std::{path::Path, process::Stdio, time::{Duration, Instant}};
+use std::{path::Path, process::Stdio, time::Duration};
 
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -77,10 +77,6 @@ const REVOKE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const GROUP_GRACE: Duration = Duration::from_secs(1);
 /// Bounded leader reap deadline after group stop/kill.
 const REAP_DEADLINE: Duration = Duration::from_secs(3);
-/// Bounded window that an unresolved endpoint authority may remain pinned
-/// before the adapter reaches its explicit terminal outcome.
-pub const RETENTION_TERMINAL_TIMEOUT: Duration = Duration::from_secs(5);
-
 #[derive(Debug)]
 pub enum EncoderStop {
     Exited(std::process::ExitStatus),
@@ -114,7 +110,6 @@ pub struct EncoderChildOwner {
     control: EncoderControlClient,
     registration_id: u64,
     registration: RegistrationState,
-    retention_deadline: Option<Instant>,
 }
 
 impl EncoderChildOwner {
@@ -129,7 +124,6 @@ impl EncoderChildOwner {
             control: EncoderControlClient { reader: BufReader::new(read), writer: write },
             registration_id: 0,
             registration: RegistrationState::Unregistered,
-            retention_deadline: None,
         })
     }
 
@@ -181,35 +175,38 @@ impl EncoderChildOwner {
         // cancellation cannot mistake the unread acknowledgement for an
         // unregistered group.
         self.registration = RegistrationState::Pending;
-        let registered = self.control.register(registration_id, pgid).await;
-        match registered {
-            Ok(EncoderControlResponse::Register { refused: false }) => self.registration = RegistrationState::Armed,
-            Ok(EncoderControlResponse::Register { refused: true }) => {
+        match self.control.register(registration_id, pgid).await {
+            ControlExchange::Answered(EncoderControlResponse::Register { refused: false }) => {
+                self.registration = RegistrationState::Armed;
+            }
+            ControlExchange::Answered(EncoderControlResponse::Register { refused: true }) => {
                 self.registration = RegistrationState::Refused;
                 self.finalize_local_refused().await.context("Local refused encoder cleanup")?;
                 self.control.settle(registration_id, EncoderSettlement::RefusedGroupStopped).await
                     .context("Report refused encoder settlement")?;
                 bail!("ENCODER_ADMISSION_FINALIZED: Host session finalizer refused encoder registration");
             }
-            Err(error) => {
-                // The typed acknowledgement was not received. Endpoint signal
-                // authority may or may not exist, so the group is never reaped
-                // blind: resolve the outstanding acknowledgement through the
-                // same typed control resource, then revoke or refuse before any
-                // local reap. An unresolved acknowledgement is surfaced as an
-                // explicit ownership failure.
-                return match self.finalize().await {
-                    Ok(_) => Err(error.context("Encoder registration acknowledgement not received")),
-                    Err(cleanup) => Err(error.context(format!(
-                        "ENCODER_REGISTRATION_UNRESOLVED: registration {registration_id} unresolved: {cleanup}"
-                    ))),
-                };
-            }
-            Ok(other) => {
+            ControlExchange::Answered(other) => {
                 // A response that is neither `Register` outcome is a protocol
                 // violation. The endpoint state is unknown, so never reap
                 // blind; surface the ownership failure.
                 bail!("ENCODER_REGISTRATION_UNRESOLVED: unexpected encoder control response: {other:?}");
+            }
+            ControlExchange::Retired => {
+                // The endpoint closed the control connection before it answered,
+                // so it cannot hold signal authority over this group. The group
+                // is adapter-owned: settle it locally before surfacing the
+                // failure.
+                self.registration = RegistrationState::Unregistered;
+                self.stop_kill_reap().await.context("Local encoder cleanup after control retirement")?;
+                bail!("ENCODER_CONTROL_RETIRED: endpoint closed the encoder control connection before the registration acknowledgement");
+            }
+            ControlExchange::Unresolved(error) => {
+                // The typed acknowledgement was not received and the connection
+                // was not observed closed. Endpoint signal authority may still
+                // exist, so the group is never reaped blind and the child stays
+                // pinned for the caller's ownership-preserving boundary.
+                bail!("ENCODER_REGISTRATION_UNRESOLVED: registration {registration_id} unresolved: {error:#}");
             }
         }
         let outcome = tokio::time::timeout(ENCODE_TIMEOUT, self.run_encode(registration_id, rgba)).await
@@ -255,12 +252,18 @@ impl EncoderChildOwner {
                 bounded_read(diagnostic, 64 * 1024),
             )?
         };
-        match self.control.revoke(registration_id).await? {
-            EncoderControlResponse::Revoke { refused: false } => {}
-            EncoderControlResponse::Revoke { refused: true } => {
+        match self.control.revoke(registration_id).await {
+            ControlExchange::Answered(EncoderControlResponse::Revoke { refused: false }) => {}
+            ControlExchange::Answered(EncoderControlResponse::Revoke { refused: true }) => {
                 bail!("Encoder group was refused before revoke acknowledgement");
             }
-            other => bail!("Unexpected encoder control response: {other:?}"),
+            ControlExchange::Answered(other) => bail!("Unexpected encoder control response: {other:?}"),
+            ControlExchange::Retired => bail!(
+                "ENCODER_CONTROL_RETIRED: endpoint closed the encoder control connection before the revoke acknowledgement"
+            ),
+            ControlExchange::Unresolved(error) => {
+                return Err(error.context("Encoder revoke exchange failed"));
+            }
         }
         // Settle the group through the same retained owner while the leader
         // identity is still pinned. `stop_kill_reap` signals the group before
@@ -283,32 +286,47 @@ impl EncoderChildOwner {
     /// Cooperative group stop/kill/reap for a registered group. It revokes
     /// before reaping the leader so the endpoint signal cannot address a
     /// reused process id.
+    ///
+    /// This is one typed finalize attempt. `Ok` means the group was settled and
+    /// the leader reaped. `Err` means endpoint authority may still be held; the
+    /// direct child stays pinned and the caller must wait for the
+    /// authority-retirement edge before retrying. A closed or broken control
+    /// connection is that edge, so it is classified as retired and the group is
+    /// settled locally instead of being reported as unresolved.
     pub async fn finalize(&mut self) -> Result<EncoderStop> {
         match self.registration {
             // An endpoint-acknowledged registration owes a `RevokeEncoder` and
             // a successful typed acknowledgement before the leader is reaped.
-            RegistrationState::Armed => {
-                self.revoke_registered().await?;
-                self.stop_kill_reap().await
-            }
+            RegistrationState::Armed => self.finalize_armed().await,
             // The `Register` request was sent but its acknowledgement was not
             // read. Resolve it before deciding: an acknowledged registration
             // still owes a revoke; a confirmed refusal runs the adapter-owned
-            // local cleanup. An unresolved acknowledgement is an explicit
-            // ownership failure and the group is never reaped blind.
+            // local cleanup; a closed connection retires endpoint authority.
+            // An unresolved acknowledgement is an explicit ownership failure
+            // and the group is never reaped blind.
             RegistrationState::Pending => {
                 match self.control.read_response(REVOKE_ACK_TIMEOUT).await {
-                    Ok(EncoderControlResponse::Register { refused: false }) => {
+                    ControlExchange::Answered(EncoderControlResponse::Register { refused: false }) => {
                         self.registration = RegistrationState::Armed;
-                        self.revoke_registered().await?;
-                        self.stop_kill_reap().await
+                        self.finalize_armed().await
                     }
-                    Ok(EncoderControlResponse::Register { refused: true }) => {
+                    ControlExchange::Answered(EncoderControlResponse::Register { refused: true }) => {
                         self.registration = RegistrationState::Refused;
                         self.stop_kill_reap().await
                     }
-                    Ok(other) => bail!("Unexpected encoder control response while resolving registration: {other:?}"),
-                    Err(error) => bail!("ENCODER_REGISTRATION_UNRESOLVED: {error:#}"),
+                    ControlExchange::Answered(other) => {
+                        bail!("Unexpected encoder control response while resolving registration: {other:?}")
+                    }
+                    // The endpoint closed the control connection, so it can no
+                    // longer hold signal authority over this group. The group is
+                    // adapter-owned and settled locally.
+                    ControlExchange::Retired => {
+                        self.registration = RegistrationState::Unregistered;
+                        self.stop_kill_reap().await
+                    }
+                    ControlExchange::Unresolved(error) => {
+                        bail!("ENCODER_REGISTRATION_UNRESOLVED: {error:#}")
+                    }
                 }
             }
             // A confirmed refusal (or a group with no endpoint registration)
@@ -317,18 +335,27 @@ impl EncoderChildOwner {
         }
     }
 
-    /// Send `RevokeEncoder` and require the typed non-refused acknowledgement
-    /// before the group is addressed. A refused or unresolved revoke is an
-    /// explicit ownership failure; the caller must not treat it as
-    /// acknowledgement or proceed to reap.
-    async fn revoke_registered(&mut self) -> Result<()> {
+    /// The `Armed` half of one typed finalize attempt. It sends `RevokeEncoder`
+    /// and requires the typed non-refused acknowledgement before the group is
+    /// addressed. A closed control connection is the authority-retirement edge,
+    /// so the group is settled locally; every other failure leaves endpoint
+    /// authority unresolved and keeps the child pinned.
+    async fn finalize_armed(&mut self) -> Result<EncoderStop> {
         let registration_id = self.registration_id;
-        match self.control.revoke(registration_id).await? {
-            EncoderControlResponse::Revoke { refused: false } => Ok(()),
-            EncoderControlResponse::Revoke { refused: true } => {
+        match self.control.revoke(registration_id).await {
+            ControlExchange::Answered(EncoderControlResponse::Revoke { refused: false }) => self.stop_kill_reap().await,
+            ControlExchange::Answered(EncoderControlResponse::Revoke { refused: true }) => {
                 bail!("ENCODER_REVOKE_REFUSED: endpoint refused revoke for registration {registration_id}")
             }
-            other => bail!("Unexpected encoder control response: {other:?}"),
+            ControlExchange::Answered(other) => bail!("Unexpected encoder control response: {other:?}"),
+            // The endpoint closed the control connection: it can no longer hold
+            // signal authority over this registration, so the group is
+            // adapter-owned and settled locally.
+            ControlExchange::Retired => {
+                self.registration = RegistrationState::Unregistered;
+                self.stop_kill_reap().await
+            }
+            ControlExchange::Unresolved(error) => Err(error.context("Revoke encoder registration")),
         }
     }
 
@@ -367,32 +394,46 @@ impl EncoderChildOwner {
         }
     }
 
-    /// Enter the unresolved endpoint-authority state and keep the exact child
-    /// retained for one bounded window. If the control resource is permanently
-    /// gone, this returns an explicit terminal instead of polling forever. The
-    /// child is deliberately not reaped here: only a typed `finalize` outcome
-    /// may clear the direct-child identity.
-    pub async fn retain_unresolved(&mut self, error: anyhow::Error) -> Result<EncoderStop> {
+    /// The one ownership-preserving terminal boundary every adapter exit path
+    /// uses. It makes exactly one typed `finalize` attempt. If that settles the
+    /// group, ownership is released and the leader is reaped. Otherwise endpoint
+    /// authority may still be held, so the direct child stays pinned and this
+    /// waits, with no elapsed-retention deadline, for the authority-retirement
+    /// edge: the control connection closing (`EOF` or closed-connection
+    /// `EPIPE`). Only after that edge is observed is the group settled locally
+    /// and the leader reaped.
+    pub async fn settle_until_retired(&mut self) -> Result<EncoderStop> {
         ensure!(self.has_live_child(), "No encoder child is retained");
-        ensure!(self.registration != RegistrationState::Unregistered,
-            "No endpoint registration is retained");
-        let deadline = match self.retention_deadline {
-            Some(deadline) => deadline,
-            None => {
-                let deadline = Instant::now() + RETENTION_TERMINAL_TIMEOUT;
-                self.retention_deadline = Some(deadline);
-                deadline
+        if let Ok(stop) = self.finalize().await {
+            return Ok(stop);
+        }
+        self.await_authority_retirement().await?;
+        self.registration = RegistrationState::Unregistered;
+        self.stop_kill_reap().await
+    }
+
+    /// Wait, without an elapsed-retention deadline, for the endpoint's control
+    /// connection to close. `EOF` or a closed-connection `EPIPE` is the typed
+    /// authority-retirement edge: the endpoint closes this connection only after
+    /// it has retired signal authority for the session, and an endpoint process
+    /// exit closes it too. Late bytes are discarded; only the close is the edge.
+    /// The retained child is untouched for the whole wait.
+    pub async fn await_authority_retirement(&mut self) -> Result<()> {
+        ensure!(self.has_live_child(), "No encoder child is retained");
+        let mut scratch = [0u8; 256];
+        loop {
+            match self.control.reader.read(&mut scratch).await {
+                Ok(0) => return Ok(()),
+                Ok(_) => continue,
+                Err(error) => {
+                    if is_io_peer_close(&error) { return Ok(()); }
+                    // No peer-close evidence yet: authority may still be held,
+                    // so keep the child pinned and retry instead of returning
+                    // an error that would drop the retained owner.
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
             }
-        };
-        if Instant::now() >= deadline {
-            bail!("ENCODER_FINALIZATION_UNRESOLVED: endpoint authority was not retired within the bounded retention window: {error:#}");
         }
-        tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
-        if !self.has_live_child() {
-            bail!("ENCODER_REGISTRATION_UNRESOLVED: encoder child was dropped before authority retirement");
-        }
-        ensure!(Instant::now() >= deadline, "Encoder retention window ended early");
-        bail!("ENCODER_FINALIZATION_UNRESOLVED: endpoint authority was not retired within the bounded retention window: {error:#}");
     }
 
     /// Reap the already-signalled leader and retire signal authority. This is
@@ -445,44 +486,116 @@ struct EncoderControlClient {
     writer: tokio::net::unix::OwnedWriteHalf,
 }
 
+/// Classification of one typed control exchange. It separates the two
+/// authority outcomes the adapter must tell apart:
+///
+/// * [`ControlExchange::Retired`] means the endpoint closed the control
+///   connection. It cannot hold signal authority over any group after that
+///   edge, so the adapter may settle the group locally.
+/// * [`ControlExchange::Unresolved`] means the exchange failed while the
+///   connection may still be live (for example a timeout, a write error on a
+///   half-open stream, or a malformed frame). Endpoint signal authority may
+///   still exist, so the retained child must stay pinned.
+#[derive(Debug)]
+enum ControlExchange<T> {
+    Answered(T),
+    Retired,
+    Unresolved(anyhow::Error),
+}
+
+/// True when an I/O error proves the peer closed its end of the control
+/// connection. A write that fails with a broken pipe, or a read that returns
+/// end-of-file, are both terminal peer-close evidence. Any other error keeps
+/// authority unresolved.
+fn is_peer_close(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+            matches!(io.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+        })
+    })
+}
+
+/// [`is_peer_close`] for a bare [`std::io::Error`].
+fn is_io_peer_close(error: &std::io::Error) -> bool {
+    matches!(error.kind(), std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset)
+}
+
 impl EncoderControlClient {
-    async fn exchange(&mut self, request: &EncoderControlRequest, timeout: Duration) -> Result<EncoderControlResponse> {
-        let mut bytes = serde_json::to_vec(request)?;
+    async fn exchange(&mut self, request: &EncoderControlRequest, timeout: Duration) -> ControlExchange<EncoderControlResponse> {
+        let mut bytes = match serde_json::to_vec(request) {
+            Ok(bytes) => bytes,
+            Err(error) => return ControlExchange::Unresolved(error.into()),
+        };
         bytes.push(b'\n');
-        tokio::time::timeout(timeout, self.writer.write_all(&bytes)).await??;
+        match tokio::time::timeout(timeout, self.writer.write_all(&bytes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let error = anyhow::Error::new(error).context("Write encoder control request");
+                return if is_peer_close(&error) { ControlExchange::Retired } else { ControlExchange::Unresolved(error) };
+            }
+            Err(_) => {
+                return ControlExchange::Unresolved(
+                    anyhow::anyhow!("Encoder control write deadline exceeded"),
+                )
+            }
+        }
         self.read_response(timeout).await
     }
 
     /// Read one bounded typed response. It is used both for a normal exchange
     /// and to resolve an outstanding `Register` acknowledgement whose read was
     /// interrupted by cancellation.
-    async fn read_response(&mut self, timeout: Duration) -> Result<EncoderControlResponse> {
+    async fn read_response(&mut self, timeout: Duration) -> ControlExchange<EncoderControlResponse> {
         let mut line = String::new();
-        tokio::time::timeout(timeout, self.reader.read_line(&mut line)).await??;
-        ensure!(line.ends_with('\n') && line.len() <= 4096, "Invalid bounded encoder control response");
+        let read = match tokio::time::timeout(timeout, self.reader.read_line(&mut line)).await {
+            Ok(Ok(read)) => read,
+            Ok(Err(error)) => {
+                let error = anyhow::Error::new(error).context("Read encoder control response");
+                return if is_peer_close(&error) { ControlExchange::Retired } else { ControlExchange::Unresolved(error) };
+            }
+            Err(_) => {
+                return ControlExchange::Unresolved(
+                    anyhow::anyhow!("Encoder control read deadline exceeded"),
+                )
+            }
+        };
+        if read == 0 {
+            // EOF with no bytes is the peer closing the connection.
+            return ControlExchange::Retired;
+        }
+        if !line.ends_with('\n') || line.len() > 4096 {
+            return ControlExchange::Unresolved(anyhow::anyhow!("Invalid bounded encoder control response"));
+        }
         line.pop();
-        Ok(serde_json::from_str(&line).context("Decode encoder control response")?)
-    }
-
-    async fn acquire(&mut self, registration_id: u64) -> Result<EncoderPermit> {
-        match self.exchange(&EncoderControlRequest::Acquire { registration_id }, CONTROL_EXCHANGE_TIMEOUT).await? {
-            EncoderControlResponse::Acquire { permit } => Ok(permit),
-            other => bail!("Unexpected encoder control response: {other:?}"),
+        match serde_json::from_str(&line) {
+            Ok(response) => ControlExchange::Answered(response),
+            Err(error) => ControlExchange::Unresolved(anyhow::Error::new(error).context("Decode encoder control response")),
         }
     }
 
-    async fn register(&mut self, registration_id: u64, pgid: i32) -> Result<EncoderControlResponse> {
+    async fn acquire(&mut self, registration_id: u64) -> Result<EncoderPermit> {
+        match self.exchange(&EncoderControlRequest::Acquire { registration_id }, CONTROL_EXCHANGE_TIMEOUT).await {
+            ControlExchange::Answered(EncoderControlResponse::Acquire { permit }) => Ok(permit),
+            ControlExchange::Answered(other) => bail!("Unexpected encoder control response: {other:?}"),
+            ControlExchange::Retired => bail!("ENCODER_CONTROL_RETIRED: endpoint closed the encoder control connection before the acquisition response"),
+            ControlExchange::Unresolved(error) => Err(error.context("Encoder acquisition exchange failed")),
+        }
+    }
+
+    async fn register(&mut self, registration_id: u64, pgid: i32) -> ControlExchange<EncoderControlResponse> {
         self.exchange(&EncoderControlRequest::Register { registration_id, pgid }, CONTROL_EXCHANGE_TIMEOUT).await
     }
 
-    async fn revoke(&mut self, registration_id: u64) -> Result<EncoderControlResponse> {
+    async fn revoke(&mut self, registration_id: u64) -> ControlExchange<EncoderControlResponse> {
         self.exchange(&EncoderControlRequest::Revoke { registration_id }, REVOKE_ACK_TIMEOUT).await
     }
 
     async fn settle(&mut self, registration_id: u64, outcome: EncoderSettlement) -> Result<()> {
-        match self.exchange(&EncoderControlRequest::Settle { registration_id, outcome }, CONTROL_EXCHANGE_TIMEOUT).await? {
-            EncoderControlResponse::Settle => Ok(()),
-            other => bail!("Unexpected encoder control response: {other:?}"),
+        match self.exchange(&EncoderControlRequest::Settle { registration_id, outcome }, CONTROL_EXCHANGE_TIMEOUT).await {
+            ControlExchange::Answered(EncoderControlResponse::Settle) => Ok(()),
+            ControlExchange::Answered(other) => bail!("Unexpected encoder control response: {other:?}"),
+            ControlExchange::Retired => bail!("ENCODER_CONTROL_RETIRED: endpoint closed the encoder control connection before the settlement response"),
+            ControlExchange::Unresolved(error) => Err(error.context("Encoder settlement exchange failed")),
         }
     }
 }

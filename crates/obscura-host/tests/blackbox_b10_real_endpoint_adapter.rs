@@ -127,11 +127,19 @@ impl Fixture {
     }
 
     fn endpoint(&self, ffmpeg: Option<&PathBuf>) -> anyhow::Result<tokio::process::Child> {
+        let media_bin = release_binary("obscura-media");
+        anyhow::ensure!(media_bin.is_file(), "OBSCURA_TEST_BINARY_DIR must contain obscura-media: {}", media_bin.display());
+        self.endpoint_with_media_bin(&media_bin, ffmpeg)
+    }
+
+    /// Spawn the real endpoint with an explicit `--media-bin`. The F4.1 harness
+    /// passes a bounded pass-through relay here so it can hold the `Register`
+    /// response at the actual control boundary.
+    fn endpoint_with_media_bin(&self, media_bin: &std::path::Path, ffmpeg: Option<&PathBuf>) -> anyhow::Result<tokio::process::Child> {
         let reservation = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let address = reservation.local_addr()?;
         drop(reservation);
         self.address.replace(Some(address));
-        let media_bin = release_binary("obscura-media");
         anyhow::ensure!(media_bin.is_file(), "OBSCURA_TEST_BINARY_DIR must contain obscura-media: {}", media_bin.display());
         let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"));
         command.arg("--listen").arg(address.to_string())
@@ -256,6 +264,328 @@ async fn armed_authority() -> anyhow::Result<()> {
 
 fn read_pgid(path: &std::path::Path) -> anyhow::Result<i32> {
     Ok(std::fs::read_to_string(path)?.trim().parse()?)
+}
+
+/// F4.1: the accepted-but-unconsumed Register window, observed against the real
+/// endpoint and the real adapter.
+///
+/// The endpoint binds `session-<id>/encoder-control.sock` and then spawns
+/// `--media-bin`. This case passes a real-adapter wrapper as `--media-bin`.
+/// Before it `exec`s the real adapter, the wrapper renames the endpoint's real
+/// control socket aside to `encoder-control.sock.real` and binds a bounded
+/// pass-through relay at `encoder-control.sock`. The real adapter then connects
+/// to the relay; the relay connects to the real endpoint listener.
+///
+/// The relay forwards every byte unchanged in both directions and delays only
+/// the `Register` response. That delay changes no endpoint semantics: the real
+/// `EncoderControlState` commits `Armed`, the real `serve_connection` writes the
+/// response, the real `run_reader` and the real `SessionDurable` finalizer all
+/// run unmodified. The relay only withholds the endpoint's response bytes from
+/// the adapter, which is exactly the accepted-but-unconsumed precondition.
+///
+/// The interrupt is delivered while the adapter's own bounded `Register`
+/// exchange is still in flight, so the adapter cannot resolve the
+/// acknowledgement before the group identity is checked. While the relay holds
+/// the `Register` acknowledgement, the case asserts that the registered leader
+/// is still pinned as a live or zombie process; only after the endpoint's real
+/// finalizer retires the Armed authority does the relay see the control
+/// connection close, and only then may the adapter reap the leader. The
+/// endpoint retires authority on its own when the last control reference is
+/// released, which the finalizer reaches after the retained adapter `SIGTERM`
+/// triggers its notification failure; the case therefore also asserts that the
+/// endpoint acknowledges no authority while the acknowledgement is withheld.
+///
+/// The pin is observed at `+2s`, `+6s` and `+16s` after the interrupt. The last
+/// point is the discriminating one: the previous revision dropped the retained
+/// child after a five second retention window that began once its own bounded
+/// ten second exchange elapsed, so it reaped the leader and exited by about
+/// fifteen seconds. A correct owner keeps the direct child and the numeric
+/// group identity pinned for the whole held-ack interval, with no elapsed-time
+/// permission to drop.
+#[tokio::test]
+async fn real_endpoint_holds_register_ack_and_retires_before_reap() {
+    tokio::time::timeout(Duration::from_secs(180), held_register_ack())
+        .await
+        .expect("F4.1 held-ack case timed out")
+        .expect("F4.1 held-ack case failed");
+}
+
+async fn held_register_ack() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new("ob10e")?;
+    let root = fixture.root.clone();
+    let mut host = fixture.start_host().await?;
+    let session_id = fixture.session_id();
+
+    // The group helper records its pgid and the adapter parent, records every
+    // signal, and blocks. Blocking keeps the adapter's registration `Armed`
+    // and gives the case a stable group identity to read.
+    let group_dir = root.join("group");
+    std::fs::create_dir_all(&group_dir)?;
+    let group_pgid = group_dir.join("group.pgid");
+    let adapter_pid_file = group_dir.join("adapter.pid");
+    let group_signals = group_dir.join("group.signals");
+    let helper = group_dir.join("group.sh");
+    std::fs::write(&helper, format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{pgid}'\nprintf '%s\\n' \"$PPID\" > '{adapter}'\ntrap 'printf \"15\\n\" >> \"{signals}\"; exit 0' TERM\nwhile :; do sleep 0.2; done\n",
+        pgid = group_pgid.display(), adapter = adapter_pid_file.display(), signals = group_signals.display(),
+    ))?;
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))?;
+
+    // `relay.py`: bounded pass-through on the control socket. It binds the
+    // path the adapter connects to, dials the real endpoint listener, and
+    // forwards bytes both ways. It holds the endpoint's first response after it
+    // sees the `Register` request until `ack.release` exists, and writes
+    // `ack.held` once the endpoint's response has actually been received (that
+    // is the proof the endpoint committed `Armed`). `conn.closed` is written
+    // when the endpoint closes the connection, the authority-retirement edge.
+    let relay_ready = root.join("relay.ready");
+    let ack_held = root.join("ack.held");
+    let ack_release = root.join("ack.release");
+    let conn_closed = root.join("conn.closed");
+    let relay_log = root.join("relay.log");
+    let relay = root.join("relay.py");
+    std::fs::write(&relay, format!(r#"import json, os, socket, sys, threading, time
+
+listen_path, upstream_path = sys.argv[1], sys.argv[2]
+ready_path, held_path, release_path, closed_path, log_path = sys.argv[3:8]
+
+def note(message):
+    with open(log_path, 'a') as handle:
+        handle.write(message + '\n')
+
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(listen_path)
+srv.listen(1)
+with open(ready_path, 'w') as handle:
+    handle.write('ready')
+conn, _ = srv.accept()
+up = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+deadline = time.time() + 20
+while True:
+    try:
+        up.connect(upstream_path)
+        break
+    except OSError:
+        if time.time() > deadline:
+            raise
+        time.sleep(0.02)
+
+def adapter_to_endpoint():
+    while True:
+        try:
+            data = conn.recv(4096)
+        except OSError:
+            data = b''
+        if not data:
+            note('adapter-closed')
+            try:
+                up.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            return
+        note('a->e ' + repr(data))
+        try:
+            up.sendall(data)
+        except OSError:
+            return
+
+held = False
+
+def endpoint_to_adapter():
+    global held
+    buffer = b''
+    while True:
+        try:
+            data = up.recv(4096)
+        except OSError:
+            data = b''
+        if not data:
+            note('endpoint-closed')
+            with open(closed_path, 'w') as handle:
+                handle.write('closed')
+            try:
+                conn.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+            return
+        buffer += data
+        while b'\n' in buffer:
+            line, buffer = buffer.split(b'\n', 1)
+            payload = line + b'\n'
+            hold = False
+            try:
+                frame = json.loads(line.decode('utf-8'))
+                hold = frame.get('op') == 'register'
+            except Exception:
+                pass
+            if hold and not held:
+                held = True
+                note('hold ' + repr(payload))
+                with open(held_path, 'w') as handle:
+                    handle.write('held')
+                while not os.path.exists(release_path):
+                    up.settimeout(0.02)
+                    try:
+                        more = up.recv(4096)
+                    except socket.timeout:
+                        more = None
+                    except OSError:
+                        more = b''
+                    up.settimeout(None)
+                    if more == b'':
+                        note('endpoint-closed-while-held')
+                        with open(closed_path, 'w') as handle:
+                            handle.write('closed')
+                        try:
+                            conn.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        return
+                    if more:
+                        buffer += more
+                note('release ' + repr(payload))
+            else:
+                note('e->a ' + repr(payload))
+            try:
+                conn.sendall(payload)
+            except OSError:
+                return
+
+threading.Thread(target=adapter_to_endpoint, daemon=True).start()
+endpoint_to_adapter()
+"#))?;
+
+    // `adapter-wrapper.sh` is the `--media-bin`. It renames the endpoint's
+    // control socket aside, starts the relay at the original path, then execs
+    // the real adapter so the endpoint's direct child stays the real adapter.
+    let real_adapter = release_binary("obscura-media");
+    anyhow::ensure!(real_adapter.is_file(), "OBSCURA_TEST_BINARY_DIR must contain obscura-media: {}", real_adapter.display());
+    let relay_pid_file = root.join("relay.pid");
+    let wrapper_ready = root.join("wrapper.ready");
+    let wrapper = root.join("adapter-wrapper.sh");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\n\
+         video=''\n\
+         prev=''\n\
+         for arg in \"$@\"; do\n\
+           if [ \"$prev\" = '--video-socket' ]; then video=\"$arg\"; fi\n\
+           prev=\"$arg\"\n\
+         done\n\
+         session=$(dirname \"$video\")\n\
+         control=\"$session/encoder-control.sock\"\n\
+         realcontrol='{realcontrol}'\n\
+         i=0\n\
+         while [ ! -S \"$control\" ]; do\n\
+           i=$((i+1)); if [ \"$i\" -gt 500 ]; then echo 'control socket never bounded' >&2; exit 9; fi\n\
+           sleep 0.02\n\
+         done\n\
+         mv \"$control\" \"$realcontrol\"\n\
+         python3 '{relay}' \"$control\" \"$realcontrol\" '{ready}' '{held}' '{release}' '{closed}' '{log}' &\n\
+         echo $! > '{relay_pid}'\n\
+         i=0\n\
+         while [ ! -S \"$control\" ]; do\n\
+           i=$((i+1)); if [ \"$i\" -gt 500 ]; then echo 'relay never bounded' >&2; exit 9; fi\n\
+           sleep 0.02\n\
+         done\n\
+         : > '{wrapper_ready}'\n\
+         exec '{adapter}' \"$@\"\n",
+        relay = relay.display(), ready = relay_ready.display(), held = ack_held.display(),
+        release = ack_release.display(), closed = conn_closed.display(), log = relay_log.display(),
+        realcontrol = root.join("control.real").display(),
+        relay_pid = relay_pid_file.display(), wrapper_ready = wrapper_ready.display(),
+        adapter = real_adapter.display(),
+    ))?;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+
+    let mut endpoint = fixture.endpoint_with_media_bin(&wrapper, Some(&helper))?;
+    wait_socket(root.join("endpoint")).await;
+
+    let connector = fixture.connector()?;
+    let (mut control_socket, _token) = connect_control(&connector, fixture.address()).await?;
+    let ready = next_json(&mut control_socket).await?;
+    anyhow::ensure!(ready["session_id"].as_str() == Some(session_id.as_str()), "Ready session changed: {ready}");
+    control_socket.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
+    let attached = next_json(&mut control_socket).await?;
+    anyhow::ensure!(attached["type"] == "result", "observe attach failed: {attached}");
+
+    wait_file(&wrapper_ready, Duration::from_secs(30)).await?;
+    wait_file(&group_pgid, Duration::from_secs(60)).await?;
+    wait_file(&adapter_pid_file, Duration::from_secs(30)).await?;
+    let pgid = read_pgid(&group_pgid)?;
+    let adapter_pid: i32 = std::fs::read_to_string(&adapter_pid_file)?.trim().parse()?;
+    anyhow::ensure!(process_alive(adapter_pid), "the real adapter parent was not alive");
+
+    // The endpoint has committed `Armed` and written the Register response; the
+    // relay has received those bytes and is holding them. The adapter has not
+    // consumed the acknowledgement. Interrupt the live adapter *inside* the
+    // accepted-but-unconsumed window, while its bounded `Register` exchange is
+    // still in flight. The interrupt boundary must keep the retained direct
+    // child and the numeric group identity, because the endpoint has not
+    // acknowledged retirement.
+    wait_file(&ack_held, Duration::from_secs(30)).await?;
+    anyhow::ensure!(process_group_alive(pgid), "the registered group died before the acknowledgement was held");
+    anyhow::ensure!(!conn_closed.exists(), "the endpoint retired authority before the acknowledgement was held");
+    anyhow::ensure!(unsafe { libc::kill(adapter_pid, libc::SIGTERM) } == 0, "SIGTERM the live adapter");
+
+    // Observe the pin across the held-ack interval. A correct owner keeps both
+    // the adapter and the numeric group identity pinned because the endpoint has
+    // not acknowledged retirement. The prior revision instead dropped the
+    // retained child after its bounded ten second exchange plus a five second
+    // retention window, so from about fifteen seconds it released the leader.
+    for checkpoint in [2u64, 4, 14] {
+        tokio::time::sleep(Duration::from_secs(checkpoint)).await;
+        eprintln!("F4.1 checkpoint: adapter_alive={} group_alive={} conn_closed={} signals={:?}",
+            process_alive(adapter_pid), process_group_alive(pgid), conn_closed.exists(),
+            std::fs::read_to_string(&group_signals).unwrap_or_default());
+        anyhow::ensure!(process_group_alive(pgid),
+            "F4.1: the leader was reaped while the Register acknowledgement was still unconsumed");
+        anyhow::ensure!(process_alive(adapter_pid),
+            "F4.1: the adapter exited while the Register acknowledgement was still unconsumed");
+        anyhow::ensure!(!conn_closed.exists(),
+            "F4.1: the endpoint retired authority while the acknowledgement was still unconsumed");
+    }
+    let pinned = std::fs::read_to_string(&group_signals).unwrap_or_default();
+    anyhow::ensure!(!pinned.contains("15"),
+        "F4.1: the registered group was signalled while the acknowledgement was still unconsumed: {pinned:?}");
+
+    // Authority retirement: releasing the final control reference runs the real
+    // endpoint finalizer, which retires the Armed authority and closes the
+    // control connection. Only that close is the typed retirement edge, so only
+    // after it may the adapter reap the retained leader.
+    control_socket.send(Message::Close(None)).await?;
+    drop(control_socket);
+    wait_file(&conn_closed, Duration::from_secs(30)).await?;
+    let signals = wait_signals(&group_signals, Duration::from_secs(30)).await?;
+    anyhow::ensure!(signals.contains("15"),
+        "F4.1: the endpoint's Armed authority did not signal the registered group: {signals:?}");
+    // Release the held acknowledgement too, so a registration still pending at
+    // retirement resolves through the typed response rather than only through
+    // the close edge.
+    std::fs::write(&ack_release, b"release")?;
+
+    anyhow::ensure!(wait_group_reaped(pgid, Duration::from_secs(30)).await,
+        "F4.1: the leader was never reaped after authority retired");
+    anyhow::ensure!(wait_process_gone(adapter_pid, Duration::from_secs(30)).await,
+        "F4.1: the adapter did not exit after reaping its leader");
+
+    let session_dir = root.join(format!("endpoint/session-{session_id}"));
+    wait_dir_gone(&session_dir, Duration::from_secs(30)).await?;
+    eprintln!("F4.1: held Register ack, no reap during the window, retirement before reap");
+
+    let _ = endpoint.kill().await;
+    let _ = endpoint.wait().await;
+    let _ = host.kill().await;
+    let _ = host.wait().await;
+    if let Ok(text) = std::fs::read_to_string(&relay_pid_file) {
+        if let Ok(relay_pid) = text.trim().parse::<i32>() {
+            // Safety: signal the exact relay pid this fixture started.
+            let _ = unsafe { libc::kill(relay_pid, libc::SIGKILL) };
+        }
+    }
+    if process_group_alive(pgid) { unsafe { libc::kill(-pgid, libc::SIGKILL); } }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
 }
 
 fn process_alive(pid: i32) -> bool {
