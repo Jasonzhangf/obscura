@@ -276,6 +276,24 @@ impl EncoderChildOwner {
         self.child.is_some()
     }
 
+    /// Relinquish direct-child ownership without killing, reaping or signalling
+    /// the group. It is used only when endpoint signal authority is still
+    /// unsettled: the leader must survive this adapter's exit so the endpoint
+    /// can finish the acknowledged cleanup. Forgetting the retained `Child`
+    /// disarms its `kill_on_drop`, and clearing the group identity makes any
+    /// later signal from this owner impossible. Returns the abandoned pgid.
+    pub fn relinquish_live_child(&mut self) -> Option<i32> {
+        let pgid = self.group.take();
+        if let Some(child) = self.child.take() {
+            // `Child::drop` with `kill_on_drop(true)` would SIGKILL the leader;
+            // forgetting the handle leaves the process running for the endpoint
+            // that still owns signal authority over it.
+            std::mem::forget(child);
+        }
+        self.registration = RegistrationState::Unregistered;
+        pgid
+    }
+
     /// Cooperative group stop/kill/reap for a registered group. It revokes
     /// before reaping the leader so the endpoint signal cannot address a
     /// reused process id.
@@ -337,15 +355,24 @@ impl EncoderChildOwner {
     async fn stop_kill_reap(&mut self) -> Result<EncoderStop> {
         let group = self.group.context("Encoder group identity missing")?;
         signal_group(group, libc::SIGTERM);
-        let leader_exited = self.reap_within(GROUP_GRACE).await?;
+        // Decide on escalation from the group's own existence, never from a
+        // reaped leader. The leader stays unreaped here, so its numeric pgid
+        // still names exactly this group when a later SIGKILL is chosen. Reaping
+        // first would release that identity for reuse and let a stale pgid
+        // address an unrelated group.
         let group_gone = wait_group_gone(group, GROUP_GRACE).await;
-        let escalated = !leader_exited || !group_gone;
+        let escalated = !group_gone;
         if escalated {
+            // The leader is still unreaped, so the pgid is still pinned to this
+            // process group.
             signal_group(group, libc::SIGKILL);
         }
         if !wait_group_gone(group, REAP_DEADLINE).await {
             bail!("Encoder process group survived SIGKILL");
         }
+        // Every signal decision is complete. Retire child/group authority at
+        // the one actual reap boundary, so no further caller can signal a
+        // reaped, reusable identity.
         let status = self.reaped_status().await?;
         if escalated {
             Ok(EncoderStop::KilledAndReaped(status))
@@ -354,17 +381,9 @@ impl EncoderChildOwner {
         }
     }
 
-    /// Try to reap the leader within `grace`. Returns true when the leader
-    /// exited and was reaped, false when the deadline expired.
-    async fn reap_within(&mut self, grace: Duration) -> Result<bool> {
-        let child = self.child.as_mut().context("Encoder child missing")?;
-        match tokio::time::timeout(grace, child.wait()).await {
-            Ok(status) => status.map(|_| true).context("Wait for encoder leader"),
-            Err(_) => Ok(false),
-        }
-    }
-
-    /// Block for the already-signalled leader to exit and be reaped.
+    /// Reap the already-signalled leader and retire signal authority. This is
+    /// the only place the direct child is reaped, so it is the only place the
+    /// retained group/child identity is cleared.
     async fn reaped_status(&mut self) -> Result<std::process::ExitStatus> {
         let status = tokio::time::timeout(REAP_DEADLINE, async {
             let child = self.child.as_mut().context("Encoder child missing")?;

@@ -142,7 +142,7 @@ async fn main() -> Result<()> {
                     Err(error) => {
                         let failure = VideoPacket::EncoderUnavailable { session_id: info.session_id, message: error.to_string() };
                         send(&mut output, &failure, &[]).await?;
-                        return Err(error);
+                        return terminal_ownership_exit(&mut owner, error);
                     }
                 }
             }
@@ -176,9 +176,30 @@ async fn race<T>(
 /// settle and the adapter exits directly.
 async fn interrupt(owner: &mut obscura_media::encoder_owner::EncoderChildOwner, signal: &'static str) -> Result<()> {
     if owner.has_live_child() {
-        owner.finalize().await.context("Finalize encoder group on interrupt")?;
+        if let Err(cleanup) = owner.finalize().await {
+            // The endpoint may still own signal authority and has not
+            // acknowledged. Preserve the leader for that authority instead of
+            // letting this owner's drop SIGKILL and reap it silently.
+            let preserved = owner.relinquish_live_child();
+            return Err(cleanup.context(format!(
+                "Media adapter received {signal} with encoder authority unresolved; preserved group {preserved:?}"
+            )));
+        }
     }
     Err(anyhow::anyhow!("Media adapter received {signal} before completion"))
+}
+
+/// Ordinary adapter-error exit. When the retained owner still holds a spawned
+/// leader, its finalization could not settle endpoint authority (an unresolved
+/// registration or revoke). Preserve the leader for the endpoint that still owns
+/// that authority instead of dropping the owner, whose `kill_on_drop` child
+/// would SIGKILL and reap it without the acknowledgement.
+fn terminal_ownership_exit(owner: &mut obscura_media::encoder_owner::EncoderChildOwner, error: anyhow::Error) -> Result<()> {
+    if owner.has_live_child() {
+        let preserved = owner.relinquish_live_child();
+        eprintln!("media adapter preserved unresolved encoder group {preserved:?} for endpoint authority: {error:#}");
+    }
+    Err(error)
 }
 
 /// Owns the standalone `encoder-control.sock` path this invocation bound. It

@@ -196,6 +196,30 @@ async fn exercise() -> anyhow::Result<()> {
     let session_dir_retained = session_dir.exists();
     let control_path_retained = session_dir.join("encoder-control.sock").exists();
 
+    // F2: a new attachment to the same session must learn the retained
+    // finalization failure instead of waiting for a finalization that will
+    // never complete. Drive a fresh real mTLS control attachment and attach in
+    // observe mode; the endpoint host-admits and Ready advertises the same
+    // session, but the exact media binding acquire must return the retained
+    // failure terminal.
+    let (mut reattach, _reattach_token) = connect_control(&connector, address).await?;
+    let reattach_ready = next_json(&mut reattach).await?;
+    anyhow::ensure!(reattach_ready["session_id"].as_str() == Some(session_id.as_str()),
+        "F2: reattach Ready session changed: {reattach_ready}");
+    reattach.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
+    let reattach_result = tokio::time::timeout(Duration::from_secs(20), next_json(&mut reattach)).await
+        .map_err(|_| anyhow::anyhow!("F2: reattachment waited for the retained finalization failure instead of returning it"))??;
+    eprintln!("B9 F2 reattach terminal: {reattach_result}");
+    anyhow::ensure!(reattach_result["type"] == "error"
+            && reattach_result["code"] == "SESSION_MEDIA_FINALIZE_FAILED",
+        "F2: a new attachment to a retained finalization failure did not return the explicit failure terminal: {reattach_result}");
+    anyhow::ensure!(reattach_result["message"].as_str().is_some_and(|message| message.contains("SESSION_ENCODER_PERMIT_UNSETTLED")),
+        "F2: the retained failure terminal did not carry the exact encoder-permit terminal: {reattach_result}");
+    // The preserved durable owner must remain unchanged by the refused
+    // reattachment.
+    anyhow::ensure!(process_alive(adapter_pid), "F2: the retained adapter was dropped while answering the reattachment");
+    anyhow::ensure!(session_dir.exists(), "F2: the retained session directory was removed while answering the reattachment");
+
     // SIGTERM the endpoint. Shutdown must surface the retained per-session
     // failure and exit nonzero. Both the release terminal and the shutdown
     // terminal carry the registration id.

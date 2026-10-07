@@ -306,16 +306,36 @@ enum FinalizeAction {
 /// adapters for the whole endpoint lifetime.
 struct SessionMediaRegistry {
     entries: HashMap<String, SessionMediaEntry>,
-    /// Bumped whenever a finalizing entry is removed. A waiter for a session
-    /// that is shutting down waits on this channel instead of the registry
-    /// mutex, so unrelated sessions are never blocked by that teardown.
-    finalized: watch::Sender<u64>,
 }
 
 impl Default for SessionMediaRegistry {
     fn default() -> Self {
-        Self { entries: HashMap::new(), finalized: watch::channel(0).0 }
+        Self { entries: HashMap::new() }
     }
+}
+
+/// Readiness of one session entry for a new [`SessionGrant::acquire`]. `Open`
+/// means the entry is absent or not finalizing. `Finalizing` carries the
+/// in-progress terminal to await outside the registry lock. `Failed` carries
+/// the retained finalization failure so a new attachment returns it instead of
+/// waiting on a generation that never advances.
+enum SessionAvailability {
+    Open,
+    Finalizing(watch::Receiver<CompletionState>),
+    Failed(String),
+}
+
+/// Why [`SessionGrant::acquire`] returned without a binding. Only
+/// `FinalizationFailed` is an explicit attachment terminal; an ordinary
+/// `Acquire` failure keeps the previous behavior of logging the error and
+/// leaving the control attachment alive with an unbound media grant.
+pub enum AcquireError {
+    /// The session entry is retained with a failed finalization. The new
+    /// attachment learns the retained terminal instead of waiting on a
+    /// finalization that will never complete.
+    FinalizationFailed(String),
+    /// An ordinary acquisition failure (adapter spawn, socket bind, ...).
+    Acquire(anyhow::Error),
 }
 
 impl SessionMediaRegistry {
@@ -416,16 +436,24 @@ impl SessionMediaRegistry {
             .is_some_and(|entry| entry.finalizing && Arc::ptr_eq(&entry.durable, durable));
         if same {
             self.entries.remove(&durable.session_id);
-            self.finalized.send_modify(|generation| *generation = generation.wrapping_add(1));
         }
     }
 
-    fn is_finalizing(&self, session_id: &str) -> bool {
-        self.entries.get(session_id).is_some_and(|entry| entry.finalizing)
-    }
-
-    fn finalized_receiver(&self) -> watch::Receiver<u64> {
-        self.finalized.subscribe()
+    /// Classify a session entry for acquisition. A retained failure is an
+    /// explicit terminal: the caller returns it instead of waiting on a
+    /// finalization that will never complete.
+    fn availability(&self, session_id: &str) -> SessionAvailability {
+        let Some(entry) = self.entries.get(session_id) else { return SessionAvailability::Open; };
+        if !entry.finalizing { return SessionAvailability::Open; }
+        match entry.completion.as_ref().map(|completion| completion.borrow().clone()) {
+            Some(CompletionState::Failed(failure)) => SessionAvailability::Failed(failure),
+            _ => match entry.completion.as_ref().map(|completion| completion.subscribe()) {
+                Some(receiver) => SessionAvailability::Finalizing(receiver),
+                None => SessionAvailability::Failed(
+                    "SESSION_FINALIZE_ABANDONED: session media entry is finalizing without a completion owner".into(),
+                ),
+            },
+        }
     }
 
     fn snapshots(&self) -> Vec<Arc<SessionDurable>> {
@@ -527,12 +555,16 @@ impl EndpointOwner {
     /// Session-local finalization entry. It marks that one entry finalizing,
     /// signals its cancel handle and awaits that session's supervisor. If the
     /// entry is already finalizing (a release is in flight), it awaits the
-    /// in-progress completion instead of starting a second finalizer.
+    /// in-progress completion instead of starting a second finalizer. The
+    /// completion await is never taken while the registry mutex is held: a
+    /// finalizing entry is only published `Succeeded` after this mutex is
+    /// re-acquired, so a waiter that held it would deadlock against its own
+    /// finalizer.
     async fn finalize_session(&self, durable: &Arc<SessionDurable>) -> Result<()> {
         let action = { self.registry.lock().await.begin_finalize(durable) };
         match action {
             FinalizeAction::Absent => Ok(()),
-            FinalizeAction::InProgress(completion) => await_completion(completion).await,
+            FinalizeAction::InProgress(completion) => return await_completion(completion).await,
             FinalizeAction::Start(supervisor, completion) => {
                 durable.cancel.send_replace(true);
                 let joined = match supervisor {
@@ -771,21 +803,34 @@ pub struct SessionGrant {
 impl SessionGrant {
     /// Acquire the exact-session media reference for `session_id`. The control
     /// attach path never blocks on an adapter connection or first frame. When
-    /// the same session's entry is `finalizing`, the acquire waits for that
-    /// entry to be removed and then creates a fresh one, so a new attachment
-    /// never reuses a durable that is already shutting down. The wait is on a
-    /// per-registry notification, not on the registry mutex, so unrelated
-    /// sessions are never blocked by another session's teardown.
-    pub async fn acquire(&self, session_id: &str) -> Result<(watch::Receiver<Option<Arc<EncodedFrame>>>, Arc<SessionDurable>)> {
-        let mut finalized = self.registry.lock().await.finalized_receiver();
+    /// the same session's entry is running its finalization, the acquire waits
+    /// for that entry to reach its terminal and then creates a fresh one, so a
+    /// new attachment never reuses a durable that is already shutting down. A
+    /// retained finalization failure is returned explicitly instead of waiting
+    /// on an entry that is deliberately kept and will never be removed. The
+    /// completion wait is never taken while the registry mutex is held.
+    pub async fn acquire(&self, session_id: &str) -> std::result::Result<(watch::Receiver<Option<Arc<EncodedFrame>>>, Arc<SessionDurable>), AcquireError> {
         let (encoded, durable) = loop {
-            {
+            let availability = {
                 let mut registry = self.registry.lock().await;
-                if !registry.is_finalizing(session_id) {
-                    break registry.acquire(&self.socket_dir, &self.host_dir, &self.media_bin, &self.ffmpeg, session_id)?;
+                match registry.availability(session_id) {
+                    SessionAvailability::Open => break registry.acquire(
+                        &self.socket_dir, &self.host_dir, &self.media_bin, &self.ffmpeg, session_id,
+                    ).map_err(AcquireError::Acquire)?,
+                    other => other,
                 }
+            };
+            match availability {
+                SessionAvailability::Finalizing(completion) => {
+                    // Await the running finalization outside the registry lock.
+                    // A failure terminal is returned explicitly; success means
+                    // the entry was removed, so the loop acquires a fresh one.
+                    await_completion(completion).await
+                        .map_err(|error| AcquireError::FinalizationFailed(format!("{error:#}")))?;
+                }
+                SessionAvailability::Failed(failure) => return Err(AcquireError::FinalizationFailed(failure)),
+                SessionAvailability::Open => unreachable!("open entries acquire inside the lock"),
             }
-            finalized.changed().await.context("session registry finalization channel closed")?;
         };
         if let Some(grant) = self.grants.lock().expect("grant owner").get_mut(&self.token) {
             grant.media = Some(encoded.clone());
@@ -827,15 +872,31 @@ impl Drop for SessionGrant {
 /// durable resource owner and its exact terminal instead of publishing
 /// successful cleanup.
 async fn release_exact_session(registry: &Arc<AsyncMutex<SessionMediaRegistry>>, durable: &Arc<SessionDurable>) -> Result<()> {
-    let released = {
+    // Take the release action under the registry lock, but never await the
+    // finalization completion while holding it. The finalizer must re-acquire
+    // this same mutex in `remove_finalized` before it publishes `Succeeded`; a
+    // waiter that held the guard across the completion await would deadlock
+    // against its own finalizer and block unrelated sessions.
+    enum Action {
+        Nothing,
+        Await(watch::Receiver<CompletionState>),
+        Run(Arc<SessionDurable>, watch::Sender<CompletionState>),
+    }
+    let action = {
         let mut registry = registry.lock().await;
         match registry.release(durable) {
-            Release::Ready(durable, completion) => Some((durable, completion)),
-            Release::Finalizing(completion) => return await_completion(completion).await,
-            Release::Absent | Release::Referenced => None,
+            Release::Ready(durable, completion) => Action::Run(durable, completion),
+            Release::Finalizing(completion) => Action::Await(completion),
+            Release::Absent | Release::Referenced => Action::Nothing,
         }
     };
-    let Some((durable, completion)) = released else { return Ok(()); };
+    // The guard above is already dropped: the completion await and the
+    // supervisor join below both run without holding the registry mutex.
+    let (durable, completion) = match action {
+        Action::Nothing => return Ok(()),
+        Action::Await(completion) => return await_completion(completion).await,
+        Action::Run(durable, completion) => (durable, completion),
+    };
     let supervisor = durable.supervisor.lock().expect("supervisor owner").take();
     let registry = Arc::clone(registry);
     // The completion runs in a detached task so aborting the caller after the
@@ -953,6 +1014,74 @@ mod tests {
         loop {
             if registry.lock().await.entries.get("cancel-session").is_none() { break; }
             assert!(tokio::time::Instant::now() < deadline, "cancelled connection left its exact-session reference");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F1: a second release of one session while the first release is still
+    /// finalizing must not hold the registry mutex across the completion await.
+    /// The first release owns the completion sender and its supervisor is gated,
+    /// so the entry is neither removed nor published. The overlapped release
+    /// therefore parks on that completion, and the registry mutex must be free
+    /// for the finalizer to publish. A release that keeps the guard live inside
+    /// the await waits forever while still holding the mutex, so the probe lock
+    /// below is never acquired.
+    #[tokio::test]
+    async fn release_overlapping_in_progress_finalization_awaits_outside_the_registry_lock() {
+        let root = test_root("overlap");
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let supervisor = tokio::spawn(async move {
+            let _ = gate_rx.await;
+            Ok(())
+        });
+        let durable = durable(&root, "overlap-session", supervisor);
+        let registry = Arc::new(AsyncMutex::new(SessionMediaRegistry::default()));
+        insert_entry(&mut *registry.lock().await, Arc::clone(&durable));
+
+        let finalizer_registry = Arc::clone(&registry);
+        let finalizer_durable = Arc::clone(&durable);
+        let finalizer = tokio::spawn(async move {
+            release_exact_session(&finalizer_registry, &finalizer_durable).await
+        });
+        // Wait until the first release has marked the entry finalizing. From
+        // here the second release necessarily takes the already-finalizing
+        // branch and awaits this same completion receiver.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let finalizing = registry.lock().await.entries.get("overlap-session").is_some_and(|entry| entry.finalizing);
+            if finalizing { break; }
+            assert!(tokio::time::Instant::now() < deadline, "first release never marked the entry finalizing");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let waiter_registry = Arc::clone(&registry);
+        let waiter_durable = Arc::clone(&durable);
+        let waiter = tokio::spawn(async move {
+            release_exact_session(&waiter_registry, &waiter_durable).await
+        });
+        // Let the overlapped release reach the completion await. Its supervisor
+        // is gated, so the finalizer has neither removed the entry nor published
+        // a terminal. The registry mutex must be free for that finalizer.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let guard = tokio::time::timeout(Duration::from_millis(250), registry.lock()).await
+            .expect("F1: the release completion was awaited while the registry lock was held");
+        assert!(guard.entries.get("overlap-session").is_some_and(|entry| entry.finalizing),
+            "F1: the overlapped entry was no longer finalizing");
+        drop(guard);
+
+        // Release the supervisor: the finalizer removes the entry and publishes
+        // the terminal, and the overlapped release must observe it.
+        let _ = gate_tx.send(());
+        let terminal = tokio::time::timeout(Duration::from_secs(5), waiter).await
+            .expect("F1: the overlapping release hung on the completion await")
+            .expect("overlapping release task panicked");
+        assert!(terminal.is_ok(), "overlapping release reported an error");
+        let terminal = finalizer.await.expect("first release task panicked");
+        assert!(terminal.is_ok(), "first release reported an error");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while registry.lock().await.entries.get("overlap-session").is_some() {
+            assert!(tokio::time::Instant::now() < deadline, "overlapped session was not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let _ = std::fs::remove_dir_all(&root);

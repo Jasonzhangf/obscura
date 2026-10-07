@@ -57,6 +57,51 @@ async fn serve_control(listener: UnixListener) {
     }
 }
 
+/// Real control peer that grants acquisition, commits registration, then closes
+/// the stream without answering `Revoke`. The adapter therefore reaches an
+/// explicit unresolved revoke terminal.
+async fn serve_control_register_then_close(listener: UnixListener) {
+    let Ok((stream, _)) = listener.accept().await else { return; };
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    loop {
+        let mut line = String::new();
+        let count = match reader.read_line(&mut line).await { Ok(count) => count, Err(_) => return };
+        if count == 0 { return; }
+        let request: EncoderControlRequest = match serde_json::from_str(line.trim_end()) { Ok(request) => request, Err(_) => return };
+        let response = match request {
+            EncoderControlRequest::Acquire { .. } => EncoderControlResponse::Acquire { permit: EncoderPermit::Granted },
+            EncoderControlRequest::Register { .. } => EncoderControlResponse::Register { refused: false },
+            EncoderControlRequest::Revoke { .. } => return,
+            EncoderControlRequest::Settle { .. } => EncoderControlResponse::Settle,
+        };
+        let mut bytes = serde_json::to_vec(&response).unwrap();
+        bytes.push(b'\n');
+        if write.write_all(&bytes).await.is_err() { return; }
+        if matches!(request, EncoderControlRequest::Register { .. }) { return; }
+    }
+}
+
+/// Write a wrapper encoder whose leader exits on its own while a same-group
+/// descendant records whether the leader is still present. When the leader is
+/// reaped before acknowledgement, `leader_gone` is written while the
+/// descendant is still alive.
+fn write_leader_retention_probe(root: &Path, name: &str, marker: &Path) -> PathBuf {
+    let observer = root.join(format!("{name}-observer.sh"));
+    let ready = root.join(format!("{name}.ready"));
+    write_executable(&observer, &format!(
+        "#!/bin/sh\nleader=\"$1\"\nmarker=\"$2\"\nready=\"$3\"\n: > \"$ready\"\necho leader_alive > \"$marker\"\nwhile kill -0 \"$leader\" 2>/dev/null; do sleep 0.01; done\necho leader_gone > \"$marker\"\nexit 0\n"
+    ));
+    let wrapper = root.join(format!("{name}.sh"));
+    write_executable(&wrapper, &format!(
+        "#!/bin/sh\nleader=$$\nsh '{observer}' \"$leader\" '{marker}' '{ready}' </dev/null >/dev/null 2>&1 &\nwhile [ ! -f '{ready}' ]; do sleep 0.02; done\nexec 1>&- 2>&-\nwhile :; do sleep 0.1; done\n",
+        observer = observer.display(),
+        marker = marker.display(),
+        ready = ready.display(),
+    ));
+    wrapper
+}
+
 async fn write_frame(socket: &mut UnixStream, packet: &FramePacket, pixels: &[u8]) {
     let mut header = serde_json::to_vec(packet).unwrap();
     header.push(b'\n');
@@ -325,4 +370,120 @@ async fn standalone_adapter_exits_on_sigterm_while_waiting_for_frames() {
         "G5: the idle standalone adapter ignored SIGTERM and did not exit within its bounded window");
     assert!(socket_removed,
         "G5: the interrupted standalone adapter must remove its encoder-control socket path");
+}
+
+/// Write a wrapper encoder whose leader exits on its own while a same-group
+/// descendant ignores SIGTERM and polls the leader's liveness. The descendant
+/// writes `reaped` as soon as `kill -0 <leader>` fails while the descendant is
+/// still alive, i.e. exactly when the leader was reaped before the group was
+/// fully settled.
+fn write_reap_ordering_probe(root: &Path, name: &str, marker: &Path) -> PathBuf {
+    let observer = root.join(format!("{name}-observer.sh"));
+    let ready = root.join(format!("{name}.ready"));
+    write_executable(&observer, &format!(
+        "#!/bin/sh\n\
+         trap '' TERM\n\
+         leader=\"$1\"\n\
+         marker=\"$2\"\n\
+         ready=\"$3\"\n\
+         : > \"$ready\"\n\
+         while :; do\n\
+           if ! kill -0 \"$leader\" 2>/dev/null; then echo reaped > \"$marker\"; exit 0; fi\n\
+           sleep 0.01\n\
+         done\n"
+    ));
+    let wrapper = root.join(format!("{name}.sh"));
+    write_executable(&wrapper, &format!(
+        "#!/bin/sh\n\
+         leader=$$\n\
+         sh '{observer}' \"$leader\" '{marker}' '{ready}' </dev/null >/dev/null 2>&1 &\n\
+         while [ ! -f '{ready}' ]; do sleep 0.02; done\n\
+         exec 1>&- 2>&-\n\
+         while :; do sleep 0.1; done\n",
+        observer = observer.display(),
+        marker = marker.display(),
+        ready = ready.display(),
+    ));
+    wrapper
+}
+
+/// F3: an encoder leader that exits while a same-group descendant resists
+/// cleanup must stay unreaped until every group signal is complete. Pre-fix
+/// `stop_kill_reap` reaped the leader within the cooperative grace and then
+/// escalated with a SIGKILL addressed to a reaped pgid. The resistant descendant
+/// observes that early reap (`kill -0 <leader>` starts failing while the
+/// descendant is still alive) and records it; the fixed ordering reaps the
+/// leader only after the group is gone, so the descendant is already dead and
+/// records nothing.
+#[tokio::test]
+async fn standalone_adapter_pins_leader_identity_until_group_settled() {
+    let dir = Directory::new();
+    let marker = dir.0.join("reap-ordering.marker");
+    let wrapper = write_reap_ordering_probe(&dir.0, "reaporder", &marker);
+    let (reply, status) = run_standalone_failure(&dir, &wrapper).await;
+    assert!(matches!(reply, VideoPacket::EncoderUnavailable { .. }),
+        "a leader that exits without output must emit EncoderUnavailable, got {reply:?}");
+    assert!(!status.success(), "a leader that exits without output must fail the adapter process");
+    let early_reap = std::fs::read_to_string(&marker).unwrap_or_default();
+    assert!(early_reap.trim().is_empty(),
+        "F3: the encoder leader was reaped while a same-group descendant was still alive, so the escalation signalled a reaped identity");
+}
+
+/// F4: when the endpoint commits a registration but the revoke acknowledgement
+/// is never delivered, the standalone adapter must return without dropping its
+/// retained `Child`. Dropping that owner would SIGKILL and reap the leader
+/// without the required acknowledgement. The same-group observer records
+/// whether the leader was reaped while it was still present.
+#[tokio::test]
+async fn standalone_adapter_preserves_leader_when_revoke_acknowledgment_is_unavailable() {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let control = UnixListener::bind(dir.0.join("encoder-control.sock")).unwrap();
+    std::fs::set_permissions(dir.0.join("encoder-control.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    drop(tokio::spawn(serve_control_register_then_close(control)));
+
+    let marker = dir.0.join("leader-retention.marker");
+    let pgid_file = dir.0.join("leader.pgid");
+    let wrapper = write_leader_retention_probe(&dir.0, "leaderretention", &marker);
+    let wrapper = {
+        let wrapper = wrapper.display().to_string();
+        let pgid = pgid_file.display().to_string();
+        let wrapper_text = format!(
+            "#!/bin/sh\necho \"$$\" > {pgid}\nexec {wrapper}\n",
+        );
+        let wrapper_path = dir.0.join("leaderretention-pgid.sh");
+        write_executable(&wrapper_path, &wrapper_text);
+        wrapper_path
+    };
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw"))
+        .arg("--video-socket").arg(dir.0.join("video"))
+        .arg("--ffmpeg").arg(&wrapper);
+    let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (mut source, _) = raw.accept().await.unwrap();
+    let mut receiver = BufReader::new(video.accept().await.unwrap().0);
+
+    let (packet, pixels) = frame(64, 48);
+    write_frame(&mut source, &packet, &pixels).await;
+    let (reply, _) = tokio::time::timeout(Duration::from_secs(15), read_video(&mut receiver)).await
+        .expect("the adapter never emitted a packet for the unresolved revoke");
+    assert!(matches!(reply, VideoPacket::EncoderUnavailable { .. }),
+        "unresolved revoke must emit EncoderUnavailable, got {reply:?}");
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output()).await
+        .expect("adapter did not exit after the unresolved revoke").unwrap();
+    assert!(!output.status.success(),
+        "unresolved revoke must fail the adapter process: {}", String::from_utf8_lossy(&output.stderr));
+
+    let pgid: i32 = std::fs::read_to_string(&pgid_file).unwrap().trim().parse().unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let observed = std::fs::read_to_string(&marker).expect("the encoder descendant must record leader retention");
+    assert_eq!(observed.trim(), "leader_alive",
+        "F4: the adapter silently killed and reaped the leader without the revoke acknowledgement");
+    assert!(group_alive(pgid),
+        "F4: the unresolved revoke exit left no encoder group for endpoint authority");
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
+        "F4: the test fixture encoder group survived explicit cleanup");
 }

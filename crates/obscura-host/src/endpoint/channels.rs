@@ -8,7 +8,7 @@ use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
 use crate::remote_admission::{self, InitialProfileGrant, RemoteAdmissionErrorCode, RemoteAdmissionRequest, RemoteAdmissionResult, RemotePrincipalContext};
-use super::server::{SessionDurable, SessionGrant};
+use super::server::{AcquireError, SessionDurable, SessionGrant};
 
 pub type Socket = WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
 
@@ -184,7 +184,23 @@ pub async fn control(
                 // adapter connection or a first frame, so the consumer cannot
                 // observe a binding that the endpoint has not yet acquired.
                 update_media_state(&active, &result);
-                reconcile_binding(&grant, &active, &mut binding).await;
+                if let Err(error) = reconcile_binding(&grant, &active, &mut binding).await {
+                    match error {
+                        // A retained finalization failure is an explicit
+                        // attachment terminal: return it instead of the attach
+                        // result so the caller never treats an unsettleable
+                        // session as attached.
+                        AcquireError::FinalizationFailed(failure) => {
+                            let failure = media_binding_failure(request_id, &failure);
+                            send(&mut remote, Message::text(serde_json::to_string(&failure)?)).await?;
+                            break;
+                        }
+                        // An ordinary acquisition failure keeps the pre-existing
+                        // behavior: log it and leave the control attachment
+                        // alive with an unbound media grant.
+                        AcquireError::Acquire(error) => eprintln!("media binding acquire failed: {error:#}"),
+                    }
+                }
                 send(&mut remote, Message::text(serde_json::to_string(&result)?)).await?;
                 if terminal_denial {
                     release_binding(&grant, &mut binding).await;
@@ -250,7 +266,15 @@ pub async fn control(
                         &mut browser_responses, &mut terminal_pending);
                     continue;
                 }
-                reconcile_binding(&grant, &active, &mut binding).await;
+                if let Err(error) = reconcile_binding(&grant, &active, &mut binding).await {
+                    // The browser response is already dispatched on this path;
+                    // surface the retained failure for diagnosis without
+                    // abandoning the surviving WebRTC/control attachment.
+                    match error {
+                        AcquireError::FinalizationFailed(failure) => eprintln!("media binding finalization failed: {failure}"),
+                        AcquireError::Acquire(error) => eprintln!("media binding acquire failed: {error:#}"),
+                    }
+                }
                 if terminal || detached {
                     fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
                         &mut browser_responses, &mut terminal_pending);
@@ -404,11 +428,11 @@ async fn reconcile_binding(
     grant: &SessionGrant,
     active: &watch::Sender<MediaState>,
     binding: &mut Option<(String, Arc<SessionDurable>, watch::Receiver<Option<Arc<EncodedFrame>>>)>,
-) {
+) -> std::result::Result<(), AcquireError> {
     let current = active.borrow().clone();
     let wanted = if current.attached { current.session_id.clone() } else { None };
     let unchanged = binding.as_ref().is_some_and(|(session_id, _, _)| Some(session_id) == wanted.as_ref());
-    if unchanged { return; }
+    if unchanged { return Ok(()); }
     if let Some((_, durable, _)) = binding.take() {
         // A failed finalizer is retained and reported by the durable owner; it
         // must not abort the surviving control attachment or another session's
@@ -418,10 +442,29 @@ async fn reconcile_binding(
         }
     }
     if let Some(session_id) = wanted {
+        // A retained finalization failure surfaces here as an explicit
+        // terminal instead of an unbounded wait; an ordinary acquisition
+        // failure is reported separately so the caller can keep the attach.
         match grant.acquire(&session_id).await {
             Ok((encoded, durable)) => { *binding = Some((session_id, durable, encoded)); }
-            Err(error) => eprintln!("media binding acquire failed for {session_id}: {error:?}"),
+            Err(AcquireError::FinalizationFailed(failure)) => return Err(AcquireError::FinalizationFailed(failure)),
+            Err(AcquireError::Acquire(error)) => {
+                return Err(AcquireError::Acquire(error.context(format!("exact media binding acquire failed for {session_id}"))));
+            }
         }
+    }
+    Ok(())
+}
+
+/// Typed, correlated attachment failure for a session whose retained
+/// finalization did not succeed. It carries the endpoint terminal code and the
+/// exact registration-bearing message, so the attachment learns the retained
+/// terminal instead of waiting for a success that will never arrive.
+fn media_binding_failure(request_id: u64, failure: &str) -> Response {
+    Response::Error {
+        id: request_id,
+        code: "SESSION_MEDIA_FINALIZE_FAILED".into(),
+        message: failure.to_owned(),
     }
 }
 
