@@ -94,6 +94,11 @@ async fn retained_finalization_failure_receiver_error_cleans_up_launched_adapter
     let outcome = run_fixture_fault("error", &sink, Duration::from_secs(240)).await;
     assert!(outcome.is_err(), "the injected post-launch receiver failure must fail the case");
     assert_recorded_adapter_gone(&sink).await;
+    // R8-F5's "no second SIGKILL to the recorded pid" property is asserted by the
+    // F5 black-box device (`r10_f5_cleanup_disarms_external_pid_sink`), which
+    // observes the real outbound signal from outside this process through an
+    // injected observer. No in-process counter is kept: it would be a second,
+    // independently unverified source for the same fact.
 }
 
 /// F2: the outer case timeout must also reach cleanup. `hang` blocks after the
@@ -105,6 +110,37 @@ async fn retained_finalization_failure_timeout_cleans_up_launched_adapter() {
     let outcome = run_fixture_fault("hang", &sink, Duration::from_secs(90)).await;
     assert!(outcome.is_err(), "the hanging case must be cancelled by the case timeout");
     assert_recorded_adapter_gone(&sink).await;
+}
+
+/// R8-F6: cleanup failure must be reported and must retain the records needed to
+/// finish the job. A non-numeric pid record cannot be verified as terminated, so
+/// the cleanup owner must return an error, keep the pid record, and stay armed
+/// instead of silently removing the record and dropping signal authority.
+#[tokio::test]
+async fn final_failure_fixture_retains_pid_record_when_termination_unverified() {
+    let sink = fixture_pid_sink();
+    std::fs::write(&sink, b"not-a-pid").unwrap();
+    let endpoint = Command::new("sleep").arg("300").kill_on_drop(true).spawn().unwrap();
+    let host = Command::new("sleep").arg("300").kill_on_drop(true).spawn().unwrap();
+    let mut fixture = FinalFailureFixture {
+        label: "r8-f6 cleanup-failure fixture",
+        pid_file: sink.clone(),
+        adapter_termination_owed: true,
+        endpoint,
+        host,
+        producer_task: None,
+        root: PathBuf::new(),
+    };
+    let cleanup = fixture.cleanup().await;
+    assert!(cleanup.is_err(), "cleanup must report the unverified adapter termination");
+    let message = format!("{:#}", cleanup.unwrap_err());
+    assert!(message.contains("cleanup incomplete"), "cleanup error must be explicit: {message}");
+    assert!(sink.exists(), "cleanup must retain the pid record when termination is not verified");
+    assert!(fixture.adapter_termination_owed, "cleanup must leave the termination owner armed");
+    // Disarm before Drop so the test-owned signal arm is not left set, then
+    // remove the retained evidence record.
+    fixture.adapter_termination_owed = false;
+    let _ = std::fs::remove_file(&sink);
 }
 
 /// Two authorized receivers bound to two distinct Host profiles run at the same
@@ -1000,12 +1036,17 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
         }
     });
 
+    // F6 observation device: the fault hook must touch the same record path the
+    // fixture cleanup owner will read. `p1_pid_file` itself moves into the
+    // fixture, so keep a clone for the hook.
+    let p1_pid_file_for_fault = p1_pid_file.clone();
     // From here the p1 adapter is launched and every fallible operation runs
     // inside the fixture's single cleanup owner, so no early return or outer
     // timeout can orphan the exact p1 pid or the endpoint/host teardown.
     let fixture = FinalFailureFixture {
         label: "p1 fixture adapter",
         pid_file: p1_pid_file,
+        adapter_termination_owed: true,
         endpoint,
         host,
         producer_task: Some(producer_task),
@@ -1040,9 +1081,25 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
         // adapter, so these faults fall inside the exact lifetime the fixture
         // cleanup owner must cover. `error` fails the case immediately; `hang`
         // blocks so the outer `tokio::time::timeout` cancels this future.
-        match std::env::var("OBSCURA_FIXTURE_FAULT").as_deref() {
-            Ok("error") => { return Err(anyhow::anyhow!("injected post-launch receiver failure")); }
-            Ok("hang") => { tokio::time::sleep(Duration::from_secs(600)).await; }
+        //
+        // F6 (reused from O4) adds a real I/O-boundary fault:
+        // `pid-record-unparseable` replaces the adapter's own pid record with
+        // unparseable bytes after the adapter recorded it and before the cleanup
+        // owner reads it. `record-pid-only` captures the same evidence without
+        // corrupting the record (normal-path control).
+        let f6_fault = std::env::var("OBSCURA_FIXTURE_FAULT").unwrap_or_default();
+        if f6_fault.contains("pid-record-unparseable") || f6_fault == "record-pid-only" {
+            f6_record_pid_evidence(
+                f6_case_from_fault(&f6_fault),
+                &p1_pid_file_for_fault,
+                &root,
+                f6_fault.contains("pid-record-unparseable"),
+            )
+            .await?;
+        }
+        match f6_fault.as_str() {
+            "error" | "error+pid-record-unparseable" => { return Err(anyhow::anyhow!("injected post-launch receiver failure")); }
+            "hang" => { tokio::time::sleep(Duration::from_secs(600)).await; }
             _ => {}
         }
 
@@ -1106,6 +1163,11 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
 struct FinalFailureFixture {
     label: &'static str,
     pid_file: PathBuf,
+    // Whether this owner still owes the adapter a termination. It is armed when
+    // the fixture is created, disarmed the moment exact-pid termination is
+    // verified, and left armed when termination fails so the `Drop` backstop can
+    // retry with the exact recorded pid.
+    adapter_termination_owed: bool,
     endpoint: tokio::process::Child,
     host: tokio::process::Child,
     producer_task: Option<tokio::task::JoinHandle<()>>,
@@ -1113,28 +1175,40 @@ struct FinalFailureFixture {
 }
 
 impl FinalFailureFixture {
-    /// Always run `work`, then remove every owned resource. The result of
-    /// `work` is returned only after cleanup has run, so every fallible
-    /// operation between the two is covered by this single owner.
+    /// Always run `work`, then remove every owned resource. The work result and
+    /// any cleanup failure are both propagated, so a swallowed cleanup failure
+    /// can never hide a live retained adapter.
     async fn run<F, T>(mut self, work: F) -> anyhow::Result<T>
     where
         F: std::future::Future<Output = anyhow::Result<T>>,
     {
         let outcome = work.await;
-        self.cleanup().await;
-        outcome
+        let cleanup = self.cleanup().await;
+        match (outcome, cleanup) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(cleanup_error)) => Err(cleanup_error.context("fixture cleanup failed after work succeeded")),
+            (Err(work_error), Ok(())) => Err(work_error),
+            (Err(work_error), Err(cleanup_error)) => Err(work_error.context(format!("fixture cleanup also failed: {cleanup_error:#}"))),
+        }
     }
 
-    async fn cleanup(&mut self) {
-        if self.pid_file.exists() {
+    /// Remove every owned resource and report failure. Adapter termination is
+    /// verified before the signal authority is disarmed. On any failure the pid
+    /// record and the scratch root are retained and the owner stays armed, so a
+    /// later `Drop` retry still has the exact pid to finish the job.
+    async fn cleanup(&mut self) -> anyhow::Result<()> {
+        let mut failures: Vec<String> = Vec::new();
+        if self.adapter_termination_owed {
             match wait_pid(&self.pid_file, Duration::from_secs(30)).await {
-                Ok(adapter_pid) => {
-                    if let Err(error) = terminate_exact_pid(self.label, adapter_pid, Duration::from_secs(30)).await {
-                        eprintln!("{} cleanup: exact-pid termination failed: {error:#}", self.label);
-                    }
-                }
-                Err(error) => eprintln!("{} cleanup: adapter pid unavailable: {error:#}", self.label),
+                Ok(adapter_pid) => match terminate_exact_pid(self.label, adapter_pid, Duration::from_secs(30)).await {
+                    Ok(()) => self.adapter_termination_owed = false,
+                    Err(error) => failures.push(format!("exact-pid termination failed: {error:#}")),
+                },
+                Err(error) => failures.push(format!("adapter pid unavailable: {error:#}")),
             }
+        }
+        if !failures.is_empty() {
+            return Err(anyhow::anyhow!("{} cleanup incomplete: {}", self.label, failures.join("; ")));
         }
         let _ = self.endpoint.kill().await;
         let _ = self.endpoint.wait().await;
@@ -1148,18 +1222,20 @@ impl FinalFailureFixture {
         if !root.as_os_str().is_empty() {
             let _ = std::fs::remove_dir_all(root);
         }
+        Ok(())
     }
 }
 
 impl Drop for FinalFailureFixture {
     fn drop(&mut self) {
-        // Cancellation backstop. On the normal path `cleanup` has already
-        // removed the pid file by tearing down the root, so this only fires when
-        // the outer timeout drops the future while a resource is still live.
+        // Cancellation backstop. It fires only while this owner still owes the
+        // adapter a termination: on the normal path `cleanup` has verified
+        // termination and disarmed the owner, so a reused pid is never signalled
+        // just because the external pid file still exists as evidence.
         if let Some(task) = self.producer_task.take() {
             task.abort();
         }
-        if self.pid_file.exists() {
+        if self.adapter_termination_owed {
             if let Ok(text) = std::fs::read_to_string(&self.pid_file) {
                 if let Ok(pid) = text.trim().parse::<i32>() {
                     // Safety: this signal targets the exact pid this fixture wrote.
@@ -1515,4 +1591,502 @@ fn _tls_client_config(ca: &[u8], cert: &[u8], key: &[u8]) -> anyhow::Result<toki
     roots.add(CertificateDer::from(ca.to_vec()))?;
     Ok(rustls::ClientConfig::builder().with_root_certificates(roots)
         .with_client_auth_cert(vec![CertificateDer::from(cert.to_vec())], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec())))?)
+}
+
+// ===========================================================================
+// F5 black-box external signal device, and the F6 real-fault regression device.
+//
+// F5: `f5-blackbox.py` injects `kill-observer.dylib` into THIS test executable
+// only. The device snapshots the observer log path, clears the inherited
+// injection variables from its own environment before any child process is
+// spawned, runs the real retained-failure fixture entry, and then -- after the
+// entry returned and before it removes the external pid sink -- reads the raw
+// signal log and filters it by this process as caller and by the exact positive
+// pid the fixture itself recorded. The injected observer is the only source of
+// the "no extra signal to the old pid" fact; no in-process counter is kept.
+//
+// F6: the same real fixture entry plus one real post-prime I/O-boundary fault
+// reused from O4: the adapter's own pid record is replaced with unparseable
+// bytes after the adapter recorded it and before the cleanup owner reads it.
+// ===========================================================================
+
+/// Snapshot and clear the F5 injection environment, and return the observer log
+/// path. It must run before the case spawns any child process, so the injected
+/// observer can never reach the Host, the endpoint, media or the receiver.
+fn f5_take_injection_scope() -> Option<PathBuf> {
+    let observer_log = std::env::var_os("KILL_OBSERVER_LOG").map(PathBuf::from);
+    let inherited_dylib = std::env::var_os("DYLD_INSERT_LIBRARIES");
+    for name in ["KILL_OBSERVER_LOG", "DYLD_INSERT_LIBRARIES", "DYLD_FORCE_FLAT_NAMESPACE"] {
+        std::env::remove_var(name);
+    }
+    println!(
+        "F5-SCOPE test_pid={} observer_log={:?} inherited_dyld_insert={:?} after_clear_log={:?} after_clear_dyld={:?}",
+        std::process::id(),
+        observer_log,
+        inherited_dylib,
+        std::env::var_os("KILL_OBSERVER_LOG"),
+        std::env::var_os("DYLD_INSERT_LIBRARIES"),
+    );
+    observer_log
+}
+
+/// One raw line written by kill-observer.c.
+#[derive(Debug, Clone)]
+struct F5Signal {
+    seq: i64,
+    caller_pid: i32,
+    target_pid: i32,
+    signal: i32,
+    signal_name: String,
+    ret: i32,
+    errno: i32,
+}
+
+impl F5Signal {
+    /// The full recorded tuple, so every field the observer writes is also
+    /// reported and asserted on: seq, caller, target, signal, ret, errno.
+    fn f5_line(&self) -> String {
+        format!(
+            "seq={} caller_pid={} target_pid={} signal={}({}) ret={} errno={}",
+            self.seq, self.caller_pid, self.target_pid, self.signal, self.signal_name, self.ret, self.errno,
+        )
+    }
+}
+
+/// Read the raw observer log exactly as written; no filtering happens here.
+fn f5_read_signals(path: &PathBuf) -> anyhow::Result<Vec<F5Signal>> {
+    let text = std::fs::read_to_string(path)?;
+    let mut signals = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() { continue; }
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        signals.push(F5Signal {
+            seq: value["seq"].as_i64().unwrap_or(-1),
+            caller_pid: value["caller_pid"].as_i64().unwrap_or(-1) as i32,
+            target_pid: value["target_pid"].as_i64().unwrap_or(-1) as i32,
+            signal: value["signal"].as_i64().unwrap_or(-1) as i32,
+            signal_name: value["signal_name"].as_str().unwrap_or("<missing>").to_owned(),
+            ret: value["ret"].as_i64().unwrap_or(i64::MIN) as i32,
+            errno: value["errno"].as_i64().unwrap_or(-1) as i32,
+        });
+    }
+    Ok(signals)
+}
+
+/// Filter by the exact caller (this test process) and the exact positive target
+/// pid the fixture recorded. A signal to any other pid is not evidence here.
+fn f5_signals_to(signals: &[F5Signal], caller_pid: i32, target_pid: i32) -> Vec<F5Signal> {
+    signals.iter()
+        .filter(|event| event.caller_pid == caller_pid && event.target_pid == target_pid)
+        .cloned()
+        .collect()
+}
+
+/// The positive pid the fixture wrote into the external sink.
+fn f5_read_recorded_pid(sink: &PathBuf) -> Option<i32> {
+    std::fs::read_to_string(sink).ok()
+        .and_then(|text| text.trim().parse::<i32>().ok())
+        .filter(|pid| *pid > 0)
+}
+
+/// F5 normal path. The real retained-failure fixture entry runs with an external
+/// pid sink, so the recorded adapter pid survives the scratch-root teardown. The
+/// injected observer must show the fixture's own real termination call to that
+/// exact pid (observer activity positive control), and after the entry returned
+/// it must show no extra SIGKILL to the old pid.
+///
+/// Ignored by default: this case is only valid when `f5-blackbox.py` injects the
+/// external observer into this exact test process. Without that injection
+/// `KILL_OBSERVER_LOG` is unset, no outbound signal can be observed, and the
+/// device fails as invalid. Run it through the runner, which passes `--ignored`.
+#[ignore = "needs f5-blackbox.py to inject the external observer; without injection this device is invalid"]
+#[tokio::test]
+async fn r10_f5_cleanup_disarms_external_pid_sink() {
+    let observer_log = f5_take_injection_scope().expect(
+        "F5 DEVICE INVALID: no observer was injected (KILL_OBSERVER_LOG is unset); run this case through f5-blackbox.py",
+    );
+    let sink = fixture_pid_sink();
+    std::env::set_var("OBSCURA_FIXTURE_PID_SINK", &sink);
+    let outcome = run_retained_finalize_failure_data_channel().await;
+    std::env::remove_var("OBSCURA_FIXTURE_PID_SINK");
+    let outcome_text = match &outcome {
+        Ok(()) => "Ok(())".to_owned(),
+        Err(error) => format!("{error:#}"),
+    };
+    println!("F5-NORMAL case_outcome={outcome_text}");
+
+    // Read the signal log after the fixture entry returned and before the
+    // external sink is removed.
+    assert!(sink.exists(), "F5 DEVICE INVALID: the external pid sink was gone before the signal log was read: {}", sink.display());
+    let recorded_pid = f5_read_recorded_pid(&sink).expect(
+        "F5 DEVICE INVALID: the fixture never recorded a positive adapter pid in the external sink",
+    );
+    let caller_pid = std::process::id() as i32;
+    let signals = f5_read_signals(&observer_log).expect("F5 DEVICE INVALID: observer log unreadable");
+    let to_target = f5_signals_to(&signals, caller_pid, recorded_pid);
+    println!("F5-NORMAL recorded_pid={recorded_pid} caller_pid={caller_pid} filtered_events={}", to_target.len());
+    for event in &to_target {
+        println!("F5-NORMAL observed {}", event.f5_line());
+    }
+
+    // Observer activity positive control: a real termination call, issued by this
+    // process, to the exact pid the fixture itself recorded.
+    let real_terminations = to_target.iter()
+        .filter(|event| (event.signal == libc::SIGTERM || event.signal == libc::SIGKILL) && event.ret == 0)
+        .count();
+    assert!(
+        real_terminations >= 1,
+        "F5 DEVICE INVALID: the observer recorded no real termination call from caller {caller_pid} to the exact recorded pid {recorded_pid}: {to_target:?}",
+    );
+
+    // The dangerous call: after cleanup verified adapter termination and disarmed
+    // the owner, no further signal may target the old pid.
+    let sigkills: Vec<F5Signal> = to_target.iter().filter(|event| event.signal == libc::SIGKILL).cloned().collect();
+    assert_eq!(
+        sigkills.len(), 1,
+        "F5: cleanup verified adapter termination and disarmed the owner, so only cleanup's own SIGKILL may target recorded pid {recorded_pid}; the observer recorded {} SIGKILL(s) from caller {caller_pid}: {}",
+        sigkills.len(),
+        sigkills.iter().map(F5Signal::f5_line).collect::<Vec<_>>().join(" | "),
+    );
+    assert_eq!(
+        sigkills[0].ret, 0,
+        "F5: the single SIGKILL to recorded pid {recorded_pid} must be cleanup's own real termination, not a stale-pid drop kill: {:?}",
+        sigkills[0],
+    );
+
+    // No further signal to the old pid after the fixture entry returned.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = f5_read_signals(&observer_log).expect("F5 DEVICE INVALID: observer log unreadable");
+    let after_target = f5_signals_to(&after, caller_pid, recorded_pid);
+    assert_eq!(
+        after_target.len(), to_target.len(),
+        "F5: a signal to the old pid {recorded_pid} appeared after the fixture entry returned: {after_target:?}",
+    );
+
+    let adapter_gone = pid_exited_or_zombie(recorded_pid);
+    let _ = std::fs::remove_file(&sink);
+    assert!(adapter_gone, "F5: the adapter pid {recorded_pid} must not be alive after verified termination");
+    assert!(outcome.is_ok(), "F5: the normal retained-failure path must complete: {outcome_text}");
+}
+
+/// F5 cancel path. The post-launch `hang` fault makes the outer case timeout drop
+/// the fixture future, so cleanup never runs and the `Drop` backstop must still
+/// deliver a real SIGKILL to the exact recorded adapter pid. The observer proves
+/// the call happened; the process state independently proves the owned adapter
+/// is gone.
+///
+/// Ignored by default: this case is only valid when `f5-blackbox.py` injects the
+/// external observer into this exact test process. Without that injection
+/// `KILL_OBSERVER_LOG` is unset, no outbound signal can be observed, and the
+/// device fails as invalid. Run it through the runner, which passes `--ignored`.
+#[ignore = "needs f5-blackbox.py to inject the external observer; without injection this device is invalid"]
+#[tokio::test]
+async fn r10_f5_cancel_keeps_backstop_effective() {
+    let observer_log = f5_take_injection_scope().expect(
+        "F5 DEVICE INVALID: no observer was injected (KILL_OBSERVER_LOG is unset); run this case through f5-blackbox.py",
+    );
+    let sink = fixture_pid_sink();
+    let outcome = run_fixture_fault("hang", &sink, Duration::from_secs(90)).await;
+    let outcome_text = match &outcome {
+        Ok(()) => "Ok(())".to_owned(),
+        Err(error) => format!("{error:#}"),
+    };
+    println!("F5-CANCEL case_outcome={outcome_text}");
+    assert!(outcome.is_err(),
+        "F5 DEVICE INVALID: the hanging case was not cancelled by the case timeout, so the backstop path was never exercised: {outcome_text}");
+
+    assert!(sink.exists(), "F5 DEVICE INVALID: the external pid sink was gone before the signal log was read: {}", sink.display());
+    let recorded_pid = f5_read_recorded_pid(&sink).expect(
+        "F5 DEVICE INVALID: the fixture never recorded a positive adapter pid in the external sink",
+    );
+    let caller_pid = std::process::id() as i32;
+    let signals = f5_read_signals(&observer_log).expect("F5 DEVICE INVALID: observer log unreadable");
+    let to_target = f5_signals_to(&signals, caller_pid, recorded_pid);
+    println!("F5-CANCEL recorded_pid={recorded_pid} caller_pid={caller_pid} filtered_events={}", to_target.len());
+    for event in &to_target {
+        println!("F5-CANCEL observed {}", event.f5_line());
+    }
+
+    // Observer activity positive control: the backstop's real SIGKILL to the exact
+    // recorded pid, delivered while the adapter was still alive (ret == 0).
+    let backstop_kills = to_target.iter()
+        .filter(|event| event.signal == libc::SIGKILL && event.ret == 0)
+        .count();
+    assert!(
+        backstop_kills >= 1,
+        "F5 DEVICE INVALID: the observer recorded no real backstop SIGKILL from caller {caller_pid} to the exact recorded pid {recorded_pid}: {to_target:?}",
+    );
+
+    // The call record is not by itself a delivery proof: process state must
+    // independently show the owned adapter is no longer alive.
+    let adapter_gone = pid_exited_or_zombie(recorded_pid);
+    let _ = std::fs::remove_file(&sink);
+    assert!(adapter_gone,
+        "F5: the owned adapter pid {recorded_pid} must not be alive after the cancellation backstop");
+}
+
+// ---------------------------------------------------------------------------
+// F6 real-fault regression device (reused from O4).
+// ---------------------------------------------------------------------------
+
+/// Where the F6 device writes its raw evidence. The runner sets it per run.
+fn f6_evidence_dir() -> PathBuf {
+    std::env::var_os("OBSCURA_F6_EVIDENCE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("r10-f6-evidence"))
+}
+
+/// The evidence case name for one injected fault value.
+fn f6_case_from_fault(fault: &str) -> &'static str {
+    if fault.contains("pid-record-unparseable") && fault.contains("error") {
+        "work-and-cleanup-errors"
+    } else if fault.contains("pid-record-unparseable") {
+        "cleanup-error-after-success"
+    } else {
+        "normal-cleanup"
+    }
+}
+
+fn f6_case_dir(case: &str) -> PathBuf {
+    f6_evidence_dir().join(case)
+}
+
+fn f6_write_evidence(case: &str, name: &str, text: &str) -> anyhow::Result<()> {
+    let dir = f6_case_dir(case);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(name), text)?;
+    Ok(())
+}
+
+fn f6_read_injection(case: &str) -> serde_json::Value {
+    std::fs::read_to_string(f6_case_dir(case).join("fault-injection.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Raw external process observation for one exact pid.
+fn f6_ps_stat(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-o", "stat=,etime=,command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() { None } else { Some(text) }
+}
+
+/// Terminate exactly one pid this device captured. Never a computed or matched
+/// pid: the caller passes the pid read from the adapter's own record.
+fn f6_release_exact_pid(label: &str, pid: i32) -> bool {
+    if pid <= 0 || pid_exited_or_zombie(pid) {
+        return true;
+    }
+    // Safety: this signal targets the exact pid the device read from the record.
+    unsafe { libc::kill(pid, libc::SIGKILL); }
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !pid_exited_or_zombie(pid) {
+        if std::time::Instant::now() >= deadline {
+            eprintln!("F6: {label} pid {pid} survived SIGKILL");
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    true
+}
+
+/// Read the real pid record the adapter wrote, capture it as evidence, and (when
+/// `corrupt`) replace it with unparseable bytes at the real I/O boundary. This
+/// runs inside the case after the prime attachment launched the real adapter and
+/// before the fixture cleanup owner reads the same file.
+async fn f6_record_pid_evidence(case: &str, pid_file: &PathBuf, root: &PathBuf, corrupt: bool) -> anyhow::Result<()> {
+    let pid = wait_pid(pid_file, Duration::from_secs(60))
+        .await
+        .map_err(|error| error.context(format!(
+            "F6 DEVICE INVALID: the real adapter pid record never became readable at {}",
+            pid_file.display()
+        )))?;
+    let before = std::fs::read(pid_file)?;
+    let live_before = !pid_exited_or_zombie(pid);
+    anyhow::ensure!(live_before, "F6 DEVICE INVALID: recorded adapter pid {pid} is not a live process");
+    if corrupt {
+        std::fs::write(pid_file, b"not-a-pid\n")?;
+    }
+    let after = std::fs::read(pid_file)?;
+    let evidence = serde_json::json!({
+        "stage": "after-prime-attachment-before-fixture-cleanup",
+        "pid_file": pid_file.display().to_string(),
+        "pid_file_before_bytes": String::from_utf8_lossy(&before).to_string(),
+        "pid_file_after_bytes": String::from_utf8_lossy(&after).to_string(),
+        "pid_recorded": pid,
+        "adapter_live_at_injection": live_before,
+        "adapter_ps_at_injection": f6_ps_stat(pid),
+        "corrupted": corrupt,
+        "scratch_root": root.display().to_string(),
+        "scratch_root_exists_at_injection": root.exists(),
+        "record_lives_outside_scratch_root": !pid_file.starts_with(root),
+    });
+    f6_write_evidence(case, "fault-injection.json", &serde_json::to_string_pretty(&evidence)?)?;
+    println!("F6-INJECT case={case} stage=post-prime pid={pid} live={live_before} corrupt={corrupt} record={} root={}",
+        pid_file.display(), root.display());
+    Ok(())
+}
+
+/// Shared tail for the two F6 fault cases: capture the observable state after the
+/// case returned, write the raw record, reclaim only the exact captured pid and
+/// the records it retained, and assert the failure surface.
+async fn f6_finish_fault_case(
+    case: &str,
+    outcome: &Result<Result<(), anyhow::Error>, tokio::time::error::Elapsed>,
+    record_path: &PathBuf,
+    expected_work_error: Option<&str>,
+) -> anyhow::Result<()> {
+    let injection = f6_read_injection(case);
+    let pid = injection["pid_recorded"].as_i64().unwrap_or(-1) as i32;
+    let root = PathBuf::from(injection["scratch_root"].as_str().unwrap_or_default());
+    let case_outcome = match outcome {
+        Err(_) => "OUTER_OBSERVATION_TIMEOUT".to_string(),
+        Ok(Ok(())) => "Ok(()): the case reported success".to_string(),
+        Ok(Err(error)) => format!("{error:#}"),
+    };
+    let work_reported_success = matches!(outcome, Ok(Ok(())));
+    let record_exists = record_path.exists();
+    let record_text = std::fs::read_to_string(record_path).ok();
+    let root_exists = !root.as_os_str().is_empty() && root.exists();
+    let adapter_live = pid > 0 && !pid_exited_or_zombie(pid);
+    let adapter_stat = f6_ps_stat(pid);
+    let evidence = serde_json::json!({
+        "case": case,
+        "injection": injection,
+        "case_outcome": case_outcome,
+        "work_reported_success": work_reported_success,
+        "pid_record_path": record_path.display().to_string(),
+        "pid_record_exists_after_case": record_exists,
+        "pid_record_text_after_case": record_text,
+        "scratch_root_path": root.display().to_string(),
+        "scratch_root_exists_after_case": root_exists,
+        "adapter_pid": pid,
+        "adapter_live_after_case": adapter_live,
+        "adapter_ps_after_case": adapter_stat,
+    });
+    f6_write_evidence(case, "observation.json", &serde_json::to_string_pretty(&evidence)?)?;
+    println!("F6-OBSERVED case={case}");
+    println!("F6-OBSERVED case_outcome={case_outcome}");
+    println!("F6-OBSERVED pid_record_exists={record_exists} text={record_text:?}");
+    println!("F6-OBSERVED scratch_root_exists={root_exists} path={}", root.display());
+    println!("F6-OBSERVED adapter_pid={pid} live={adapter_live} ps={adapter_stat:?}");
+
+    // Reclamation: only the exact pid this device captured, then the records it
+    // retained. The retained state is captured above first.
+    let released = f6_release_exact_pid("f6 fault adapter", pid);
+    if record_exists {
+        let _ = std::fs::remove_file(record_path);
+    }
+    if root_exists {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    println!("F6-RECLAIMED observer_released_exact_pid={released} pid={pid}");
+
+    assert!(!work_reported_success,
+        "F6: the cleanup failure must not be swallowed into case success: {case_outcome}");
+    if let Some(expected) = expected_work_error {
+        assert!(case_outcome.contains(expected),
+            "F6: the work error must stay in the propagated chain (expected {expected:?}): {case_outcome}");
+    }
+    assert!(case_outcome.contains("cleanup incomplete"),
+        "F6: the cleanup failure must be explicit: {case_outcome}");
+    assert!(case_outcome.contains("adapter pid unavailable"),
+        "F6: the unverified termination must name the unreadable pid record: {case_outcome}");
+    assert!(record_exists, "F6: the pid record must be retained when termination is not verified");
+    assert!(root_exists, "F6: the scratch root must be retained when termination is not verified");
+    assert!(adapter_live, "F6: the real adapter child must still be observable after unverified cleanup");
+    assert!(released, "F6: the device must release the exact captured pid");
+    Ok(())
+}
+
+/// F6 case A: work succeeds, cleanup cannot parse the pid record. The real
+/// retained-failure entry runs unchanged; the only fault is the real
+/// I/O-boundary replacement of the adapter's own pid record with unparseable
+/// bytes.
+#[tokio::test]
+async fn r10_f6_cleanup_error_after_success_retains_records() {
+    let sink = fixture_pid_sink();
+    std::env::set_var("OBSCURA_FIXTURE_PID_SINK", &sink);
+    std::env::set_var("OBSCURA_FIXTURE_FAULT", "pid-record-unparseable");
+    let outcome = tokio::time::timeout(Duration::from_secs(300), run_retained_finalize_failure_data_channel()).await;
+    std::env::remove_var("OBSCURA_FIXTURE_FAULT");
+    std::env::remove_var("OBSCURA_FIXTURE_PID_SINK");
+    f6_finish_fault_case("cleanup-error-after-success", &outcome, &sink, None).await.unwrap();
+}
+
+/// F6 case B: the same real fault plus the pre-existing post-launch work
+/// failure, so the work error and the cleanup error must both appear in one
+/// propagated chain.
+#[tokio::test]
+async fn r10_f6_work_and_cleanup_errors_both_surface() {
+    let sink = fixture_pid_sink();
+    std::env::set_var("OBSCURA_FIXTURE_PID_SINK", &sink);
+    std::env::set_var("OBSCURA_FIXTURE_FAULT", "error+pid-record-unparseable");
+    let outcome = tokio::time::timeout(Duration::from_secs(300), run_retained_finalize_failure_data_channel()).await;
+    std::env::remove_var("OBSCURA_FIXTURE_FAULT");
+    std::env::remove_var("OBSCURA_FIXTURE_PID_SINK");
+    f6_finish_fault_case(
+        "work-and-cleanup-errors",
+        &outcome,
+        &sink,
+        Some("injected post-launch receiver failure"),
+    ).await.unwrap();
+}
+
+/// F6 control: the same device, the same real entry, the same observation
+/// points, and no fault. The adapter is terminated and verified, the owner
+/// disarms, the scratch root (which holds the pid record on this path) is
+/// removed, and the adapter is gone.
+#[tokio::test]
+async fn r10_f6_normal_cleanup_retires_records() {
+    std::env::set_var("OBSCURA_FIXTURE_FAULT", "record-pid-only");
+    let outcome = tokio::time::timeout(Duration::from_secs(300), run_retained_finalize_failure_data_channel()).await;
+    std::env::remove_var("OBSCURA_FIXTURE_FAULT");
+    let case = "normal-cleanup";
+    let injection = f6_read_injection(case);
+    let pid = injection["pid_recorded"].as_i64().unwrap_or(-1) as i32;
+    let pid_file = PathBuf::from(injection["pid_file"].as_str().unwrap_or_default());
+    let root = PathBuf::from(injection["scratch_root"].as_str().unwrap_or_default());
+    let case_outcome = match &outcome {
+        Err(_) => "OUTER_OBSERVATION_TIMEOUT".to_string(),
+        Ok(Ok(())) => "Ok(())".to_string(),
+        Ok(Err(error)) => format!("{error:#}"),
+    };
+    let case_ok = matches!(&outcome, Ok(Ok(())));
+    let record_exists = pid_file.exists();
+    let root_exists = root.exists();
+    let adapter_live = pid > 0 && !pid_exited_or_zombie(pid);
+    let adapter_stat = f6_ps_stat(pid);
+    let evidence = serde_json::json!({
+        "case": case,
+        "injection": injection,
+        "case_outcome": case_outcome,
+        "pid_record_path": pid_file.display().to_string(),
+        "pid_record_exists_after_case": record_exists,
+        "scratch_root_path": root.display().to_string(),
+        "scratch_root_exists_after_case": root_exists,
+        "adapter_pid": pid,
+        "adapter_live_after_case": adapter_live,
+        "adapter_ps_after_case": adapter_stat,
+    });
+    f6_write_evidence(case, "observation.json", &serde_json::to_string_pretty(&evidence).unwrap()).unwrap();
+    println!("F6-CONTROL case_outcome={case_outcome}");
+    println!("F6-CONTROL pid_record_path={} exists={record_exists}", pid_file.display());
+    println!("F6-CONTROL scratch_root={} exists={root_exists}", root.display());
+    println!("F6-CONTROL adapter_pid={pid} live={adapter_live} ps={adapter_stat:?}");
+    let released = f6_release_exact_pid("f6 control adapter", pid);
+    println!("F6-CONTROL observer_released_exact_pid={released} pid={pid}");
+
+    assert!(case_ok, "F6 control: the normal path must complete: {case_outcome}");
+    assert!(!record_exists, "F6 control: the pid record must be retired after verified termination");
+    assert!(!root_exists, "F6 control: the scratch root must be removed after verified termination");
+    assert!(!adapter_live, "F6 control: the adapter must be gone after verified termination");
 }

@@ -480,7 +480,8 @@ async fn await_completion(mut receiver: watch::Receiver<CompletionState>) -> Res
 
 /// The per-session supervisor. Its only job is to own both JoinHandles, run the
 /// durable finalizer while the healthy encoder-control reader is still active,
-/// then stop and join that reader.
+/// then stop and join that reader. It is also the single exit for the three
+/// owners, so it reports every terminal they produced instead of the first one.
 fn spawn_supervisor(
     durable: Arc<SessionDurable>,
     listener: UnixListener,
@@ -521,18 +522,38 @@ fn spawn_supervisor(
         if reader_join.is_none() {
             reader_join = Some(reader.await);
         }
-        finalize?;
+        // The supervisor is the single exit for three owners, so it must keep
+        // every terminal. A failing finalizer must not replace the reader's
+        // original error, and the reader's original error must not replace an
+        // unsettled terminal. Both the published `CompletionState::Failed` and
+        // the endpoint error exit render this one error's own message, so when
+        // more than one owner fails that message names every cause.
+        let mut failures: Vec<anyhow::Error> = Vec::new();
+        if let Err(error) = finalize { failures.push(error); }
         match ingest_join.expect("ingest join recorded") {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(anyhow::anyhow!("ingest task panicked")),
+            Ok(Err(error)) => failures.push(error),
+            Err(_) => failures.push(anyhow::anyhow!("ingest task panicked")),
         }
         match reader_join.expect("reader join recorded") {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(anyhow::anyhow!("encoder control reader panicked")),
+            Ok(Err(error)) => failures.push(error),
+            Err(_) => failures.push(anyhow::anyhow!("encoder control reader panicked")),
         }
-        Ok(())
+        match failures.len() {
+            0 => Ok(()),
+            // One owner failed: its own error is returned unchanged, so every
+            // established single-terminal message stays exact.
+            1 => Err(failures.pop().expect("one recorded failure")),
+            // More than one owner failed: name every cause in the returned
+            // error's own message and keep the finalizer's terminal as the cause
+            // chain tail.
+            _ => {
+                let causes: Vec<String> = failures.iter().map(|error| format!("{error:#}")).collect();
+                let primary = failures.remove(0);
+                Err(primary.context(format!("SESSION_MULTIPLE_TERMINALS: {}", causes.join(" | "))))
+            }
+        }
     })
 }
 

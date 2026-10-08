@@ -53,6 +53,31 @@ pub enum EncoderRevoke {
     AwaitingSignal(std::sync::Arc<Notify>),
 }
 
+/// The branch one closing control connection's retirement barrier observed.
+///
+/// The barrier applies the permit rule independently of this value: an
+/// outstanding permit that never reached `register` is retained in every
+/// branch, and the barrier never synthesizes a settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderRetirement {
+    /// No outstanding permit and no valid registration: no authority to
+    /// retire, and no settlement may be synthesized from this close edge.
+    NoAuthority,
+    /// An `Armed` registration was moved to `Revoked` under the same control
+    /// lock, revoking every later claim to group-signal authority.
+    RevokedArmed,
+    /// The registration was `Revoking`: the barrier waited for the existing
+    /// finalizer to finish its signal work and `mark_revoked`.
+    AwaitedFinalizer,
+    /// The registration was already `Revoked`; no further signal is possible.
+    AlreadyRevoked,
+    /// No registration, but an outstanding permit never reached `register`.
+    /// The permit keeps its settlement receiver and registration id, so the
+    /// existing finalizer still observes the unknown settlement instead of a
+    /// synthesized success.
+    PermitRetained,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct EncoderRegistration {
     pub registration_id: u64,
@@ -172,11 +197,91 @@ impl EncoderControlState {
         self.revoke_changed.notify_one();
     }
 
+    /// First step of the retirement barrier for one control connection that is
+    /// closing: read the real state under the control lock and take the only
+    /// action that state authorizes. It never signals a group, never clears the
+    /// registration, and never resolves a permit: a closed transport is not
+    /// evidence that no child exists. The `Revoking` branch still has to be
+    /// completed by `await_finalizer_revoke` outside the lock.
+    pub fn begin_retirement(&mut self) -> EncoderRetirement {
+        if let Some(registration) = self.registration.as_mut() {
+            return match registration.state {
+                // The finalizer takes group-signal authority through this same
+                // control lock (`begin_stop_armed_group`); revoking here means
+                // it can no longer acquire that authority, so the group is
+                // adapter-owned from this close edge on. The registration
+                // record stays as the true `Revoked` state.
+                EncoderRegistrationState::Armed => {
+                    registration.state = EncoderRegistrationState::Revoked;
+                    EncoderRetirement::RevokedArmed
+                }
+                // Signal work already started: keep the registration and its
+                // true state and wait for its owner to complete it.
+                EncoderRegistrationState::Revoking => EncoderRetirement::AwaitedFinalizer,
+                EncoderRegistrationState::Revoked => EncoderRetirement::AlreadyRevoked,
+            };
+        }
+        // `registration == None` is not proof of no child. An outstanding
+        // permit that never reached `register` keeps its settlement receiver
+        // and registration id, so the existing finalizer still reaches its
+        // unknown-settlement path instead of consuming a fabricated
+        // `RefusedNoChild` success.
+        if self.in_flight.is_some() {
+            EncoderRetirement::PermitRetained
+        } else {
+            EncoderRetirement::NoAuthority
+        }
+    }
+
     /// Flip admission to `Finalizing` and return the exact armed pgid if one is
     /// bound. The finalizer calls this before it signals or stops anything.
     pub fn close_admission(&mut self) -> Option<i32> {
         self.admission = EncoderAdmission::Finalizing;
         self.registration.as_ref().map(|registration| registration.pgid)
+    }
+}
+
+/// State-sensitive retirement barrier for one encoder-control connection that
+/// is closing. It runs after the request loop for every ordinary await return
+/// (owner stop, EOF, malformed frame, read failure, stalled consumer) and
+/// before the stream is dropped.
+///
+/// It retires exactly the authority the real state authorizes: an `Armed`
+/// registration loses its future group-signal authority, a `Revoking`
+/// registration is left to its existing finalizer, and an outstanding permit
+/// that never registered stays untouched for that finalizer's
+/// unknown-settlement path. It never signals a group, never clears the
+/// registration, and never fabricates a settlement.
+pub async fn retire_connection_authority(state: &Arc<Mutex<EncoderControlState>>) -> EncoderRetirement {
+    let branch = state.lock().await.begin_retirement();
+    if branch == EncoderRetirement::AwaitedFinalizer {
+        await_finalizer_revoke(state).await;
+    }
+    branch
+}
+
+/// Complete the `Revoking` branch: keep the registration and its true state and
+/// wait for the existing finalizer to finish its signal work and call
+/// `mark_revoked`. The wait is established before the state is checked, is
+/// awaited outside the control lock, and re-checks the state after every wake.
+/// `Notify::notify_one` stores a permit when no waiter is registered, so a
+/// `mark_revoked` between the check and the await cannot be lost. There is no
+/// deadline: `Revoking` is only ever set by the finalizer that owns the bounded
+/// group wait and always completes it with `mark_revoked`.
+async fn await_finalizer_revoke(state: &Arc<Mutex<EncoderControlState>>) {
+    loop {
+        let changed = Arc::clone(&state.lock().await.revoke_changed);
+        // Established before the state check below, so this wakeup cannot be
+        // lost between the check and the await.
+        let wait = changed.notified();
+        let revoking = {
+            let guard = state.lock().await;
+            guard.registration.as_ref().is_some_and(|registration| registration.state == EncoderRegistrationState::Revoking)
+        };
+        if !revoking {
+            return;
+        }
+        wait.await;
     }
 }
 
@@ -240,7 +345,20 @@ pub async fn run_reader(listener: UnixListener, state: Arc<Mutex<EncoderControlS
 
 async fn serve_connection(mut stream: UnixStream, state: Arc<Mutex<EncoderControlState>>, stop: &mut oneshot::Receiver<()>) -> Result<()> {
     let (read, mut write) = stream.split();
-    let mut reader = BufReader::new(read);
+    let result = serve_requests(&mut BufReader::new(read), &mut write, &state, stop).await;
+    // Retirement barrier: runs after the request loop ends for every ordinary
+    // await return, while the stream is still open. It retires this
+    // connection's authority according to the real state it finds, and the
+    // original `serve_requests` result is returned unchanged below.
+    retire_connection_authority(&state).await;
+    result
+}
+
+async fn serve_requests<R, W>(reader: &mut BufReader<R>, write: &mut W, state: &Arc<Mutex<EncoderControlState>>, stop: &mut oneshot::Receiver<()>) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     loop {
         let mut line = String::new();
         let read = tokio::select! {
@@ -356,5 +474,94 @@ mod tests {
         let _ = stop_tx.send(());
         let _ = reader_task.await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// F1 row 1: with no outstanding permit and no valid registration there is
+    /// no authority to retire, so the barrier closes without inventing a
+    /// settlement.
+    #[tokio::test]
+    async fn retirement_barrier_without_authority_invents_no_settlement() {
+        let state = Arc::new(Mutex::new(EncoderControlState::default()));
+        assert_eq!(retire_connection_authority(&state).await, EncoderRetirement::NoAuthority);
+        let guard = state.lock().await;
+        assert!(guard.registration.is_none(), "the barrier invented a registration");
+        assert!(guard.in_flight.is_none(), "the barrier invented an in-flight permit");
+    }
+
+    /// F1 row 2: an `Armed` registration is revoked inside the same control
+    /// lock, so the finalizer can no longer take group-signal authority.
+    #[tokio::test]
+    async fn retirement_barrier_revokes_armed_before_finalizer_takes_authority() {
+        let state = Arc::new(Mutex::new(EncoderControlState::default()));
+        assert!(matches!(state.lock().await.acquire(1), EncoderPermit::Granted));
+        assert!(!state.lock().await.register(1, 42));
+        assert_eq!(retire_connection_authority(&state).await, EncoderRetirement::RevokedArmed);
+        let mut guard = state.lock().await;
+        assert_eq!(guard.registration.map(|registration| registration.state), Some(EncoderRegistrationState::Revoked));
+        assert_eq!(guard.begin_stop_armed_group(), None, "the closing connection left group-signal authority available");
+    }
+
+    /// F1 row 3: a `Revoking` registration keeps its true state and the barrier
+    /// waits for the existing finalizer's `mark_revoked` before the connection
+    /// closes.
+    #[tokio::test]
+    async fn retirement_barrier_waits_for_finalizer_revoke_completion() {
+        let state = Arc::new(Mutex::new(EncoderControlState::default()));
+        assert!(matches!(state.lock().await.acquire(1), EncoderPermit::Granted));
+        assert!(!state.lock().await.register(1, 42));
+        assert_eq!(state.lock().await.begin_stop_armed_group(), Some(42));
+        let mut barrier = tokio::spawn({
+            let state = Arc::clone(&state);
+            async move { retire_connection_authority(&state).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), &mut barrier).await.is_err(),
+            "the barrier closed the connection while endpoint signal work was still in flight"
+        );
+        assert_eq!(
+            state.lock().await.registration.map(|registration| registration.state),
+            Some(EncoderRegistrationState::Revoking),
+            "the barrier discarded the registration or its true state while signal work was in flight"
+        );
+        state.lock().await.mark_revoked();
+        let branch = tokio::time::timeout(Duration::from_secs(1), barrier)
+            .await
+            .expect("the barrier did not resume after the finalizer completed signal work")
+            .unwrap();
+        assert_eq!(branch, EncoderRetirement::AwaitedFinalizer);
+    }
+
+    /// F1 row 4: an already `Revoked` registration is closed directly and
+    /// without any further signal.
+    #[tokio::test]
+    async fn retirement_barrier_completes_without_signal_when_already_revoked() {
+        let state = Arc::new(Mutex::new(EncoderControlState::default()));
+        assert!(matches!(state.lock().await.acquire(1), EncoderPermit::Granted));
+        assert!(!state.lock().await.register(1, 42));
+        assert!(matches!(state.lock().await.revoke(1), EncoderRevoke::Acknowledged));
+        assert_eq!(retire_connection_authority(&state).await, EncoderRetirement::AlreadyRevoked);
+        assert_eq!(state.lock().await.begin_stop_armed_group(), None);
+    }
+
+    /// F1 row 5: an outstanding permit that never registered is retained, and
+    /// the barrier fabricates no settlement for it. The adapter's own `Settle`
+    /// remains the only settle edge for that permit.
+    #[tokio::test]
+    async fn retirement_barrier_retains_unregistered_permit_for_unknown_settlement() {
+        let state = Arc::new(Mutex::new(EncoderControlState::default()));
+        assert!(matches!(state.lock().await.acquire(7), EncoderPermit::Granted));
+        assert_eq!(retire_connection_authority(&state).await, EncoderRetirement::PermitRetained);
+        let (registration_id, mut settlement) = state
+            .lock()
+            .await
+            .take_settlement_receiver()
+            .expect("the barrier dropped the unregistered permit's settlement receiver");
+        assert_eq!(registration_id, 7);
+        assert!(
+            matches!(settlement.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+            "the barrier synthesized a settlement for an unregistered permit"
+        );
+        state.lock().await.settle(7, EncoderSettlement::RefusedGroupStopped);
+        assert!(matches!(settlement.await, Ok(EncoderSettlement::RefusedGroupStopped)));
     }
 }
