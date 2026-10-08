@@ -1530,19 +1530,29 @@ impl ObservedSession {
 /// every signal it receives. `stubborn` selects whether it survives SIGTERM, so
 /// the endpoint's cooperative grace can expire and the retained terminal stays
 /// observable.
+/// R12-F1: the adapter direct child's wait loop must not spawn a child of its
+/// own. `while :; do sleep 0.2; done` forks a `sleep` that is orphaned for up to
+/// its own interval whenever the fixture reclaims the shell with SIGKILL, and
+/// nextest's leak detector then records a leak for the case that caused it. A
+/// blocking `read` on a FIFO this fixture owns waits inside the shell itself:
+/// no child process, no busy loop, the TERM trap still runs, and a stubborn
+/// child still survives SIGTERM.
 fn write_adapter_child(root: &Path, stubborn: bool) -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
     let script = root.join("adapter-child.sh");
     let pid_file = root.join("adapter-child.pid");
     let signals = root.join("adapter-child.signals");
+    let fifo = root.join("adapter-child.fifo");
+    let created = std::process::Command::new("mkfifo").arg(&fifo).status()?;
+    anyhow::ensure!(created.success(), "mkfifo failed for {}", fifo.display());
     let trap = if stubborn {
         format!("trap 'printf \"15\\n\" >> \"{}\"' TERM\n", signals.display())
     } else {
         format!("trap 'printf \"15\\n\" >> \"{}\"; exit 0' TERM\n", signals.display())
     };
     std::fs::write(&script, format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{pid}'\n{trap}while :; do sleep 0.2; done\n",
-        pid = pid_file.display(), trap = trap,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{pid}'\nexec 3<> '{fifo}'\n{trap}while :; do read -r _ <&3; done\n",
+        pid = pid_file.display(), fifo = fifo.display(), trap = trap,
     ))?;
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
     Ok((script, pid_file, signals))
@@ -1555,6 +1565,66 @@ fn reclaim_adapter(pid: i32) {
     if process_alive(pid) {
         // Safety: signal the exact adapter pid this fixture's endpoint spawned.
         unsafe { libc::kill(pid, libc::SIGKILL); }
+    }
+}
+
+/// R12-F1: the single cleanup owner for one fixture's adapter direct child.
+///
+/// The endpoint spawns that child, so it is not a child of this test and no
+/// `kill_on_drop` covers it. The child writes its own pid and, in the stubborn
+/// arrangement, survives SIGTERM by design, so only an explicit reclaim of that
+/// exact pid can retire it.
+///
+/// Every case in this file that starts an adapter direct child creates one of
+/// these before the child can exist. It reclaims the child on all three termini
+/// of the case: the success path (`reclaim`, which then disarms the backstop),
+/// every early `?`/`ensure!` return before the final reclaim, and outer
+/// `tokio::time::timeout` cancellation, where `Drop` is the only code that still
+/// runs. Until the pid is recorded, `Drop` falls back to the pid the child wrote
+/// for itself, so a case that fails before `wait_pid_file` returns still cannot
+/// leave the child behind.
+///
+/// The shape is the one `AdapterHarnessCleanup` uses: one owner, exact recorded
+/// pids, a `Drop` backstop. That owner is not reused here because it owns the
+/// endpoint, host and group children and the scratch root for the R8-F4 relay
+/// harness, while these cases already own their endpoint and host through
+/// `ObservedSession`; reusing it would need a placeholder relay pid record.
+/// `reclaim_adapter` stays the one reclaim authority.
+struct AdapterChildCleanup {
+    root: PathBuf,
+    pid_file: PathBuf,
+    pid: Option<i32>,
+    armed: bool,
+}
+
+impl AdapterChildCleanup {
+    fn new(root: PathBuf, pid_file: PathBuf) -> Self {
+        Self { root, pid_file, pid: None, armed: true }
+    }
+
+    /// Record the exact pid the adapter child wrote for itself.
+    fn record(&mut self, pid: i32) { self.pid = Some(pid); }
+
+    /// The exact pid this owner must retire: the recorded one, or the pid the
+    /// child wrote for itself when the case ended before the record was read.
+    fn target_pid(&self) -> Option<i32> {
+        self.pid.or_else(|| std::fs::read_to_string(&self.pid_file).ok()?.trim().parse::<i32>().ok())
+    }
+
+    /// Reclaim the child on the success path and disarm the backstop.
+    fn reclaim(&mut self) {
+        if let Some(pid) = self.target_pid() { reclaim_adapter(pid); }
+        self.armed = false;
+    }
+}
+
+impl Drop for AdapterChildCleanup {
+    fn drop(&mut self) {
+        // Failure and cancellation backstop. It fires only while this owner
+        // still owes a reclaim, and it signals only this fixture's adapter pid.
+        if !self.armed { return; }
+        if let Some(pid) = self.target_pid() { reclaim_adapter(pid); }
+        let _ = std::fs::remove_dir_all(&self.root);
     }
 }
 
@@ -1662,8 +1732,11 @@ async fn unregistered_child_close_retains_failure() -> anyhow::Result<()> {
     let fixture = Fixture::new("r10f1a")?;
     let root = fixture.root.clone();
     let (adapter, adapter_pid_file, adapter_signals) = write_adapter_child(&root, true)?;
+    // R12-F1: the fixture's single cleanup owner, armed before the child exists.
+    let mut adapter_cleanup = AdapterChildCleanup::new(root.clone(), adapter_pid_file.clone());
     let mut session = ObservedSession::open(&fixture, &adapter).await?;
     let adapter_pid = wait_pid_file(&adapter_pid_file, Duration::from_secs(30)).await?;
+    adapter_cleanup.record(adapter_pid);
     anyhow::ensure!(process_alive(adapter_pid), "the endpoint's adapter direct child was not alive");
 
     wait_socket(session.control_path.clone()).await;
@@ -1708,7 +1781,7 @@ async fn unregistered_child_close_retains_failure() -> anyhow::Result<()> {
         "F1: the endpoint reported a successful shutdown after publishing an unsettled encoder permit: exit={code:?}");
     anyhow::ensure!(stderr.contains("ENDPOINT_SESSION_FINALIZE_FAILED"),
         "F1: the endpoint did not report the failed session finalization at shutdown:\n{stderr}");
-    reclaim_adapter(adapter_pid);
+    adapter_cleanup.reclaim();
     session.shutdown().await;
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -1762,8 +1835,11 @@ async fn reader_failure_and_unsettled_permit_both_surface() -> anyhow::Result<()
     // so the finalizer's cooperative grace expires and the permit stays
     // unsettled while the session is retained.
     let (adapter, adapter_pid_file, adapter_signals) = write_adapter_child(&root, true)?;
+    // R12-F1: the fixture's single cleanup owner, armed before the child exists.
+    let mut adapter_cleanup = AdapterChildCleanup::new(root.clone(), adapter_pid_file.clone());
     let mut session = ObservedSession::open(&fixture, &adapter).await?;
     let adapter_pid = wait_pid_file(&adapter_pid_file, Duration::from_secs(30)).await?;
+    adapter_cleanup.record(adapter_pid);
     anyhow::ensure!(process_alive(adapter_pid), "the endpoint's adapter direct child was not alive");
 
     wait_socket(session.control_path.clone()).await;
@@ -1831,7 +1907,7 @@ async fn reader_failure_and_unsettled_permit_both_surface() -> anyhow::Result<()
         "F1: the endpoint error exit did not carry the unsettled-permit terminal:\n{stderr}");
     anyhow::ensure!(!matches!(code, Some(0)),
         "F1: the endpoint reported a successful shutdown after publishing an unresolved session terminal: exit={code:?}");
-    reclaim_adapter(adapter_pid);
+    adapter_cleanup.reclaim();
     session.shutdown().await;
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -1857,8 +1933,11 @@ async fn no_child_settlement_closes_normally() -> anyhow::Result<()> {
     let fixture = Fixture::new("r10f1b")?;
     let root = fixture.root.clone();
     let (adapter, adapter_pid_file, _adapter_signals) = write_adapter_child(&root, false)?;
+    // R12-F1: the fixture's single cleanup owner, armed before the child exists.
+    let mut adapter_cleanup = AdapterChildCleanup::new(root.clone(), adapter_pid_file.clone());
     let mut session = ObservedSession::open(&fixture, &adapter).await?;
     let adapter_pid = wait_pid_file(&adapter_pid_file, Duration::from_secs(30)).await?;
+    adapter_cleanup.record(adapter_pid);
     anyhow::ensure!(process_alive(adapter_pid), "the endpoint's adapter direct child was not alive");
 
     wait_socket(session.control_path.clone()).await;
@@ -1890,7 +1969,7 @@ async fn no_child_settlement_closes_normally() -> anyhow::Result<()> {
     eprintln!("R10-F1B-RESULT: endpoint_exit={code:?}");
     anyhow::ensure!(code == Some(0),
         "F1 positive control: the endpoint did not shut down cleanly after a real no-child settlement: exit={code:?}\n{}", session.stderr());
-    reclaim_adapter(adapter_pid);
+    adapter_cleanup.reclaim();
     session.shutdown().await;
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
@@ -1916,8 +1995,11 @@ async fn revoking_close_waits_for_signal_completion() -> anyhow::Result<()> {
     let fixture = Fixture::new("r10f1c")?;
     let root = fixture.root.clone();
     let (adapter, adapter_pid_file, _adapter_signals) = write_adapter_child(&root, false)?;
+    // R12-F1: the fixture's single cleanup owner, armed before the child exists.
+    let mut adapter_cleanup = AdapterChildCleanup::new(root.clone(), adapter_pid_file.clone());
     let mut session = ObservedSession::open(&fixture, &adapter).await?;
     let adapter_pid = wait_pid_file(&adapter_pid_file, Duration::from_secs(30)).await?;
+    adapter_cleanup.record(adapter_pid);
     anyhow::ensure!(process_alive(adapter_pid), "the endpoint's adapter direct child was not alive");
 
     wait_socket(session.control_path.clone()).await;
@@ -1990,7 +2072,7 @@ async fn revoking_close_waits_for_signal_completion() -> anyhow::Result<()> {
 
     let code = session.terminate_endpoint().await;
     eprintln!("R10-F1C-RESULT: endpoint_exit={code:?}");
-    reclaim_adapter(adapter_pid);
+    adapter_cleanup.reclaim();
     session.shutdown().await;
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
