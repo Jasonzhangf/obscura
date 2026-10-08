@@ -97,8 +97,11 @@ async fn retained_finalization_failure_receiver_error_cleans_up_launched_adapter
     // R8-F5's "no second SIGKILL to the recorded pid" property is asserted by the
     // F5 black-box device (`r10_f5_cleanup_disarms_external_pid_sink`), which
     // observes the real outbound signal from outside this process through an
-    // injected observer. No in-process counter is kept: it would be a second,
-    // independently unverified source for the same fact.
+    // injected observer. The error-work branch driven here has the same external
+    // observation in `r10_f5_error_work_disarms_external_pid_sink`, which runs
+    // this same entry with this same fault and this same sink. No in-process
+    // counter is kept: it would be a second, independently unverified source for
+    // the same fact.
 }
 
 /// F2: the outer case timeout must also reach cleanup. `hang` blocks after the
@@ -1604,6 +1607,9 @@ fn _tls_client_config(ca: &[u8], cert: &[u8], key: &[u8]) -> anyhow::Result<toki
 // signal log and filters it by this process as caller and by the exact positive
 // pid the fixture itself recorded. The injected observer is the only source of
 // the "no extra signal to the old pid" fact; no in-process counter is kept.
+// Two cases run this device: the normal entry, and the same entry with the real
+// post-launch work fault, so the normal and the error work branches are both
+// observed from outside the process.
 //
 // F6: the same real fixture entry plus one real post-prime I/O-boundary fault
 // reused from O4: the adapter's own pid record is replaced with unparseable
@@ -1824,6 +1830,94 @@ async fn r10_f5_cancel_keeps_backstop_effective() {
     let _ = std::fs::remove_file(&sink);
     assert!(adapter_gone,
         "F5: the owned adapter pid {recorded_pid} must not be alive after the cancellation backstop");
+}
+
+/// F5 error-work path. The same real fixture entry, the same external pid sink
+/// and the same observation points as the normal case, but the entry runs the
+/// real post-launch work fault (`OBSCURA_FIXTURE_FAULT=error`), so the work
+/// itself ends with its original `injected post-launch receiver failure` while
+/// the cleanup owner still terminates and verifies the exact recorded adapter
+/// pid. The injected observer must show that real termination call to that exact
+/// pid (observer activity positive control), and after the entry returned it must
+/// show no extra SIGKILL to the old pid.
+///
+/// Ignored by default: this case is only valid when `f5-blackbox.py` injects the
+/// external observer into this exact test process. Without that injection
+/// `KILL_OBSERVER_LOG` is unset, no outbound signal can be observed, and the
+/// device fails as invalid. Run it through the runner, which passes `--ignored`.
+#[ignore = "needs f5-blackbox.py to inject the external observer; without injection this device is invalid"]
+#[tokio::test]
+async fn r10_f5_error_work_disarms_external_pid_sink() {
+    let observer_log = f5_take_injection_scope().expect(
+        "F5 DEVICE INVALID: no observer was injected (KILL_OBSERVER_LOG is unset); run this case through f5-blackbox.py",
+    );
+    let sink = fixture_pid_sink();
+    let outcome = run_fixture_fault("error", &sink, Duration::from_secs(240)).await;
+    let outcome_text = match &outcome {
+        Ok(()) => "Ok(())".to_owned(),
+        Err(error) => format!("{error:#}"),
+    };
+    println!("F5-ERROR case_outcome={outcome_text}");
+
+    // The real work fault must survive cleanup: the entry returns the original
+    // post-launch work error, not a cleanup error and not Ok.
+    assert!(outcome.is_err(),
+        "F5: the injected post-launch work fault must fail the entry: {outcome_text}");
+    assert!(outcome_text.contains("injected post-launch receiver failure"),
+        "F5: the entry did not return the real work error after cleanup: {outcome_text}");
+
+    // Read the signal log after the fixture entry returned and before the
+    // external sink is removed.
+    assert!(sink.exists(), "F5 DEVICE INVALID: the external pid sink was gone before the signal log was read: {}", sink.display());
+    let recorded_pid = f5_read_recorded_pid(&sink).expect(
+        "F5 DEVICE INVALID: the fixture never recorded a positive adapter pid in the external sink",
+    );
+    let caller_pid = std::process::id() as i32;
+    let signals = f5_read_signals(&observer_log).expect("F5 DEVICE INVALID: observer log unreadable");
+    let to_target = f5_signals_to(&signals, caller_pid, recorded_pid);
+    println!("F5-ERROR recorded_pid={recorded_pid} caller_pid={caller_pid} filtered_events={}", to_target.len());
+    for event in &to_target {
+        println!("F5-ERROR observed {}", event.f5_line());
+    }
+
+    // Observer activity positive control: a real termination call, issued by this
+    // process, to the exact pid the fixture itself recorded, on the error-work
+    // branch.
+    let real_terminations = to_target.iter()
+        .filter(|event| (event.signal == libc::SIGTERM || event.signal == libc::SIGKILL) && event.ret == 0)
+        .count();
+    assert!(
+        real_terminations >= 1,
+        "F5 DEVICE INVALID: the observer recorded no real termination call from caller {caller_pid} to the exact recorded pid {recorded_pid} on the error-work branch: {to_target:?}",
+    );
+
+    // The dangerous call: after cleanup verified adapter termination and disarmed
+    // the owner, no further signal may target the old pid.
+    let sigkills: Vec<F5Signal> = to_target.iter().filter(|event| event.signal == libc::SIGKILL).cloned().collect();
+    assert_eq!(
+        sigkills.len(), 1,
+        "F5: cleanup verified adapter termination and disarmed the owner on the error-work branch, so only cleanup's own SIGKILL may target recorded pid {recorded_pid}; the observer recorded {} SIGKILL(s) from caller {caller_pid}: {}",
+        sigkills.len(),
+        sigkills.iter().map(F5Signal::f5_line).collect::<Vec<_>>().join(" | "),
+    );
+    assert_eq!(
+        sigkills[0].ret, 0,
+        "F5: the single SIGKILL to recorded pid {recorded_pid} must be cleanup's own real termination on the error-work branch, not a stale-pid drop kill: {:?}",
+        sigkills[0],
+    );
+
+    // No further signal to the old pid after the fixture entry returned.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = f5_read_signals(&observer_log).expect("F5 DEVICE INVALID: observer log unreadable");
+    let after_target = f5_signals_to(&after, caller_pid, recorded_pid);
+    assert_eq!(
+        after_target.len(), to_target.len(),
+        "F5: a signal to the old pid {recorded_pid} appeared after the error-work fixture entry returned: {after_target:?}",
+    );
+
+    let adapter_gone = pid_exited_or_zombie(recorded_pid);
+    let _ = std::fs::remove_file(&sink);
+    assert!(adapter_gone, "F5: the adapter pid {recorded_pid} must not be alive after verified termination");
 }
 
 // ---------------------------------------------------------------------------

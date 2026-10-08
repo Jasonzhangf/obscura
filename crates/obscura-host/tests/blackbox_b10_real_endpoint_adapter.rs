@@ -65,6 +65,12 @@
 //! * `real_endpoint_adapter_startup_failure_cleans_up_relay` (F4) is extended
 //!   with external resource checks for the accept stage and for a held-stage
 //!   cancellation.
+//! * `r10_accept_stage_cancellation_leaves_no_live_resource` (F4, R13): the
+//!   accept stage reached by the case above, but cancelled instead of cleaned
+//!   up normally. The cleanup owner is moved into the future that is dropped
+//!   while the relay is still blocked in `accept()`, so the `Drop` backstop is
+//!   the only code that can still run. The live-resource checks and the
+//!   recovery-record retention checks run from outside that cancelled future.
 
 use std::{cell::{Cell, RefCell}, path::{Path, PathBuf}, process::Stdio, sync::Arc, time::Duration};
 
@@ -2247,6 +2253,144 @@ while True:
     drop(control_socket);
     let _ = std::fs::remove_dir_all(&root);
     eprintln!("R10-F4: held-stage cancellation left no relay, adapter, endpoint or host behind");
+    Ok(())
+}
+
+/// R13-F4: cancellation while the bounded relay is still blocked in `accept()`.
+///
+/// The startup-failure case reaches this same stage and then calls the owner's
+/// normal asynchronous `cleanup()`. That is the failure path, not the
+/// cancellation path. Here the owner is moved into the future that is dropped at
+/// the accept stage, so the owner's `Drop` backstop is the only code that can
+/// still run: the inner future's own assertions never execute, and `cleanup()`
+/// is never called. The live-resource and recovery-record checks then run from
+/// outside the cancelled future.
+#[tokio::test]
+async fn r10_accept_stage_cancellation_leaves_no_live_resource() {
+    tokio::time::timeout(Duration::from_secs(240), accept_stage_cancellation_probe())
+        .await
+        .expect("r10 F4 accept-stage cancellation probe timed out")
+        .expect("r10 F4 accept-stage cancellation probe failed");
+}
+
+async fn accept_stage_cancellation_probe() -> anyhow::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let fixture = Fixture::new("r10f4a")?;
+    let root = fixture.root.clone();
+    // The same real harness as the startup-failure case: the relay binds the real
+    // per-session control path, and the endpoint's direct child execs a binary
+    // that exits before it dials, so the relay stays blocked in `accept()`.
+    let paths = write_relay_harness(&root, "exec /bin/false")?;
+    let adapter_pid_file = root.join("group/adapter.pid");
+
+    // R13-F4: the cleanup owner exists before the wrapper is launched. It is
+    // moved into the future below, so dropping that future is the cancellation.
+    let mut cleanup = AdapterHarnessCleanup::new(
+        "r10 F4 accept-stage cancellation", root.clone(), paths.pid.clone(), adapter_pid_file.clone());
+    cleanup.own_host(fixture.start_host().await?);
+    let session_id = fixture.session_id();
+    cleanup.own_endpoint(fixture.endpoint_with_media_bin(&paths.wrapper, None)?);
+    let endpoint_pid = cleanup.endpoint_pid();
+    let host_pid = cleanup.host_pid();
+    wait_socket(root.join("endpoint")).await;
+
+    let connector = fixture.connector()?;
+    let (mut control_socket, _token) = connect_control(&connector, fixture.address()).await?;
+    let ready = next_json(&mut control_socket).await?;
+    anyhow::ensure!(ready["session_id"].as_str() == Some(session_id.as_str()), "Ready session changed: {ready}");
+    control_socket.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
+    let attached = next_json(&mut control_socket).await?;
+    anyhow::ensure!(attached["type"] == "result", "observe attach failed: {attached}");
+
+    // Positive control for the negative assertions below: at the cancellation
+    // edge the relay, the endpoint and the host were all live. The relay is
+    // blocked in `accept()` because the adapter exited before it dialed.
+    wait_file(&paths.wrapper_ready, Duration::from_secs(40)).await?;
+    let relay_pid = wait_pid_file(&paths.pid, Duration::from_secs(40)).await?;
+    anyhow::ensure!(process_alive(relay_pid),
+        "R13-F4: the accept-stage relay {relay_pid} was not live before the cancellation edge");
+    anyhow::ensure!(endpoint_pid.is_some_and(process_alive) && host_pid.is_some_and(process_alive),
+        "R13-F4: the accept-stage endpoint and host children were not both live before the cancellation edge");
+
+    // The accept-stage precondition is proved from inside the future that owns
+    // the cleanup owner, and the flag is read only after that future was
+    // dropped. A cancellation that happened anywhere else fails this case.
+    let reached_accept = Arc::new(AtomicBool::new(false));
+    let reached = reached_accept.clone();
+    let accept_ready = paths.ready.clone();
+    let accept_wrapper_ready = paths.wrapper_ready.clone();
+    let accept_held = paths.held.clone();
+    let accept_release = paths.release.clone();
+    let accept_log = paths.log.clone();
+    let accept_adapter_pid_file = adapter_pid_file.clone();
+    let cancelled = tokio::time::timeout(Duration::from_secs(60), async move {
+        // The owner is moved into this future, so dropping the future is the
+        // cancellation and drops the owner with it.
+        let _owner = cleanup;
+        anyhow::ensure!(accept_ready.exists(),
+            "R13-F4: the relay never bound the real control path, so this is not the accept stage");
+        anyhow::ensure!(accept_wrapper_ready.exists(),
+            "R13-F4: the wrapper never reached the adapter exec, so this is not the accept stage");
+        anyhow::ensure!(!accept_held.exists(),
+            "R13-F4: the run had already passed the accept stage: the held acknowledgement exists");
+        anyhow::ensure!(!accept_release.exists(),
+            "R13-F4: the run had already passed the accept stage: the release marker exists");
+        anyhow::ensure!(!accept_adapter_pid_file.exists(),
+            "R13-F4: an adapter dialed the relay before the cancellation edge, so this is not the accept stage");
+        anyhow::ensure!(
+            !read_relay_events(&accept_log).iter().any(|line| line.starts_with("a->e") || line.starts_with("e->a")),
+            "R13-F4: the relay already carried control frames, so this is not the accept stage");
+        reached.store(true, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await;
+    anyhow::ensure!(cancelled.is_err() && reached_accept.load(Ordering::SeqCst),
+        "R13-F4: the accept-stage probe never proved the accept-stage precondition before its cancellation edge: {cancelled:?}");
+
+    // Everything below runs outside the cancelled future: only the owner's `Drop`
+    // backstop has run.
+    //
+    // The recovery records the owner would still need to finish the job are not
+    // deleted before termination is verified: the relay pid record still names
+    // the exact pid, and the scratch root with the relay's ready marker is still
+    // on disk.
+    let recorded_relay = read_pid_record(&paths.pid);
+    anyhow::ensure!(recorded_relay == Some(relay_pid),
+        "R13-F4: the accept-stage relay pid record was deleted or changed before termination was verified: {recorded_relay:?} vs {relay_pid}");
+    anyhow::ensure!(root.exists() && paths.ready.exists(),
+        "R13-F4: the cancellation backstop deleted the recovery records (scratch root, relay ready marker) before termination was verified");
+    anyhow::ensure!(!paths.held.exists(),
+        "R13-F4: the cancelled accept-stage run reached the held acknowledgement");
+    anyhow::ensure!(wait_process_gone(relay_pid, Duration::from_secs(10)).await,
+        "R13-F4: the accept-stage relay {relay_pid} survived the cancellation backstop");
+    if let Some(pid) = endpoint_pid {
+        anyhow::ensure!(wait_process_gone(pid, Duration::from_secs(10)).await,
+            "R13-F4: the accept-stage endpoint {pid} survived the cancellation backstop");
+    }
+    if let Some(pid) = host_pid {
+        anyhow::ensure!(wait_process_gone(pid, Duration::from_secs(10)).await,
+            "R13-F4: the accept-stage host {pid} survived the cancellation backstop");
+    }
+    // At the accept stage no adapter ever dialed, so there is no adapter pid and
+    // no adapter process group: those two sub-conditions of the F4 row are
+    // vacuous here and are asserted as absent rather than claimed as observed.
+    anyhow::ensure!(!adapter_pid_file.exists(),
+        "R13-F4: an adapter pid record appeared after the accept-stage cancellation");
+    eprintln!(
+        "R13-F4-ACCEPT-CANCELLED: relay_pid={relay_pid} endpoint_pid={endpoint_pid:?} host_pid={host_pid:?} \
+         relay_pid_record_present={} relay_ready_marker_present={} held_marker_present={} \
+         adapter_pid_record_present={} scratch_root_present={}",
+        paths.pid.exists(), paths.ready.exists(), paths.held.exists(),
+        adapter_pid_file.exists(), root.exists());
+
+    // The test's own scratch teardown runs only after the live-resource and
+    // record-retention checks above.
+    drop(control_socket);
+    let _ = std::fs::remove_dir_all(&root);
+    anyhow::ensure!(!root.exists(),
+        "R13-F4: the accept-stage scratch root survived the test's own teardown");
     Ok(())
 }
 
