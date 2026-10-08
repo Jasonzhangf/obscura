@@ -572,15 +572,22 @@ fn relay_tail_reorder_source() -> anyhow::Result<String> {
     Ok(source)
 }
 
-/// R11-F2: which real relay program the F2 contract case drives. Unset — every
-/// gate run — drives the candidate relay, the program the held-ack case drives at
-/// the real control boundary. `tail-reorder` drives the red control above: a real
-/// relay program that preserves length, timing, markers and event order and
-/// changes only the withheld bytes. Only the program under test changes; the
-/// harness, the input bytes, the release driver and the assertions are identical.
+/// R11-F2/R15-F2: which real relay program the F2 contract case drives. Unset —
+/// every gate run — drives the candidate relay, the program the held-ack case
+/// drives at the real control boundary. `tail-reorder` drives the red control
+/// above: a real relay program that preserves length, timing, markers and event
+/// order and changes only the withheld bytes. `baseline` drives the *historical*
+/// relay baseline, the pre-fix program the plan's 「必需判别」 names: it is run
+/// through the same harness and judged by the same `assert_candidate` contract,
+/// so the case exits non-zero because the historical relay violates the
+/// candidate contract (an early EOF, early bytes or lost bytes), never merely
+/// because `deviated()` observed a deviation. Only the program under test
+/// changes; the harness, the input bytes, the release driver and the assertions
+/// are identical.
 fn f2_relay_under_test() -> anyhow::Result<(String, &'static str)> {
     match std::env::var("OBSCURA_R11_F2_RELAY").as_deref() {
         Ok("tail-reorder") => Ok((relay_tail_reorder_source()?, "tail-reorder-red-control")),
+        Ok("baseline") => Ok((RELAY_PY_BASELINE.to_owned(), "baseline-red-control")),
         _ => Ok((RELAY_PY.to_owned(), "candidate")),
     }
 }
@@ -1868,6 +1875,23 @@ async fn reader_failure_and_unsettled_permit_both_surface() -> anyhow::Result<()
     session.release_control_reference().await;
     let published = wait_session_finalize_terminal(&session, Duration::from_secs(60)).await?;
     eprintln!("R11-F1-PUBLISHED-TERMINAL: {published}");
+
+    // R15-F1: the shared F1 behaviour is observed and printed before any of its
+    // assertions runs, so one run's log carries both the published terminal and
+    // the retained resources. The wrong retirement guard deviates on the
+    // resources this input keeps alive, and that deviation is the first
+    // assertion it fails; the candidate keeps both.
+    //
+    // The unresolved terminal must not become a cleanup success: the session
+    // directory and the live direct child that never registered stay retained.
+    let retained_dir = session.session_dir().exists();
+    let retained_adapter = process_alive(adapter_pid);
+    eprintln!("R11-F1-RETAINED: session_dir_present={retained_dir} adapter_alive={retained_adapter} adapter_signals={:?}",
+        std::fs::read_to_string(&adapter_signals).unwrap_or_default());
+    anyhow::ensure!(retained_dir,
+        "F1: the endpoint removed the session directory for a session with an unresolved terminal, so it published a cleanup success that no adapter settlement supports");
+    anyhow::ensure!(retained_adapter,
+        "F1: the endpoint force-killed the live adapter direct child of a session with an unresolved terminal");
     anyhow::ensure!(published.contains("SESSION_ENCODER_PERMIT_UNSETTLED"),
         "F1: the published session terminal lost the unsettled-permit terminal:\n{published}");
     anyhow::ensure!(published.contains("ENCODER_CONTROL_MALFORMED"),
@@ -1890,16 +1914,8 @@ async fn reader_failure_and_unsettled_permit_both_surface() -> anyhow::Result<()
     anyhow::ensure!(message.contains("SESSION_ENCODER_PERMIT_UNSETTLED"),
         "F1: the endpoint attachment terminal lost the unsettled-permit terminal:\n{message}");
 
-    // The unresolved terminal must not become a cleanup success: the session
-    // directory and the live direct child that never registered stay retained.
-    let retained_dir = session.session_dir().exists();
-    let retained_adapter = process_alive(adapter_pid);
-    eprintln!("R11-F1-RETAINED: session_dir_present={retained_dir} adapter_alive={retained_adapter} adapter_signals={:?}",
-        std::fs::read_to_string(&adapter_signals).unwrap_or_default());
-    anyhow::ensure!(retained_dir,
-        "F1: the endpoint removed the session directory for a session with an unresolved terminal, so it published a cleanup success that no adapter settlement supports");
-    anyhow::ensure!(retained_adapter,
-        "F1: the endpoint force-killed the live adapter direct child of a session with an unresolved terminal");
+    // R15-F1: the retained-resource assertions for this input ran above, before
+    // the terminal-content assertions; nothing about them is weakened or dropped.
 
     // The endpoint's own error exit must report the same terminal and must not
     // report a successful cleanup of the retained session.
