@@ -780,6 +780,7 @@ async fn wait_cancelled(cancel: &mut watch::Receiver<bool>) -> () {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+    use tokio_rustls::rustls;
 
     /// B1: a correlated `REMOTE_PRINCIPAL_REVOKED` / `REMOTE_AUTH_REQUIRED`
     /// denial is terminal for the attachment's media. `terminal_response`,
@@ -890,5 +891,117 @@ mod tests {
         assert!(matches!(encoded_rx.borrow().as_ref().map(|frame| &frame.packet), Some(VideoPacket::Unavailable { .. })));
         assert!(task.await.expect("ingest task panicked").is_err(), "Host unavailable EOF must remain a generic ingest error");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Build one in-process TLS + WebSocket pair whose endpoint half is the
+    /// exact production `Socket` type, so the one-way `/media` reader can be
+    /// driven directly. The endpoint half uses the same 64 KiB frame limits the
+    /// endpoint configures for a real `/media` handshake.
+    async fn media_socket_pair() -> (
+        Socket,
+        tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    ) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("self-signed test certificate");
+        let certificate = rustls::pki_types::CertificateDer::from(certified.cert.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()));
+        let server_config = rustls::ServerConfig::builder().with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], key).expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).expect("trust test certificate");
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(
+            rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth(),
+        ));
+        let accept = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.expect("accept test peer");
+            let tls = acceptor.accept(tcp).await.expect("endpoint test tls");
+            let mut config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+            config.max_message_size = Some(64 * 1024);
+            config.max_frame_size = Some(64 * 1024);
+            tokio_tungstenite::accept_async_with_config(tls, Some(config)).await.expect("endpoint test websocket")
+        });
+        let tls = connector.connect(rustls::pki_types::ServerName::try_from("localhost").expect("test server name"), tokio::net::TcpStream::connect(address).await.expect("connect test endpoint")).await.expect("peer test tls");
+        let (peer, _) = tokio_tungstenite::client_async("wss://localhost/media", tls).await.expect("peer test websocket");
+        (accept.await.expect("endpoint test handshake task"), peer)
+    }
+
+    fn attached_media_state() -> MediaState {
+        MediaState { attached: true, session_id: Some("media-contract-session".into()), generation: 1 }
+    }
+
+    /// A peer data message is a direction-contract violation. It must surface as
+    /// the explicit typed terminal, never as a transport read failure. Before
+    /// the split match this returned the generic "Media channel is read-only"
+    /// string, so this case fails on the pre-fix arm.
+    #[tokio::test]
+    async fn peer_data_frames_are_a_typed_direction_violation_not_a_transport_error() {
+        for message in [Message::text("peer-write"), Message::binary(vec![0u8; 4])] {
+            let (endpoint, mut peer) = media_socket_pair().await;
+            let (_latest_tx, latest) = watch::channel(None);
+            let (_active_tx, active) = watch::channel(attached_media_state());
+            let task = tokio::spawn(media(endpoint, latest, active));
+            peer.send(message.clone()).await.expect("peer data frame");
+            let error = tokio::time::timeout(Duration::from_secs(10), task).await
+                .expect("media must end on a peer data frame")
+                .expect("media task panicked")
+                .expect_err("a peer data frame is not a media success");
+            assert!(error.downcast_ref::<MediaChannelDirectionViolation>().is_some(),
+                "a peer data frame must be the explicit typed direction violation: {error:?}");
+            assert!(error.downcast_ref::<tokio_tungstenite::tungstenite::Error>().is_none(),
+                "a direction-contract violation must never be reported as a transport read failure: {error:?}");
+            assert!(error.to_string().starts_with("MEDIA_CHANNEL_DIRECTION_VIOLATION"),
+                "the violation must carry its explicit code: {error}");
+        }
+    }
+
+    /// A transport read failure must pass through as-is. The root tungstenite
+    /// error stays in the chain and is never reclassified as a direction
+    /// violation.
+    #[tokio::test]
+    async fn transport_read_failure_is_reported_as_is() {
+        let (endpoint, peer) = media_socket_pair().await;
+        let (_latest_tx, latest) = watch::channel(None);
+        let (_active_tx, active) = watch::channel(attached_media_state());
+        let task = tokio::spawn(media(endpoint, latest, active));
+        // Abrupt close without a WebSocket close handshake.
+        drop(peer);
+        let error = tokio::time::timeout(Duration::from_secs(10), task).await
+            .expect("media must end on a transport read failure")
+            .expect("media task panicked")
+            .expect_err("a transport read failure is not a media success");
+        assert!(error.downcast_ref::<MediaChannelDirectionViolation>().is_none(),
+            "a transport read failure must not be reclassified as a direction violation: {error:?}");
+        assert!(error.downcast_ref::<tokio_tungstenite::tungstenite::Error>().is_some(),
+            "the transport error must be preserved in the chain: {error:?}");
+        assert!(!error.to_string().contains("MEDIA_CHANNEL_DIRECTION_VIOLATION"),
+            "a transport read failure must not borrow the violation code: {error}");
+    }
+
+    /// The direction contract is unchanged: Ping is still answered, Pong is still
+    /// ignored, and a peer Close is still a normal media terminal.
+    #[tokio::test]
+    async fn peer_ping_pong_and_close_still_end_media_normally() {
+        let (endpoint, mut peer) = media_socket_pair().await;
+        let (_latest_tx, latest) = watch::channel(None);
+        let (_active_tx, active) = watch::channel(attached_media_state());
+        let task = tokio::spawn(media(endpoint, latest, active));
+        peer.send(Message::Ping(vec![7u8].into())).await.expect("peer ping");
+        let reply = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match peer.next().await.expect("media ended before a pong").expect("peer read failed") {
+                    Message::Pong(payload) => break payload,
+                    _ => continue,
+                }
+            }
+        }).await.expect("a peer Ping must be answered");
+        assert_eq!(&reply[..], &[7u8], "the Pong must echo the Ping payload");
+        peer.send(Message::Pong(vec![1u8].into())).await.expect("peer pong");
+        peer.send(Message::Close(None)).await.expect("peer close");
+        let result = tokio::time::timeout(Duration::from_secs(10), task).await
+            .expect("media must end on a peer Close")
+            .expect("media task panicked");
+        assert!(result.is_ok(), "a peer Close is a normal media terminal, not a violation: {result:?}");
     }
 }
