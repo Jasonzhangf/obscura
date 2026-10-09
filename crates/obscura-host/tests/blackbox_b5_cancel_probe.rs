@@ -117,7 +117,7 @@ async fn exercise() -> anyhow::Result<()> {
     anyhow::ensure!(attached["type"] == "result" && attached["value"]["mode"] == "observe",
         "attach failed: {attached}");
 
-    let session_dir = root.join(format!("endpoint/session-{session_id}"));
+    let session_dir = root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12]));
     anyhow::ensure!(wait_dir(&session_dir, Duration::from_secs(10)).await,
         "the bound session directory was never created");
 

@@ -294,7 +294,7 @@ pub struct EncoderControl {
 
 impl EncoderControl {
     pub fn bind(dir: &Path, session_id: &str) -> Result<Self> {
-        let dir = dir.join(format!("session-{session_id}"));
+        let dir = dir.join(super::server::media_dir_name(session_id)?);
         // The session media registry owns creation of the 0700 per-session
         // directory before the encoded socket bind; tolerate it being present.
         if !dir.exists() {

@@ -160,7 +160,7 @@ async fn exercise() -> anyhow::Result<()> {
     let attached_b = next_json(&mut control_b).await?;
     anyhow::ensure!(attached_b["type"] == "result", "B attach failed: {attached_b}");
 
-    let dir_a = root.join(format!("endpoint/session-{session_a}"));
+    let dir_a = root.join(format!("endpoint/m-{}", &session_a.replace("-", "")[..12]));
     anyhow::ensure!(wait_dir(&dir_a, Duration::from_secs(10)).await, "A session directory was never bound");
     // A's adapter records readiness after installing the SIGTERM handler and
     // connecting to the exact-session socket, so the abrupt close below cannot

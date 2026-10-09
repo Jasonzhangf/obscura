@@ -27,6 +27,77 @@ pub enum SessionTerminal {
     EncoderPermitUnsettled { registration_id: u64 },
 }
 
+/// macOS binds Unix sockets below `SUN_LEN`. The endpoint owns this layout, so
+/// it validates both of its own socket names before creating anything.
+const UNIX_SOCKET_PATH_LIMIT: usize = 104;
+/// Endpoint-owned per-session media directory prefix.
+const MEDIA_DIR_PREFIX: &str = "m-";
+/// Hex chars of the canonical session UUID used as the bounded on-disk media id.
+/// The full 36-char canonical UUID stays the session identity for the registry,
+/// the admission decision and the Host frame socket; only this endpoint-owned
+/// directory name is truncated so both socket paths fit `SUN_LEN` at any
+/// deployment prefix. A truncated id must never silently share a directory, so
+/// acquisition creates it exclusively and rejects a collision.
+const MEDIA_ID_HEX_CHARS: usize = 12;
+const ENCODED_SOCKET_NAME: &str = "encoded.sock";
+const CONTROL_SOCKET_NAME: &str = "encoder-control.sock";
+
+/// The session identity is a canonical UUID. The Host generates it, and it is
+/// what the registry keys, the admission projection carries and the raw frame
+/// socket is named with.
+fn validate_canonical_session_id(session_id: &str) -> Result<()> {
+    ensure!(session_id.len() == 36, "Session media socket requires a canonical UUID");
+    for (position, byte) in session_id.bytes().enumerate() {
+        if byte == b'-' {
+            ensure!(matches!(position, 8 | 13 | 18 | 23),
+                "Session media socket requires a canonical UUID");
+            continue;
+        }
+        ensure!(byte.is_ascii_hexdigit(), "Session media socket requires a canonical UUID");
+    }
+    Ok(())
+}
+
+/// Endpoint-owned per-session media directory name: prefix plus the bounded
+/// fingerprint of the validated session identity.
+pub(crate) fn media_dir_name(session_id: &str) -> Result<String> {
+    validate_canonical_session_id(session_id)?;
+    let hex = session_id.replace('-', "");
+    Ok(format!("{prefix}{id}", prefix = MEDIA_DIR_PREFIX, id = &hex[..MEDIA_ID_HEX_CHARS]))
+}
+
+/// Create the per-session media directory exclusively. A fingerprint collision
+/// in this endpoint-owned space is an explicit failure, never a shared socket.
+fn create_media_dir(media_dir: &Path) -> Result<()> {
+    match std::fs::DirBuilder::new().mode(0o700).create(media_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+            "Session media directory fingerprint collision for {}",
+            media_dir.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown")
+        ),
+        Err(error) => Err(error).context("Create per-session media directory"),
+    }
+}
+
+/// Reject an endpoint-owned socket layout before the first bind, so an overlong
+/// deployment prefix fails as a typed acquisition error instead of a partial
+/// bind that leaves media resources behind.
+fn ensure_media_socket_paths_fit(socket_dir: &Path, media_dir: &str) -> Result<()> {
+    let encoded = socket_dir.join(media_dir).join(ENCODED_SOCKET_NAME);
+    ensure!(
+        encoded.to_string_lossy().len() < UNIX_SOCKET_PATH_LIMIT,
+        "Per-session encoded socket path exceeds macOS bound"
+    );
+    let control = socket_dir.join(media_dir).join(CONTROL_SOCKET_NAME);
+    ensure!(
+        control.to_string_lossy().len() < UNIX_SOCKET_PATH_LIMIT,
+        "Per-session encoder-control socket path exceeds macOS bound"
+    );
+    Ok(())
+}
+
 impl std::fmt::Display for SessionTerminal {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -354,8 +425,10 @@ impl SessionMediaRegistry {
             entry.references = entry.references.saturating_add(1);
             return Ok((entry.encoded_rx.clone(), Arc::clone(&entry.durable)));
         }
-        let media_dir = socket_dir.join(format!("session-{session_id}"));
-        std::fs::DirBuilder::new().mode(0o700).create(&media_dir).context("Create per-session media directory")?;
+        let media_name = media_dir_name(session_id)?;
+        ensure_media_socket_paths_fit(socket_dir, &media_name)?;
+        let media_dir = socket_dir.join(&media_name);
+        create_media_dir(&media_dir)?;
         let encoded_path = media_dir.join("encoded.sock");
         let control_path = media_dir.join("encoder-control.sock");
         let mut acquisition = SessionAcquisition::new(media_dir.clone(), encoded_path.clone(), control_path);
@@ -981,7 +1054,7 @@ mod tests {
 
     fn durable(root: &Path, id: &str, supervisor: tokio::task::JoinHandle<Result<()>>) -> Arc<SessionDurable> {
         let control = encoder_control::EncoderControl::bind(root, id).unwrap();
-        let media_dir = root.join(format!("session-{id}"));
+        let media_dir = root.join(media_dir_name(id).unwrap());
         let encoded_path = media_dir.join("encoded.sock");
         let (cancel, _) = watch::channel(false);
         Arc::new(SessionDurable {
@@ -993,6 +1066,98 @@ mod tests {
             cancel,
             supervisor: Mutex::new(Some(supervisor)),
         })
+    }
+
+    #[test]
+    fn endpoint_media_dir_uses_a_bounded_fingerprint_of_the_canonical_identity() {
+        let session_id = "603d917e-965a-4a60-bb4a-834466dc5df8";
+        assert_eq!(media_dir_name(session_id).unwrap(), "m-603d917e965a");
+        assert!(media_dir_name("603d917e-965a-4a60-bb4a-834466dc5df8Z").is_err());
+        assert!(media_dir_name("603d917e965a-4a60-bb4a-834466dc5df8").is_err());
+        assert!(media_dir_name("cancel-session").is_err());
+    }
+
+    /// Both endpoint-owned socket budgets are checked at their own threshold:
+    /// the encoded path fails at the limit, and the eight bytes longer
+    /// encoder-control path fails at the limit while the encoded path still
+    /// fits. Nothing is created before the check.
+    #[test]
+    fn endpoint_media_socket_paths_are_checked_before_any_bind() {
+        fn socket_dir_for(path_len: usize, name: &str, media_dir: &str) -> PathBuf {
+            let pad = path_len - "/tmp/".len() - 1 - media_dir.len() - 1 - name.len();
+            PathBuf::from("/tmp").join("b".repeat(pad))
+        }
+        let session_id = "603d917e-965a-4a60-bb4a-834466dc5df8";
+        let media_name = media_dir_name(session_id).unwrap();
+        let encoded = |socket_dir: &Path| socket_dir.join(&media_name).join(ENCODED_SOCKET_NAME);
+        let control = |socket_dir: &Path| socket_dir.join(&media_name).join(CONTROL_SOCKET_NAME);
+
+        let encoded_over = socket_dir_for(UNIX_SOCKET_PATH_LIMIT, ENCODED_SOCKET_NAME, &media_name);
+        std::fs::create_dir_all(&encoded_over).unwrap();
+        assert_eq!(encoded(&encoded_over).to_string_lossy().len(), UNIX_SOCKET_PATH_LIMIT);
+        let error = ensure_media_socket_paths_fit(&encoded_over, &media_name).unwrap_err().to_string();
+        assert!(error.contains("encoded socket path exceeds macOS bound"), "{error}");
+
+        let control_over = socket_dir_for(UNIX_SOCKET_PATH_LIMIT, CONTROL_SOCKET_NAME, &media_name);
+        std::fs::create_dir_all(&control_over).unwrap();
+        assert!(encoded(&control_over).to_string_lossy().len() < UNIX_SOCKET_PATH_LIMIT);
+        assert_eq!(control(&control_over).to_string_lossy().len(), UNIX_SOCKET_PATH_LIMIT);
+        let error = ensure_media_socket_paths_fit(&control_over, &media_name).unwrap_err().to_string();
+        assert!(error.contains("encoder-control socket path exceeds macOS bound"), "{error}");
+
+        let at_budget = socket_dir_for(UNIX_SOCKET_PATH_LIMIT - 1, CONTROL_SOCKET_NAME, &media_name);
+        std::fs::create_dir_all(&at_budget).unwrap();
+        ensure_media_socket_paths_fit(&at_budget, &media_name).unwrap();
+
+        for socket_dir in [&encoded_over, &control_over, &at_budget] {
+            assert!(!socket_dir.join(&media_name).exists(), "the layout check created the session directory");
+            let _ = std::fs::remove_dir_all(socket_dir);
+        }
+    }
+
+    /// The accepted internal-endpoint deployment used a 51-byte socket directory
+    /// with the 36-char session layout: encoded 109, encoder-control 117. The
+    /// bounded media id must keep both under `SUN_LEN` at that exact prefix.
+    #[test]
+    fn endpoint_media_socket_paths_fit_the_internal_deployment_prefix() {
+        let socket_dir = PathBuf::from("/private/tmp/abnocode-f13310de/rt/endpoint-17fcd5cd");
+        let session_id = "603d917e-965a-4a60-bb4a-834466dc5df8";
+        assert_eq!(socket_dir.to_string_lossy().len(), 51);
+        assert_eq!(
+            format!("{}/session-{session_id}/{ENCODED_SOCKET_NAME}", socket_dir.display()).len(),
+            109,
+            "fixture prefix changed; refresh the accepted evidence numbers"
+        );
+        assert_eq!(
+            format!("{}/session-{session_id}/{CONTROL_SOCKET_NAME}", socket_dir.display()).len(),
+            117,
+            "fixture prefix changed; refresh the accepted evidence numbers"
+        );
+
+        let media_name = media_dir_name(session_id).unwrap();
+        ensure_media_socket_paths_fit(&socket_dir, &media_name).unwrap();
+        assert!(media_name.len() <= 14, "media dir name must stay bounded: {media_name}");
+    }
+
+    /// A truncated fingerprint must not silently share a directory, and the
+    /// layout budget check must run before any path is created.
+    #[test]
+    fn endpoint_media_dir_requires_a_unique_fingerprint() {
+        let root = PathBuf::from("/tmp").join(format!("ob-media-{uuid}", uuid = uuid::Uuid::new_v4()));
+        let media_dir = root.join(media_dir_name("603d917e-965a-4a60-bb4a-834466dc5df8").unwrap());
+        std::fs::create_dir_all(&media_dir).unwrap();
+        let error = create_media_dir(&media_dir).unwrap_err().to_string();
+        assert!(error.contains("fingerprint collision"), "{error}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Fixed canonical identity for the registry-lock tests. The endpoint now
+    /// validates this shape before binding its owned media layout.
+    fn canonical_id(tag: u8) -> String {
+        let mut bytes = [0x60, 0x3d, 0x91, 0x7e, 0x96, 0x5a, 0x4a, 0x60,
+                         0xbb, 0x4a, 0x83, 0x44, 0x66, 0xdc, 0x5d, 0x00];
+        bytes[15] = tag;
+        uuid::Uuid::from_bytes(bytes).to_string()
     }
 
     fn insert_entry(registry: &mut SessionMediaRegistry, durable: Arc<SessionDurable>) {
@@ -1016,7 +1181,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
             Ok(())
         });
-        let durable = durable(&root, "cancel-session", supervisor);
+        let durable = durable(&root, &canonical_id(0x10), supervisor);
         let registry = Arc::new(AsyncMutex::new(SessionMediaRegistry::default()));
         insert_entry(&mut *registry.lock().await, Arc::clone(&durable));
         let guard = SessionBindingGuard::new(Arc::clone(&registry), Arc::new(Mutex::new(Some(Arc::clone(&durable)))));
@@ -1033,7 +1198,7 @@ mod tests {
         let _ = connection.await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            if registry.lock().await.entries.get("cancel-session").is_none() { break; }
+            if registry.lock().await.entries.get(&canonical_id(0x10)).is_none() { break; }
             assert!(tokio::time::Instant::now() < deadline, "cancelled connection left its exact-session reference");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1056,7 +1221,7 @@ mod tests {
             let _ = gate_rx.await;
             Ok(())
         });
-        let durable = durable(&root, "overlap-session", supervisor);
+        let durable = durable(&root, &canonical_id(0x11), supervisor);
         let registry = Arc::new(AsyncMutex::new(SessionMediaRegistry::default()));
         insert_entry(&mut *registry.lock().await, Arc::clone(&durable));
 
@@ -1070,7 +1235,7 @@ mod tests {
         // branch and awaits this same completion receiver.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let finalizing = registry.lock().await.entries.get("overlap-session").is_some_and(|entry| entry.finalizing);
+            let finalizing = registry.lock().await.entries.get(&canonical_id(0x11)).is_some_and(|entry| entry.finalizing);
             if finalizing { break; }
             assert!(tokio::time::Instant::now() < deadline, "first release never marked the entry finalizing");
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1087,7 +1252,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(150)).await;
         let guard = tokio::time::timeout(Duration::from_millis(250), registry.lock()).await
             .expect("F1: the release completion was awaited while the registry lock was held");
-        assert!(guard.entries.get("overlap-session").is_some_and(|entry| entry.finalizing),
+        assert!(guard.entries.get(&canonical_id(0x11)).is_some_and(|entry| entry.finalizing),
             "F1: the overlapped entry was no longer finalizing");
         drop(guard);
 
@@ -1101,7 +1266,7 @@ mod tests {
         let terminal = finalizer.await.expect("first release task panicked");
         assert!(terminal.is_ok(), "first release reported an error");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while registry.lock().await.entries.get("overlap-session").is_some() {
+        while registry.lock().await.entries.get(&canonical_id(0x11)).is_some() {
             assert!(tokio::time::Instant::now() < deadline, "overlapped session was not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1118,7 +1283,7 @@ mod tests {
             let _ = release_rx.await;
             Ok(())
         });
-        let durable = durable(&root, "lock-session", supervisor);
+        let durable = durable(&root, &canonical_id(0x12), supervisor);
         let registry = Arc::new(AsyncMutex::new(SessionMediaRegistry::default()));
         insert_entry(&mut *registry.lock().await, Arc::clone(&durable));
         let release_registry = Arc::clone(&registry);
@@ -1128,7 +1293,7 @@ mod tests {
         loop {
             let guard = tokio::time::timeout(Duration::from_millis(200), registry.lock()).await
                 .expect("registry lock was held across the supervisor await");
-            if guard.entries.get("lock-session").is_some_and(|entry| entry.finalizing) { break; }
+            if guard.entries.get(&canonical_id(0x12)).is_some_and(|entry| entry.finalizing) { break; }
             drop(guard);
             assert!(tokio::time::Instant::now() < deadline, "session release never marked the entry finalizing");
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1136,7 +1301,7 @@ mod tests {
         let _ = release_tx.send(());
         let _ = release.await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        while registry.lock().await.entries.get("lock-session").is_some() {
+        while registry.lock().await.entries.get(&canonical_id(0x12)).is_some() {
             assert!(tokio::time::Instant::now() < deadline, "finalized session was not removed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -1154,16 +1319,16 @@ mod tests {
         std::fs::create_dir_all(&host_dir).unwrap();
         let registry = Arc::new(AsyncMutex::new(SessionMediaRegistry::default()));
         let missing = root.join("missing-media");
-        let failed = registry.lock().await.acquire(&socket_dir, &host_dir, &missing, Path::new("/usr/bin/true"), "rollback-session");
+        let failed = registry.lock().await.acquire(&socket_dir, &host_dir, &missing, Path::new("/usr/bin/true"), &canonical_id(0x13));
         assert!(failed.is_err(), "missing media binary must fail acquisition");
-        let session_dir = socket_dir.join("session-rollback-session");
+        let session_dir = socket_dir.join(media_dir_name(&canonical_id(0x13)).unwrap());
         assert!(!session_dir.exists(), "failed acquisition left its session directory");
 
         let media = root.join("media.sh");
         std::fs::write(&media, "#!/bin/sh\nsleep 30\n").unwrap();
         std::fs::set_permissions(&media, std::fs::Permissions::from_mode(0o755)).unwrap();
         let (_, durable) = registry.lock().await
-            .acquire(&socket_dir, &host_dir, &media, Path::new("/usr/bin/true"), "rollback-session")
+            .acquire(&socket_dir, &host_dir, &media, Path::new("/usr/bin/true"), &canonical_id(0x13))
             .expect("later acquisition must not be poisoned by the failed attempt");
         release_exact_session(&registry, &durable).await;
         assert!(!session_dir.exists(), "successful release did not remove the retried session directory");

@@ -13,7 +13,7 @@ async fn mutual_tls_endpoint_preserves_host_and_fences_remote_agent_access() {
 
 async fn exercise() {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    // Exact-session media dirs are `socket_dir/session-<36>/encoder-control.sock`
+    // Exact-session media dirs are `socket_dir/m-<12 hex>/encoder-control.sock`
     // and must stay strictly below the macOS SUN_LEN bound, so keep the root short.
     let root = PathBuf::from("/tmp").join(format!("oe-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
     std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
@@ -733,8 +733,8 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
             assert!(tokio::time::Instant::now() < deadline, "B never produced an access unit: {header}");
         }
 
-        let dir_a = root.join(format!("endpoint/session-{session_a}"));
-        let dir_b = root.join(format!("endpoint/session-{session_b}"));
+        let dir_a = root.join(format!("endpoint/m-{}", &session_a.replace("-", "")[..12]));
+        let dir_b = root.join(format!("endpoint/m-{}", &session_b.replace("-", "")[..12]));
         assert!(wait_dir(&dir_a, Duration::from_secs(10)).await, "A per-session directory was never bound");
         assert!(wait_dir(&dir_b, Duration::from_secs(10)).await, "B per-session directory was never bound");
         assert!(dir_a.join("encoded.sock").exists(), "A encoded socket missing while healthy");

@@ -112,8 +112,26 @@ struct Fixture {
 impl Fixture {
     fn new(prefix: &str) -> anyhow::Result<Self> {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        let root = PathBuf::from("/tmp").join(format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
-        std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+        // `OBSCURA_TEST_ROOT` lets the case run under an exact deployment-length
+        // socket directory, which is what the macOS `SUN_LEN` bound depends on.
+        // The default stays a short unique `/tmp` root for the other cases.
+        let (root, provided) = match std::env::var_os("OBSCURA_TEST_ROOT") {
+            Some(root) => (PathBuf::from(root), true),
+            None => (
+                PathBuf::from("/tmp").join(format!("{prefix}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8])),
+                false,
+            ),
+        };
+        if provided {
+            // Reuse of a provided root must not inherit stale sockets, so remove
+            // only the directories this fixture owns.
+            for owned in ["host", "endpoint", "profiles"] {
+                let _ = std::fs::remove_dir_all(root.join(owned));
+            }
+        }
+        // A provided root may already exist, so create recursively while keeping
+        // the 0700 mode the fixture's sockets rely on.
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&root)?;
         let ca_key = rcgen::KeyPair::generate()?;
         let mut ca_params = rcgen::CertificateParams::new(vec![])?;
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -300,7 +318,7 @@ async fn armed_authority() -> anyhow::Result<()> {
         "F5: the endpoint's Armed authority did not deliver exactly one SIGTERM to the registered group: {signals:?}");
     anyhow::ensure!(!process_group_alive(read_pgid(&group_pgid)?), "F5: the registered group survived the endpoint finalizer");
 
-    let session_dir = root.join(format!("endpoint/session-{}", fixture.session_id()));
+    let session_dir = root.join(format!("endpoint/m-{}", &fixture.session_id().replace("-", "")[..12]));
     wait_dir_gone(&session_dir, Duration::from_secs(20)).await?;
     eprintln!("F5 armed authority: endpoint settled the registered group through its own Armed state");
 
@@ -1257,7 +1275,7 @@ async fn wait_child_exit_code(child: &mut tokio::process::Child, timeout: Durati
 /// R10-F3: the held-ack completion arrangement, observed against the real
 /// endpoint and the real adapter.
 ///
-/// The endpoint binds `session-<id>/encoder-control.sock` and then spawns
+/// The endpoint binds `m-<12 hex>/encoder-control.sock` and then spawns
 /// `--media-bin`. This case passes a real-adapter wrapper as `--media-bin`.
 /// Before it `exec`s the real adapter, the wrapper renames the endpoint's real
 /// control socket aside and binds the bounded pass-through relay at the
@@ -1454,7 +1472,7 @@ async fn held_ack_adapter_owned_completion(legacy: bool) -> anyhow::Result<()> {
 
     // Release the endpoint reference only after the adapter's own exit.
     if let Some(mut socket) = control.take() { let _ = socket.send(Message::Close(None)).await; }
-    let session_dir = root.join(format!("endpoint/session-{session_id}"));
+    let session_dir = root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12]));
     wait_dir_gone(&session_dir, Duration::from_secs(30)).await?;
     let closing = read_relay_events(&paths.log);
     let adapter_closed_at = event_index(&closing, "adapter-closed").ok_or_else(|| anyhow::anyhow!("the adapter never closed its control connection"))?;
@@ -1502,9 +1520,9 @@ impl ObservedSession {
             host,
             endpoint,
             control,
-            control_path: root.join(format!("endpoint/session-{session_id}/encoder-control.sock")),
+            control_path: root.join(format!("endpoint/m-{}/encoder-control.sock", &session_id.replace("-", "")[..12])),
             endpoint_stderr: root.join("endpoint.err"),
-            session_dir: root.join(format!("endpoint/session-{session_id}")),
+            session_dir: root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12])),
         })
     }
 
@@ -2531,7 +2549,7 @@ async fn abnormal_control_close_retirement() -> anyhow::Result<()> {
     let attached = next_json(&mut control).await?;
     anyhow::ensure!(attached["type"] == "result", "observe attach failed: {attached}");
 
-    let control_socket = root.join(format!("endpoint/session-{session_id}/encoder-control.sock"));
+    let control_socket = root.join(format!("endpoint/m-{}/encoder-control.sock", &session_id.replace("-", "")[..12]));
     wait_socket(control_socket.clone()).await;
     let stream = tokio::net::UnixStream::connect(&control_socket).await?;
     let (read, mut write) = stream.into_split();
@@ -2583,7 +2601,7 @@ async fn abnormal_control_close_retirement() -> anyhow::Result<()> {
     // The endpoint supervisor runs the session finalizer when the reader exits.
     // Once the session directory is gone the finalizer has completed, so any
     // signal to the registered group would already have been delivered.
-    let session_dir = root.join(format!("endpoint/session-{session_id}"));
+    let session_dir = root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12]));
     wait_dir_gone(&session_dir, Duration::from_secs(30)).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -2897,7 +2915,7 @@ async fn revoke_during_endpoint_cleanup() -> anyhow::Result<()> {
     anyhow::ensure!(wait_process_gone(adapter_pid, Duration::from_secs(15)).await,
         "F4.2: the adapter did not exit after reaping its leader");
 
-    let session_dir = root.join(format!("endpoint/session-{}", fixture.session_id()));
+    let session_dir = root.join(format!("endpoint/m-{}", &fixture.session_id().replace("-", "")[..12]));
     wait_dir_gone(&session_dir, Duration::from_secs(20)).await?;
     eprintln!("F4.2: live adapter revoke waited for endpoint authority before leader reap");
 

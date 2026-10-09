@@ -151,7 +151,7 @@ async fn exercise() -> anyhow::Result<()> {
     let attached = next_json(&mut control).await?;
     anyhow::ensure!(attached["type"] == "result", "attach failed: {attached}");
 
-    let session_dir = root.join(format!("endpoint/session-{session_id}"));
+    let session_dir = root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12]));
     anyhow::ensure!(wait_dir(&session_dir, Duration::from_secs(15)).await, "session directory was never bound");
     wait_file(&session_dir.join("encoded.sock.ready"), Duration::from_secs(15)).await?;
 
@@ -315,7 +315,7 @@ async fn exercise_f1() -> anyhow::Result<()> {
         let attached = next_json(&mut control).await?;
         anyhow::ensure!(attached["type"] == "result", "F1: cycle {cycle} attach failed: {attached}");
 
-        let session_dir = cycle_root.join(format!("endpoint/session-{session_id}"));
+        let session_dir = cycle_root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12]));
         anyhow::ensure!(wait_dir(&session_dir, Duration::from_secs(15)).await, "F1: cycle {cycle} session directory was never bound");
         wait_file(&session_dir.join("encoded.sock.ready"), Duration::from_secs(15)).await?;
 

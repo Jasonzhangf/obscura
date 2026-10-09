@@ -439,7 +439,7 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
 
     // The r11 endpoint binds the exact-session encoded socket only on
     // admission, so the receiver must attach before the producer connects.
-    let session_socket = root.join(format!("endpoint/session-{session_id}/encoded.sock"));
+    let session_socket = root.join(format!("endpoint/m-{}/encoded.sock", &session_id.replace("-", "")[..12]));
     wait_socket(session_socket.clone()).await;
     let mut producer = tokio::net::UnixStream::connect(&session_socket).await?;
 
@@ -614,7 +614,7 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
 
     // The r11 endpoint binds the exact-session encoded socket only on
     // admission, so the receiver must attach before the producer connects.
-    let session_socket = root.join(format!("endpoint/session-{session_id}/encoded.sock"));
+    let session_socket = root.join(format!("endpoint/m-{}/encoded.sock", &session_id.replace("-", "")[..12]));
     wait_socket(session_socket.clone()).await;
     let producer = tokio::net::UnixStream::connect(&session_socket).await?;
     let producer_task = {
@@ -980,8 +980,12 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
     let adapter = root.join("adapter-wrapper.py");
     let marker_literal = format!("{:?}", p1_marker.display().to_string());
     let p1_literal = format!("{:?}", p1_adapter.display().to_string());
+    // The wrapper selects the p1 session by its Host session identity, which
+    // the endpoint passes in the Host-owned `--frames-socket` name. The
+    // endpoint-owned `--video-socket` media layout is deliberately not used:
+    // it is the thing under test and it carries no full session identity.
     let wrapper = format!(
-        "#!/usr/bin/env python3\nimport os, sys\nargs = sys.argv[1:]\nvideo = args[args.index('--video-socket') + 1] if '--video-socket' in args else ''\nmarker = open({marker}).read().strip()\nif marker and marker in video:\n    os.execv(sys.executable, [sys.executable, {p1}] + args)\nos.execv('/usr/bin/true', ['true'] + args)\n",
+        "#!/usr/bin/env python3\nimport os, sys\nargs = sys.argv[1:]\nframes = args[args.index('--frames-socket') + 1] if '--frames-socket' in args else ''\nmarker = open({marker}).read().strip()\nif marker and marker in frames:\n    os.execv(sys.executable, [sys.executable, {p1}] + args)\nos.execv('/usr/bin/true', ['true'] + args)\n",
         marker = marker_literal,
         p1 = p1_literal
     );
@@ -1008,7 +1012,7 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
     // after that attachment is admitted.
     let bytes = obscura_media::encode(std::path::Path::new("ffmpeg"), 160, 120, scripted_scene(160, 120)).await?;
     anyhow::ensure!(!bytes.is_empty(), "finalization-failure producer got no access unit");
-    let session_socket = root.join(format!("endpoint/session-{session_id}/encoded.sock"));
+    let session_socket = root.join(format!("endpoint/m-{}/encoded.sock", &session_id.replace("-", "")[..12]));
     let producer_task = tokio::spawn({
         let session_socket = session_socket.clone();
         let session_id = session_id.clone();
@@ -1108,7 +1112,7 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
 
         // The prime attachment has closed. Wait for the endpoint's real finalizer
         // to publish the retained failure before the DataChannel rebind.
-        let secondary_dir = root.join(format!("endpoint/session-{secondary_session}"));
+        let secondary_dir = root.join(format!("endpoint/m-{}", &secondary_session.replace("-", "")[..12]));
         wait_socket_deadline(secondary_dir.join("encoded.sock"), Duration::from_secs(30)).await?;
         let endpoint_stderr_path = raw_root.join("endpoint.stderr");
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);

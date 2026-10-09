@@ -101,7 +101,7 @@ async fn exercise() -> anyhow::Result<()> {
         )?;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 
-    let session_dir = root.join(format!("endpoint/session-{session_id}"));
+    let session_dir = root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12]));
     let encoded_socket = session_dir.join("encoded.sock");
     let control_socket = session_dir.join("encoder-control.sock");
 

@@ -114,7 +114,7 @@ async fn exercise() -> anyhow::Result<()> {
     let attached = next_json(&mut control).await?;
     anyhow::ensure!(attached["type"] == "result", "attach failed: {attached}");
 
-    let control_socket = root.join(format!("endpoint/session-{session_id}/encoder-control.sock"));
+    let control_socket = root.join(format!("endpoint/m-{}/encoder-control.sock", &session_id.replace("-", "")[..12]));
     wait_socket(control_socket.clone()).await;
     let stream = tokio::net::UnixStream::connect(&control_socket).await?;
     let (read, mut write) = stream.into_split();

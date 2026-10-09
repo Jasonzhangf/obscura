@@ -157,7 +157,7 @@ async fn exercise() -> anyhow::Result<()> {
     let attached = next_json(&mut control).await?;
     anyhow::ensure!(attached["type"] == "result", "attach failed: {attached}");
 
-    let control_socket = root.join(format!("endpoint/session-{session_id}/encoder-control.sock"));
+    let control_socket = root.join(format!("endpoint/m-{}/encoder-control.sock", &session_id.replace("-", "")[..12]));
     wait_socket(control_socket.clone()).await;
 
     // Act as the adapter: acquire a permit and never bind a pgid through
@@ -188,7 +188,7 @@ async fn exercise() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     let adapter_retained = process_alive(adapter_pid);
     let descendant_retained = process_alive(descendant_pid);
-    let session_dir = root.join(format!("endpoint/session-{session_id}"));
+    let session_dir = root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12]));
     // The failed release must retain the durable resource owner: the session
     // directory and its control path stay on disk while the endpoint is still
     // alive. This observation is taken before endpoint shutdown, because the
