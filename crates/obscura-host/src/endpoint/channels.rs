@@ -632,6 +632,22 @@ fn packet_session(packet: &VideoPacket) -> Option<String> {
     }
 }
 
+/// A peer data message on the one-way `/media` channel. The endpoint only
+/// publishes frames and answers WebSocket control traffic here, so a peer
+/// `Text`/`Binary` message is a direction-contract violation. It is a distinct
+/// typed terminal so a protocol violation is never reported as a transport
+/// read failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaChannelDirectionViolation;
+
+impl std::fmt::Display for MediaChannelDirectionViolation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "MEDIA_CHANNEL_DIRECTION_VIOLATION: media channel is read-only for the peer")
+    }
+}
+
+impl std::error::Error for MediaChannelDirectionViolation {}
+
 pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Arc<EncodedFrame>>>, mut active: watch::Receiver<MediaState>) -> Result<()> {
     let mut emit = true;
     loop {
@@ -683,7 +699,15 @@ pub async fn media(mut remote: Socket, mut latest: watch::Receiver<Option<Arc<En
                 Some(Ok(Message::Ping(bytes))) => send(&mut remote, Message::Pong(bytes)).await?,
                 Some(Ok(Message::Pong(_))) => {}
                 Some(Ok(Message::Close(_))) | None => return Ok(()),
-                _ => anyhow::bail!("Media channel is read-only"),
+                // A transport read failure is reported as-is; it must never be
+                // reclassified as a direction-contract violation.
+                Some(Err(error)) => return Err(anyhow::Error::new(error)),
+                // The endpoint only writes media frames to this channel, so a
+                // peer data message is an explicit direction-contract violation.
+                // `Frame` is never produced by a read, but is listed so the
+                // match is exhaustive without a catch-all arm.
+                Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Frame(_))) =>
+                    return Err(anyhow::Error::new(MediaChannelDirectionViolation)),
             }
         }
     }
