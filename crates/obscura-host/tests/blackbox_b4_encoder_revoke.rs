@@ -1,13 +1,13 @@
 #![cfg(unix)]
-//! B4 black-box regression: a revoke acknowledgement from the real endpoint
-//! encoder-control socket must not outrun the endpoint's signal authority over
-//! the registered process group.
+//! B4 black-box regression: the endpoint is NOT an owner of the registered
+//! process group.
 //!
 //! The test acts as a real adapter over the per-session Unix socket. It
-//! registers a real process group that writes a marker when it receives the
-//! endpoint's SIGTERM. While that group is still alive, a revoke request must
-//! remain unanswered. The acknowledgement is accepted only after the group has
-//! been reaped, and a later revoke is idempotent.
+//! registers a real process group whose SIGTERM handler writes a marker. The
+//! adapter is the sole owner of group signal and reap, so the endpoint must
+//! acknowledge a revoke without ever signalling that group: the marker must
+//! never appear, and the group must still be alive when the acknowledgement
+//! arrives. A later revoke is idempotent.
 
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
@@ -20,7 +20,7 @@ use tokio_rustls::rustls::{self, pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, 
 use tokio_tungstenite::{client_async, tungstenite::Message};
 
 #[tokio::test]
-async fn revoke_ack_waits_for_endpoint_group_signal_authority() {
+async fn revoke_ack_does_not_depend_on_endpoint_group_signal() {
     tokio::time::timeout(Duration::from_secs(120), exercise())
         .await
         .expect("B4 public revoke-ordering case timed out")
@@ -146,54 +146,75 @@ async fn exercise() -> anyhow::Result<()> {
     anyhow::ensure!(matches!(registered, EncoderControlResponse::Register { refused: false }),
         "encoder registration was refused: {registered:?}");
 
-    control.send(Message::Close(None)).await?;
-    drop(control);
-    // The endpoint has now begun its finalizer: it takes signal authority over
-    // the registered group and SIGTERMs it. The marker proves the endpoint, not
-    // the test, signalled the group; only then do we issue the adapter revoke.
-    wait_file(&marker, Duration::from_secs(10)).await?;
-
-    let mut group_wait = tokio::spawn(async move { group_child.wait().await });
-    send(&mut write, &EncoderControlRequest::Revoke { registration_id: 7 }).await?;
-    let mut response_line = String::new();
-    let mut group_status = None;
-    let ack_before_reap = {
-        let response_fut = read.read_line(&mut response_line);
-        tokio::pin!(response_fut);
-        tokio::select! {
-            joined = &mut group_wait => {
-                group_status = Some(joined.expect("group wait task panicked")?);
-                false
-            }
-            read = &mut response_fut => {
-                read?;
-                true
-            }
-        }
-    };
-    anyhow::ensure!(!ack_before_reap,
-        "revoke acknowledgement arrived while the endpoint still held signal authority over the registered group");
-    // The group was reaped first; the acknowledgement must follow.
-    if response_line.is_empty() {
-        tokio::time::timeout(Duration::from_secs(15), read.read_line(&mut response_line)).await
-            .context("revoke was not acknowledged after the group was reaped")??;
-    }
-    let response: EncoderControlResponse = serde_json::from_str(response_line.trim_end())?;
+    // The adapter owns the group while the session is live. A revoke must be
+    // acknowledged without any endpoint-side signal work: the endpoint has no
+    // authority to signal, so it has nothing to wait for. The group is
+    // deliberately still alive, so an endpoint that waited for its own signal
+    // could never answer.
+    let response = exchange(&mut read, &mut write, EncoderControlRequest::Revoke { registration_id: 7 }).await?;
     anyhow::ensure!(matches!(response, EncoderControlResponse::Revoke { refused: false }),
         "revoke was not acknowledged: {response:?}");
-    let status = match group_status {
-        Some(status) => status,
-        None => group_wait.await.expect("group wait task panicked")?,
-    };
-    anyhow::ensure!(!status.success(), "registered group exited successfully instead of being signalled: {status}");
+    anyhow::ensure!(
+        !marker.exists(),
+        "the endpoint signalled the registered group while acknowledging the revoke"
+    );
+    anyhow::ensure!(
+        unsafe { libc::kill(-pgid, 0) } == 0,
+        "the registered group was gone after revoke: the endpoint reaped a group it does not own"
+    );
 
-    let mut second_line = String::new();
-    send(&mut write, &EncoderControlRequest::Revoke { registration_id: 7 }).await?;
-    tokio::time::timeout(Duration::from_secs(2), read.read_line(&mut second_line)).await
-        .context("idempotent revoke was not acknowledged")??;
-    let second: EncoderControlResponse = serde_json::from_str(second_line.trim_end())?;
+    // Idempotent second revoke, still without any group signal.
+    let second = exchange(&mut read, &mut write, EncoderControlRequest::Revoke { registration_id: 7 }).await?;
     anyhow::ensure!(matches!(second, EncoderControlResponse::Revoke { refused: false }),
         "idempotent revoke was refused: {second:?}");
+    anyhow::ensure!(
+        !marker.exists(),
+        "a repeated revoke caused the endpoint to signal the registered group"
+    );
+
+    // Now close the session. The finalizer retires its registration authority
+    // and must still never signal the group, which remains adapter-owned.
+    control.send(Message::Close(None)).await?;
+    drop(control);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    anyhow::ensure!(
+        !marker.exists(),
+        "the endpoint signalled the registered group during session finalize: {} appeared",
+        marker.display()
+    );
+    anyhow::ensure!(
+        unsafe { libc::kill(-pgid, 0) } == 0,
+        "the endpoint reaped the registered group during finalize; only the adapter may"
+    );
+
+    // The adapter now owns cleanup: it signals and reaps the group itself.
+    // This is the exact sequence the base adapter runs, and it must still work
+    // after the endpoint has retired its authority.
+    anyhow::ensure!(
+        unsafe { libc::kill(-pgid, libc::SIGTERM) } == 0,
+        "adapter-owned SIGTERM did not reach the registered group"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    anyhow::ensure!(marker.exists(), "the group's own SIGTERM handler did not record the adapter signal");
+    // SIGKILL the group now that delivery is proven, then reap it.
+    anyhow::ensure!(
+        unsafe { libc::kill(-pgid, libc::SIGKILL) } == 0,
+        "adapter-owned SIGKILL did not reach the registered group"
+    );
+    let status = tokio::time::timeout(Duration::from_secs(20), group_child.wait())
+        .await
+        .context("adapter-owned group reap deadline")??;
+    anyhow::ensure!(!status.success(), "registered group exited successfully instead of being signalled: {status}");
+    // The group identity is only gone once the reaper has collected it.
+    let mut identity_gone = false;
+    for _ in 0..40 {
+        identity_gone = unsafe { libc::kill(-pgid, 0) } != 0;
+        if identity_gone {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::ensure!(identity_gone, "the registered group identity was still addressable after reap");
 
     if let Some(pid) = endpoint.id() {
         // Safety: signaling the one endpoint process this test spawned so its

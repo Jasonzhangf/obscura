@@ -19,7 +19,7 @@ use obscura_media::encoder_owner::{
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
-    sync::{oneshot, Mutex, Notify},
+    sync::{oneshot, Mutex},
 };
 
 /// One endpoint admission fence for encoder acquisition. Registration is
@@ -40,17 +40,23 @@ pub struct InFlightAcquisition {
     settlement_rx: Option<oneshot::Receiver<EncoderSettlement>>,
 }
 
+/// Registration lifecycle on the endpoint side. The endpoint never signals a
+/// registered process group, so there is no intermediate "signal work in
+/// flight" state: a registration is either `Armed` (bound and accepted while
+/// admission was open) or `Revoked` (the endpoint holds no further claim to
+/// it). Group signal and reap belong to the adapter, which is the only party
+/// that can `wait` the FFmpeg leader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderRegistrationState {
     Armed,
-    Revoking,
     Revoked,
 }
 
+/// The answer to one typed revoke request. Every non-refused answer is final,
+/// because the endpoint has no group signal work to complete first.
 pub enum EncoderRevoke {
     Acknowledged,
     Refused,
-    AwaitingSignal(std::sync::Arc<Notify>),
 }
 
 /// The branch one closing control connection's retirement barrier observed.
@@ -66,9 +72,6 @@ pub enum EncoderRetirement {
     /// An `Armed` registration was moved to `Revoked` under the same control
     /// lock, revoking every later claim to group-signal authority.
     RevokedArmed,
-    /// The registration was `Revoking`: the barrier waited for the existing
-    /// finalizer to finish its signal work and `mark_revoked`.
-    AwaitedFinalizer,
     /// The registration was already `Revoked`; no further signal is possible.
     AlreadyRevoked,
     /// No registration, but an outstanding permit never reached `register`.
@@ -93,7 +96,6 @@ pub struct EncoderControlState {
     pub admission: EncoderAdmission,
     pub in_flight: Option<InFlightAcquisition>,
     pub registration: Option<EncoderRegistration>,
-    revoke_changed: std::sync::Arc<Notify>,
 }
 
 impl Default for EncoderAdmission {
@@ -159,65 +161,44 @@ impl EncoderControlState {
         Some((in_flight.registration_id, receiver))
     }
 
-    /// Begin or observe revocation for one registration. An `Armed` group is
-    /// acknowledged immediately. A group already under endpoint signal
-    /// authority remains unacknowledged until `mark_revoked` completes that
-    /// authority. Unknown and mismatched ids are refused.
+    /// Revoke one registration. An `Armed` group is acknowledged immediately
+    /// and the registration becomes `Revoked`, so no later caller can claim
+    /// signal authority over it. The endpoint never signals the group itself.
+    /// Unknown and mismatched ids are refused.
     pub fn revoke(&mut self, registration_id: u64) -> EncoderRevoke {
         let Some(registration) = self.registration.as_mut() else { return EncoderRevoke::Refused; };
         if registration.registration_id != registration_id {
             return EncoderRevoke::Refused;
         }
-        match registration.state {
-            EncoderRegistrationState::Armed => {
-                registration.state = EncoderRegistrationState::Revoked;
-                EncoderRevoke::Acknowledged
-            }
-            EncoderRegistrationState::Revoking => EncoderRevoke::AwaitingSignal(std::sync::Arc::clone(&self.revoke_changed)),
-            EncoderRegistrationState::Revoked => EncoderRevoke::Acknowledged,
-        }
+        registration.state = EncoderRegistrationState::Revoked;
+        EncoderRevoke::Acknowledged
     }
 
-    /// Move an armed registration to `Revoking` and return its exact pgid for a
-    /// direct group signal. Refused/unknown ids return `None`.
-    pub fn begin_stop_armed_group(&mut self) -> Option<i32> {
-        let registration = self.registration.as_mut()?;
-        if matches!(registration.state, EncoderRegistrationState::Armed | EncoderRegistrationState::Revoking) {
-            registration.state = EncoderRegistrationState::Revoking;
-            Some(registration.pgid)
-        } else {
-            None
-        }
-    }
-
-    pub fn mark_revoked(&mut self) {
+    /// Retire the registration's signal authority without addressing the group.
+    /// This is the endpoint's only close-edge authority transition: the adapter
+    /// owns group signal and reap, so the endpoint has no signal work to finish
+    /// first and no bounded group wait to complete.
+    pub fn revoke_registration_authority(&mut self) {
         if let Some(registration) = self.registration.as_mut() {
             registration.state = EncoderRegistrationState::Revoked;
         }
-        self.revoke_changed.notify_one();
     }
 
     /// First step of the retirement barrier for one control connection that is
     /// closing: read the real state under the control lock and take the only
     /// action that state authorizes. It never signals a group, never clears the
     /// registration, and never resolves a permit: a closed transport is not
-    /// evidence that no child exists. The `Revoking` branch still has to be
-    /// completed by `await_finalizer_revoke` outside the lock.
+    /// evidence that no child exists.
     pub fn begin_retirement(&mut self) -> EncoderRetirement {
         if let Some(registration) = self.registration.as_mut() {
             return match registration.state {
-                // The finalizer takes group-signal authority through this same
-                // control lock (`begin_stop_armed_group`); revoking here means
-                // it can no longer acquire that authority, so the group is
-                // adapter-owned from this close edge on. The registration
-                // record stays as the true `Revoked` state.
+                // The endpoint holds no group signal authority, so revoking is
+                // the whole transition: the group is adapter-owned from this
+                // close edge on. The registration record keeps its true state.
                 EncoderRegistrationState::Armed => {
                     registration.state = EncoderRegistrationState::Revoked;
                     EncoderRetirement::RevokedArmed
                 }
-                // Signal work already started: keep the registration and its
-                // true state and wait for its owner to complete it.
-                EncoderRegistrationState::Revoking => EncoderRetirement::AwaitedFinalizer,
                 EncoderRegistrationState::Revoked => EncoderRetirement::AlreadyRevoked,
             };
         }
@@ -234,7 +215,8 @@ impl EncoderControlState {
     }
 
     /// Flip admission to `Finalizing` and return the exact armed pgid if one is
-    /// bound. The finalizer calls this before it signals or stops anything.
+    /// bound. The finalizer calls this before it settles or stops anything. The
+    /// pgid is used only to identify the permit; the endpoint never signals it.
     pub fn close_admission(&mut self) -> Option<i32> {
         self.admission = EncoderAdmission::Finalizing;
         self.registration.as_ref().map(|registration| registration.pgid)
@@ -247,42 +229,13 @@ impl EncoderControlState {
 /// before the stream is dropped.
 ///
 /// It retires exactly the authority the real state authorizes: an `Armed`
-/// registration loses its future group-signal authority, a `Revoking`
-/// registration is left to its existing finalizer, and an outstanding permit
-/// that never registered stays untouched for that finalizer's
+/// registration loses its future group-signal authority, and an outstanding
+/// permit that never registered stays untouched for the finalizer's
 /// unknown-settlement path. It never signals a group, never clears the
-/// registration, and never fabricates a settlement.
+/// registration, and never fabricates a settlement. There is no wait: the
+/// endpoint has no group signal work whose completion a close edge must await.
 pub async fn retire_connection_authority(state: &Arc<Mutex<EncoderControlState>>) -> EncoderRetirement {
-    let branch = state.lock().await.begin_retirement();
-    if branch == EncoderRetirement::AwaitedFinalizer {
-        await_finalizer_revoke(state).await;
-    }
-    branch
-}
-
-/// Complete the `Revoking` branch: keep the registration and its true state and
-/// wait for the existing finalizer to finish its signal work and call
-/// `mark_revoked`. The wait is established before the state is checked, is
-/// awaited outside the control lock, and re-checks the state after every wake.
-/// `Notify::notify_one` stores a permit when no waiter is registered, so a
-/// `mark_revoked` between the check and the await cannot be lost. There is no
-/// deadline: `Revoking` is only ever set by the finalizer that owns the bounded
-/// group wait and always completes it with `mark_revoked`.
-async fn await_finalizer_revoke(state: &Arc<Mutex<EncoderControlState>>) {
-    loop {
-        let changed = Arc::clone(&state.lock().await.revoke_changed);
-        // Established before the state check below, so this wakeup cannot be
-        // lost between the check and the await.
-        let wait = changed.notified();
-        let revoking = {
-            let guard = state.lock().await;
-            guard.registration.as_ref().is_some_and(|registration| registration.state == EncoderRegistrationState::Revoking)
-        };
-        if !revoking {
-            return;
-        }
-        wait.await;
-    }
+    state.lock().await.begin_retirement()
 }
 
 pub struct EncoderControl {
@@ -405,16 +358,12 @@ where
 }
 
 async fn await_revoke(state: &Arc<Mutex<EncoderControlState>>, registration_id: u64) -> bool {
-    loop {
-        let notified = {
-            let mut guard = state.lock().await;
-            match guard.revoke(registration_id) {
-                EncoderRevoke::Acknowledged => return false,
-                EncoderRevoke::Refused => return true,
-                EncoderRevoke::AwaitingSignal(notified) => notified,
-            }
-        };
-        notified.notified().await;
+    // The endpoint owns no group signal, so a revoke is decided in one lock
+    // acquisition: acknowledged for the exact bound registration, refused
+    // otherwise. There is no signal work to wait for.
+    match state.lock().await.revoke(registration_id) {
+        EncoderRevoke::Acknowledged => false,
+        EncoderRevoke::Refused => true,
     }
 }
 
@@ -435,11 +384,11 @@ mod tests {
         serde_json::from_str(line.trim_end()).unwrap()
     }
 
-    /// B4: the typed revoke acknowledgement must not outrun endpoint signal
-    /// authority. While the registration is `Revoking`, a revoke request stays
-    /// unacknowledged until `mark_revoked` closes that authority.
+    /// B4: the endpoint never signals the registered group, so a revoke is
+    /// acknowledged from the bound registration alone and must not depend on
+    /// any endpoint-side group signal completing.
     #[tokio::test]
-    async fn revoke_ack_waits_for_endpoint_signal_authority() {
+    async fn revoke_is_acknowledged_without_endpoint_group_signal() {
         let root = std::path::Path::new("/tmp").join(format!("ec-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("control.sock");
@@ -455,21 +404,26 @@ mod tests {
         assert!(matches!(acquired, EncoderControlResponse::Acquire { permit: EncoderPermit::Granted }));
         let registered = exchange(&mut read, &mut write, EncoderControlRequest::Register { registration_id: 1, pgid: 42 }).await;
         assert!(matches!(registered, EncoderControlResponse::Register { refused: false }));
-        assert_eq!(state.lock().await.begin_stop_armed_group(), Some(42));
 
-        let mut request = serde_json::to_vec(&EncoderControlRequest::Revoke { registration_id: 1 }).unwrap();
-        request.push(b'\n');
-        write.write_all(&request).await.unwrap();
-        let mut line = String::new();
-        let early = tokio::time::timeout(Duration::from_millis(150), read.read_line(&mut line)).await;
-        assert!(early.is_err(), "revoke was acknowledged before endpoint signal authority completed: {line:?}");
+        // The revoke must be answered on the bound registration alone: the
+        // adapter owns the group, so the endpoint has no signal work to do and
+        // must not leave the caller waiting for any.
+        let revoked = tokio::time::timeout(
+            Duration::from_secs(1),
+            exchange(&mut read, &mut write, EncoderControlRequest::Revoke { registration_id: 1 }),
+        )
+        .await
+        .expect("revoke was not acknowledged: the endpoint held group signal authority it does not own");
+        assert!(matches!(revoked, EncoderControlResponse::Revoke { refused: false }));
 
-        state.lock().await.mark_revoked();
-        let mut response = String::new();
-        tokio::time::timeout(Duration::from_secs(1), read.read_line(&mut response)).await
-            .expect("revoke was not acknowledged after signal authority completed").unwrap();
-        let response: EncoderControlResponse = serde_json::from_str(response.trim_end()).unwrap();
-        assert!(matches!(response, EncoderControlResponse::Revoke { refused: false }));
+        // A second revoke of the same registration is still acknowledged, and
+        // the registration records no lingering signal authority.
+        let again = exchange(&mut read, &mut write, EncoderControlRequest::Revoke { registration_id: 1 }).await;
+        assert!(matches!(again, EncoderControlResponse::Revoke { refused: false }));
+        assert_eq!(
+            state.lock().await.registration.map(|registration| registration.state),
+            Some(EncoderRegistrationState::Revoked),
+        );
 
         let _ = stop_tx.send(());
         let _ = reader_task.await;
@@ -489,49 +443,21 @@ mod tests {
     }
 
     /// F1 row 2: an `Armed` registration is revoked inside the same control
-    /// lock, so the finalizer can no longer take group-signal authority.
+    /// lock, so no later claim to group-signal authority can be made and the
+    /// barrier needs no wait.
     #[tokio::test]
-    async fn retirement_barrier_revokes_armed_before_finalizer_takes_authority() {
+    async fn retirement_barrier_revokes_armed_without_signal_authority() {
         let state = Arc::new(Mutex::new(EncoderControlState::default()));
         assert!(matches!(state.lock().await.acquire(1), EncoderPermit::Granted));
         assert!(!state.lock().await.register(1, 42));
         assert_eq!(retire_connection_authority(&state).await, EncoderRetirement::RevokedArmed);
         let mut guard = state.lock().await;
         assert_eq!(guard.registration.map(|registration| registration.state), Some(EncoderRegistrationState::Revoked));
-        assert_eq!(guard.begin_stop_armed_group(), None, "the closing connection left group-signal authority available");
+        // A later revoke is a no-op acknowledgement rather than a signal claim.
+        assert!(matches!(guard.revoke(1), EncoderRevoke::Acknowledged));
     }
 
-    /// F1 row 3: a `Revoking` registration keeps its true state and the barrier
-    /// waits for the existing finalizer's `mark_revoked` before the connection
-    /// closes.
-    #[tokio::test]
-    async fn retirement_barrier_waits_for_finalizer_revoke_completion() {
-        let state = Arc::new(Mutex::new(EncoderControlState::default()));
-        assert!(matches!(state.lock().await.acquire(1), EncoderPermit::Granted));
-        assert!(!state.lock().await.register(1, 42));
-        assert_eq!(state.lock().await.begin_stop_armed_group(), Some(42));
-        let mut barrier = tokio::spawn({
-            let state = Arc::clone(&state);
-            async move { retire_connection_authority(&state).await }
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(150), &mut barrier).await.is_err(),
-            "the barrier closed the connection while endpoint signal work was still in flight"
-        );
-        assert_eq!(
-            state.lock().await.registration.map(|registration| registration.state),
-            Some(EncoderRegistrationState::Revoking),
-            "the barrier discarded the registration or its true state while signal work was in flight"
-        );
-        state.lock().await.mark_revoked();
-        let branch = tokio::time::timeout(Duration::from_secs(1), barrier)
-            .await
-            .expect("the barrier did not resume after the finalizer completed signal work")
-            .unwrap();
-        assert_eq!(branch, EncoderRetirement::AwaitedFinalizer);
-    }
-
-    /// F1 row 4: an already `Revoked` registration is closed directly and
+    /// F1 row 3: an already `Revoked` registration is closed directly and
     /// without any further signal.
     #[tokio::test]
     async fn retirement_barrier_completes_without_signal_when_already_revoked() {
@@ -540,7 +466,24 @@ mod tests {
         assert!(!state.lock().await.register(1, 42));
         assert!(matches!(state.lock().await.revoke(1), EncoderRevoke::Acknowledged));
         assert_eq!(retire_connection_authority(&state).await, EncoderRetirement::AlreadyRevoked);
-        assert_eq!(state.lock().await.begin_stop_armed_group(), None);
+    }
+
+    /// F1 row 4: the retirement barrier is total for the close edge. Every
+    /// reachable registration state maps to a branch without waiting, because
+    /// the endpoint owns no group signal whose completion it must await.
+    #[tokio::test]
+    async fn retirement_barrier_never_waits_for_endpoint_signal_work() {
+        let state = Arc::new(Mutex::new(EncoderControlState::default()));
+        assert!(matches!(state.lock().await.acquire(1), EncoderPermit::Granted));
+        assert!(!state.lock().await.register(1, 42));
+        let branch = tokio::time::timeout(Duration::from_millis(150), retire_connection_authority(&state))
+            .await
+            .expect("the barrier waited for endpoint signal work the endpoint does not own");
+        assert_eq!(branch, EncoderRetirement::RevokedArmed);
+        assert_eq!(
+            state.lock().await.registration.map(|registration| registration.state),
+            Some(EncoderRegistrationState::Revoked),
+        );
     }
 
     /// F1 row 5: an outstanding permit that never registered is retained, and

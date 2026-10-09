@@ -367,21 +367,27 @@ impl EncoderChildOwner {
 
     async fn stop_kill_reap(&mut self) -> Result<EncoderStop> {
         let group = self.group.context("Encoder group identity missing")?;
-        signal_group(group, libc::SIGTERM);
-        // Decide on escalation from the group's own existence, never from a
-        // reaped leader. The leader stays unreaped here, so its numeric pgid
-        // still names exactly this group when a later SIGKILL is chosen. Reaping
-        // first would release that identity for reuse and let a stale pgid
-        // address an unrelated group.
-        let group_gone = wait_group_gone(group, GROUP_GRACE).await;
-        let escalated = !group_gone;
-        if escalated {
-            // The leader is still unreaped, so the pgid is still pinned to this
-            // process group.
-            signal_group(group, libc::SIGKILL);
-        }
-        if !wait_group_gone(group, REAP_DEADLINE).await {
-            bail!("Encoder process group survived SIGKILL");
+        let mut escalated = false;
+        // Signal only a group that still holds a live member. A group whose only
+        // remaining member is this unreaped zombie leader cannot be signalled at
+        // all: `kill(-pgid, SIGTERM)` fails with EPERM. Skipping the signal there
+        // is not suppression; there is nothing left that could receive it.
+        if group_has_live_member(group) {
+            signal_group(group, libc::SIGTERM);
+            // Decide on escalation from the group's own existence, never from a
+            // reaped leader. The leader stays unreaped here, so its numeric pgid
+            // still names exactly this group when a later SIGKILL is chosen.
+            // Reaping first would release that identity for reuse and let a
+            // stale pgid address an unrelated group.
+            if !wait_group_gone(group, GROUP_GRACE).await {
+                escalated = true;
+                // The leader is still unreaped, so the pgid is still pinned to
+                // this process group.
+                signal_group(group, libc::SIGKILL);
+                if !wait_group_gone(group, REAP_DEADLINE).await {
+                    bail!("Encoder process group survived SIGKILL");
+                }
+            }
         }
         // Every signal decision is complete. Retire child/group authority at
         // the one actual reap boundary, so no further caller can signal a
@@ -470,13 +476,17 @@ pub fn signal_group(pgid: i32, signal: libc::c_int) {
 async fn wait_group_gone(pgid: i32, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if !group_exists(pgid) { return true; }
+        if !group_has_live_member(pgid) { return true; }
         if tokio::time::Instant::now() >= deadline { return false; }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
-fn group_exists(pgid: i32) -> bool {
+/// True while the bound group still holds at least one live (non-zombie)
+/// member. Not interchangeable with an existence probe: a group whose only
+/// remaining member is an unreaped zombie leader makes `kill(-pgid, 0)` fail
+/// with `EPERM`, and a zombie can never be signalled.
+fn group_has_live_member(pgid: i32) -> bool {
     // Safety: signal 0 performs an existence/permission check only.
     unsafe { libc::kill(-pgid, 0) == 0 }
 }

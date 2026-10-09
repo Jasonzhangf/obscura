@@ -234,22 +234,14 @@ pub struct SessionDurable {
 }
 
 impl SessionDurable {
-    /// Signal the known armed group directly and mark it `Revoked`. The pgid
-    /// comes from the admission permit, never from a log or a guessed pid.
-    async fn stop_armed_encoder_group(&self) -> Result<()> {
-        let pgid = {
-            let mut state = self.encoded_control.state.lock().await;
-            state.begin_stop_armed_group()
-        };
-        if let Some(pgid) = pgid {
-            obscura_media::encoder_owner::signal_group(pgid, libc::SIGTERM);
-            if !wait_group_exit(pgid, Duration::from_secs(2)).await {
-                obscura_media::encoder_owner::signal_group(pgid, libc::SIGKILL);
-                let _ = wait_group_exit(pgid, Duration::from_secs(2)).await;
-            }
-            self.encoded_control.state.lock().await.mark_revoked();
-        }
-        Ok(())
+    /// Retire this session's encoder registration authority without ever
+    /// addressing the process group. The adapter is the sole owner of group
+    /// signal and reap: only the adapter can `wait` the FFmpeg leader, so a
+    /// second signal owner here could only race that reap and address a stale
+    /// numeric pgid. A registration still `Armed` becomes `Revoked`, which
+    /// removes every later claim to signal authority.
+    async fn retire_registered_group(&self) {
+        self.encoded_control.state.lock().await.revoke_registration_authority();
     }
 
     /// Idempotent session finalizer. It closes the admission fence, settles
@@ -264,13 +256,10 @@ impl SessionDurable {
         let mut unsettled = None;
         if let Some((registration_id, receiver)) = settlement {
             match tokio::time::timeout(ENCODER_ADMISSION_SETTLE_DEADLINE, receiver).await {
-                Ok(Ok(obscura_media::encoder_owner::EncoderSettlement::Armed { pgid })) => {
-                    obscura_media::encoder_owner::signal_group(pgid, libc::SIGTERM);
-                    if !wait_group_exit(pgid, Duration::from_secs(2)).await {
-                        obscura_media::encoder_owner::signal_group(pgid, libc::SIGKILL);
-                        let _ = wait_group_exit(pgid, Duration::from_secs(2)).await;
-                    }
-                }
+                // The adapter bound a pgid, so it owns that group's signal and
+                // reap from here on. The endpoint records the settlement and
+                // never signals the group itself.
+                Ok(Ok(obscura_media::encoder_owner::EncoderSettlement::Armed { .. })) => {}
                 Ok(Ok(
                     obscura_media::encoder_owner::EncoderSettlement::RefusedNoChild
                     | obscura_media::encoder_owner::EncoderSettlement::RefusedGroupStopped,
@@ -282,7 +271,7 @@ impl SessionDurable {
                 Ok(Err(_)) | Err(_) => unsettled = Some(registration_id),
             }
         }
-        self.stop_armed_encoder_group().await?;
+        self.retire_registered_group().await;
         if let Some(registration_id) = unsettled {
             // Adapter exit is the remaining settle edge. SIGTERM the adapter
             // direct child and wait its bounded cooperative grace without
@@ -316,20 +305,6 @@ impl SessionDurable {
             None => Ok(true),
         }
     }
-}
-
-async fn wait_group_exit(pgid: i32, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if !group_exists(pgid) { return true; }
-        if tokio::time::Instant::now() >= deadline { return false; }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-fn group_exists(pgid: i32) -> bool {
-    // Safety: signal 0 performs an existence/permission check only.
-    unsafe { libc::kill(-pgid, 0) == 0 }
 }
 
 struct SessionMediaEntry {

@@ -14,13 +14,13 @@
 //!   access unit on the endpoint's `/media` stream. The only test helper is the
 //!   external FFmpeg binary the adapter spawns.
 //!
-//! * `real_endpoint_armed_authority_signals_registered_group` pauses the real
-//!   adapter (SIGSTOP) after the endpoint has committed the registration but
-//!   before the adapter has consumed any revoke acknowledgement, then releases
-//!   the final control reference. The endpoint finalizer must settle the group
-//!   through its own `Armed` authority. Because the adapter is paused, the
-//!   `SIGTERM` the group records can only come from the endpoint. The assertion
-//!   reads public protocol output: the group's signal log and the endpoint's
+//! * `real_endpoint_retires_authority_without_signalling_registered_group` pauses
+//!   the real adapter (SIGSTOP) after the endpoint has committed the registration
+//!   but before the adapter has consumed any revoke acknowledgement, then releases
+//!   the final control reference. The endpoint is not a group signal owner, so
+//!   the group must still be alive and un-signalled after the whole finalizer has
+//!   run: only the paused adapter can settle it. The assertion reads public
+//!   protocol output: the group's signal log, its liveness, and the endpoint's
 //!   session-directory cleanup. No canned control peer, no replaced
 //!   `EncoderControlState` and no replaced finalizer are involved.
 //!
@@ -43,9 +43,10 @@
 //!   typed `Settle(RefusedNoChild)` over the real control socket must still
 //!   close the session normally. A guard that turns every close into a retained
 //!   failure fails here.
-//! * `r10_revoking_close_waits_for_signal_completion` (F1): a close edge that
-//!   lands while the endpoint's own group-signal work is in flight must not
-//!   publish session completion before that work finishes.
+//! * `r10_revoking_close_waits_for_signal_completion` (F1): a close edge with an
+//!   `Armed` registration must retire the endpoint's own registration authority
+//!   and never address the group's pgid, because the adapter is the sole owner
+//!   of group signal and reap.
 //! * `r10_relay_preserves_bytes_and_release_boundary` (F2): the bounded
 //!   control-socket relay obeys the seven O2 contracts, and the frozen baseline
 //!   relay is shown to violate them (early EOF, early bytes, lost tail) in the
@@ -93,7 +94,7 @@ async fn real_endpoint_round_trip_produces_access_unit() {
 }
 
 #[tokio::test]
-async fn real_endpoint_armed_authority_signals_registered_group() {
+async fn real_endpoint_retires_authority_without_signalling_registered_group() {
     tokio::time::timeout(Duration::from_secs(180), armed_authority())
         .await
         .expect("F5 armed-authority case timed out")
@@ -303,24 +304,49 @@ async fn armed_authority() -> anyhow::Result<()> {
     // the blocked encode. It has not sent any revoke yet.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Pause the real adapter so the only process that can signal the registered
-    // group is the endpoint's own `Armed` authority.
+    // Pause the real adapter so it cannot settle the group itself. Any signal
+    // the registered group receives from here can only come from the endpoint,
+    // which is exactly the second signal owner this contract forbids.
     anyhow::ensure!(unsafe { libc::kill(adapter_pid, libc::SIGSTOP) } == 0, "SIGSTOP the real adapter");
 
     // Release the final control reference: the endpoint runs the exact-session
-    // finalizer. It must settle the registered group through its own `Armed`
-    // authority (no adapter cooperation, since the adapter is paused).
+    // finalizer. Under sole-adapter ownership the endpoint must retire its
+    // registration authority and never address the group's pgid, even though a
+    // registration is `Armed`. It may only signal its own direct adapter child.
     control.send(Message::Close(None)).await?;
     drop(control);
 
-    let signals = wait_signals(&group_signals, Duration::from_secs(20)).await?;
-    anyhow::ensure!(signals.trim() == "15",
-        "F5: the endpoint's Armed authority did not deliver exactly one SIGTERM to the registered group: {signals:?}");
-    anyhow::ensure!(!process_group_alive(read_pgid(&group_pgid)?), "F5: the registered group survived the endpoint finalizer");
-
+    // Wait past the endpoint's settlement deadline plus adapter cooperative
+    // grace: the whole finalizer has now run. It retires its registration
+    // authority and may only signal its own direct adapter child; it must never
+    // address the group's pgid.
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    anyhow::ensure!(
+        !group_signals.exists() || std::fs::read_to_string(&group_signals)?.trim().is_empty(),
+        "F5: the endpoint signalled the registered group it does not own: {:?}",
+        std::fs::read_to_string(&group_signals)
+    );
+    anyhow::ensure!(process_group_alive(read_pgid(&group_pgid)?),
+        "F5: the endpoint settled or reaped the registered group; only the adapter owns that group");
+    // The endpoint's own cleanup is complete: it retired authority, reaped its
+    // direct adapter child, and removed the session resources. The group it does
+    // not own is deliberately untouched.
     let session_dir = root.join(format!("endpoint/m-{}", &fixture.session_id().replace("-", "")[..12]));
-    wait_dir_gone(&session_dir, Duration::from_secs(20)).await?;
-    eprintln!("F5 armed authority: endpoint settled the registered group through its own Armed state");
+    wait_dir_gone(&session_dir, Duration::from_secs(30)).await?;
+    anyhow::ensure!(!process_alive(adapter_pid),
+        "F5: the endpoint did not retire its own direct adapter child");
+
+    // Reclaim this test's own resources. The endpoint never owned the group, so
+    // nothing else will settle it.
+    let pgid = read_pgid(&group_pgid)?;
+    // Safety: reclaiming the exact group this test created.
+    let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    for _ in 0..50 {
+        if !process_group_alive(pgid) { break; }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    anyhow::ensure!(!process_group_alive(pgid), "F5: test-owned encoder group could not be reclaimed");
+    eprintln!("F5 armed authority: the endpoint retired authority and never signalled the adapter-owned group");
 
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;
@@ -2015,14 +2041,14 @@ async fn no_child_settlement_closes_normally() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// R10-F1: the close terminal for a session the endpoint has already put into
-/// signal work.
+/// R10-F1: the close terminal for a session with an `Armed` registration.
 ///
-/// The endpoint's reader takes authority from the real registration and starts
-/// its own signal work: it delivers SIGTERM to the registered group, and that
-/// group is still alive afterwards. The transport then fails while that work is
-/// still in flight. The endpoint must not publish a session completion at that
-/// moment; it must finish the work it started, and only then close.
+/// The endpoint is not a group signal owner. When the last control reference is
+/// released while a registration is `Armed`, the endpoint must retire its own
+/// registration authority without ever delivering a signal to the registered
+/// group. The transport close is the retirement edge; the group stays alive and
+/// un-signalled because only the adapter can settle it. Publishing a session
+/// completion by signalling that pgid is the forbidden second signal owner.
 #[tokio::test]
 async fn r10_revoking_close_waits_for_signal_completion() {
     tokio::time::timeout(Duration::from_secs(180), revoking_close_waits_for_signal_completion())
@@ -2053,65 +2079,54 @@ async fn revoking_close_waits_for_signal_completion() -> anyhow::Result<()> {
     let registered = exchange_frame(&mut read, &mut write, EncoderControlRequest::Register { registration_id: 21, pgid }).await?;
     anyhow::ensure!(matches!(registered, EncoderControlResponse::Register { refused: false }),
         "the endpoint refused the real group registration this case needs: {registered:?}");
-    anyhow::ensure!(process_group_alive(pgid), "the registered group died before the endpoint took authority");
+    anyhow::ensure!(process_group_alive(pgid), "the registered group died before the endpoint retired authority");
 
-    // Release the last control reference: the endpoint's finalizer moves the
-    // permit into signal work and delivers its own SIGTERM.
+    // Release the last control reference: the endpoint's finalizer runs while a
+    // registration is `Armed`. The endpoint is NOT a group signal owner, so it
+    // must retire its registration authority without ever addressing this pgid.
     session.release_control_reference().await;
-    let signal_started = tokio::time::Instant::now();
-    wait_signals(&group_signals, Duration::from_secs(20)).await?;
-    let alive_at_trigger = process_group_alive(pgid);
-    let dir_at_trigger = session.session_dir().exists();
-    eprintln!("R10-F1C-PRECONDITION: endpoint SIGTERM recorded; group_alive={alive_at_trigger} session_dir_present={dir_at_trigger} group={pgid} adapter={adapter_pid}");
-    anyhow::ensure!(alive_at_trigger, "the registered group did not survive the endpoint's SIGTERM, so no signal work was in flight");
-    anyhow::ensure!(dir_at_trigger, "the endpoint published session completion before it delivered its own SIGTERM");
+    let release_started = tokio::time::Instant::now();
 
-    // Trigger: the control transport fails while the endpoint's signal work is
-    // still in flight.
-    write.write_all(b"{\"op\":\"__r10_f1c_reader_failure__\"}\n").await?;
-    let elapsed = signal_started.elapsed();
-    // The close barrier must hold the transport open for as long as the
-    // endpoint's own signal work is unfinished. A close inside the two-second
-    // grace is the premature close edge: it retires authority the endpoint is
-    // still exercising, so the adapter and the endpoint would own the group at
-    // the same time.
-    let closed_within_grace =
-        tokio::time::timeout(Duration::from_millis(300), read_to_eof(&mut read, Duration::from_secs(20))).await;
-    let alive_after_trigger = process_group_alive(pgid);
-    let dir_after_trigger = session.session_dir().exists();
-    eprintln!("R10-F1C-TRIGGER: reader failure {elapsed:?} after the endpoint SIGTERM; transport_closed_within_grace={} group_alive={alive_after_trigger} session_dir_present={dir_after_trigger}",
-        closed_within_grace.is_ok());
-    anyhow::ensure!(elapsed < Duration::from_secs(2),
-        "the reader failure landed {elapsed:?} after the SIGTERM, outside the endpoint's two-second SIGTERM grace, so the close did not overlap the signal work");
-    anyhow::ensure!(closed_within_grace.is_err(),
-        "F1 Revoking: the endpoint closed the encoder-control transport while the group-signal work it had started was still in flight, so it retired authority it was still exercising");
-    anyhow::ensure!(alive_after_trigger, "F1 Revoking: the registered group was already settled when the reader failed");
-    anyhow::ensure!(dir_after_trigger,
-        "F1 Revoking: the endpoint published its session completion while the signal work it had started was still unfinished");
+    // The endpoint's encoder-control transport is the retirement edge: closing
+    // it is how any later claim to signal authority is revoked.
     read_to_eof(&mut read, Duration::from_secs(20)).await?;
+    let elapsed = release_started.elapsed();
+    eprintln!("R10-F1C-RETIRED: endpoint closed the encoder-control transport {elapsed:?} after release");
 
-    // The endpoint must finish the work it started, and only then close.
-    let status = wait_child_status(&mut group, Duration::from_secs(20)).await;
-    let exit_signal = status.as_ref().and_then(|status| {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal()
-    });
-    let reaped = wait_group_reaped(pgid, Duration::from_secs(10)).await;
+    // The whole finalizer has now run. The group is still here and never
+    // received a signal, because only the adapter owns this group.
+    let recorded = std::fs::read_to_string(&group_signals).unwrap_or_default();
+    anyhow::ensure!(recorded.trim().is_empty(),
+        "F1: the endpoint signalled the registered group it does not own: {recorded:?}");
+    anyhow::ensure!(process_group_alive(pgid),
+        "F1: the endpoint settled or reaped the registered group; only the adapter owns that group");
+
+    // The endpoint completed its own cleanup: the permit was resolved by
+    // `Register`, so no unsettled terminal may appear, and the session's own
+    // resources are removed while the adapter-owned group is left untouched.
     let dir_removed = wait_dir_gone_bool(&session.session_dir(), Duration::from_secs(30)).await;
     let stderr = session.stderr();
-    let recorded = std::fs::read_to_string(&group_signals).unwrap_or_default();
-    eprintln!("R10-F1C-OBSERVED: group_exit_signal={exit_signal:?} group_reaped={reaped} session_dir_removed={dir_removed} signals={recorded:?} terminal_present={}",
-        stderr.contains("SESSION_ENCODER_PERMIT_UNSETTLED"));
-    anyhow::ensure!(exit_signal == Some(libc::SIGKILL),
-        "F1 Revoking: the endpoint abandoned the signal work it had started after the close edge; group_exit_signal={exit_signal:?}");
-    anyhow::ensure!(reaped, "F1 Revoking: the registered group was not reaped after the endpoint's own signal work");
-    anyhow::ensure!(dir_removed, "F1 Revoking: the endpoint did not complete the close after the signal work finished");
-    anyhow::ensure!(recorded.trim() == "15", "F1 Revoking: the group recorded signals other than the endpoint's own SIGTERM: {recorded:?}");
     anyhow::ensure!(!stderr.contains("SESSION_ENCODER_PERMIT_UNSETTLED"),
-        "F1 Revoking: an unsettled-permit terminal appeared for a registered group:\n{stderr}");
+        "F1: an unsettled-permit terminal appeared for a registration the endpoint retired cleanly:\n{stderr}");
+    anyhow::ensure!(dir_removed,
+        "F1: the endpoint did not complete its own session cleanup after retiring registration authority");
+    anyhow::ensure!(process_group_alive(pgid),
+        "F1: the endpoint removed session resources by settling a group it does not own");
+
+    // Reclaim this test's own group: the endpoint never owns it, so nothing else
+    // will settle it.
+    // Safety: reclaiming the exact test-owned group.
+    let _ = unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    let _ = wait_group_reaped(pgid, Duration::from_secs(10)).await;
+    if process_group_alive(pgid) {
+        let _ = unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        let _ = wait_group_reaped(pgid, Duration::from_secs(10)).await;
+    }
+    let _ = group.wait().await;
+    eprintln!("R10-F1C-RESULT: endpoint retired authority without signalling the adapter-owned group");
 
     let code = session.terminate_endpoint().await;
-    eprintln!("R10-F1C-RESULT: endpoint_exit={code:?}");
+    eprintln!("R10-F1C-ENDPOINT-EXIT: {code:?}");
     adapter_cleanup.reclaim();
     session.shutdown().await;
     let _ = std::fs::remove_dir_all(&root);
@@ -2844,14 +2859,18 @@ async fn real_endpoint_live_adapter_revoke_waits_for_endpoint_authority() {
         .expect("F4.2 case failed");
 }
 
-/// F4.2: a live adapter that requests `Revoke` while the real endpoint owns the
-/// group cleanup must not reap its leader before the endpoint retires signal
-/// authority. The endpoint's typed revoke acknowledgement is the public signal
-/// that authority is retired: `stop_armed_encoder_group` moves the registration
-/// to `Revoking`, signals the group, and only calls `mark_revoked` after the
-/// group settles. The group here ignores SIGTERM, so the endpoint spends its
-/// full two second SIGTERM grace in `Revoking`; an adapter that reaped without
-/// waiting would drop the leader inside its own one second grace.
+/// F4.2: a live adapter and a released endpoint session must have exactly one
+/// owner of group signal and reap.
+///
+/// The helper group ignores SIGTERM, so whichever party owns the group must
+/// deliver one SIGTERM and then escalate to SIGKILL. Under sole-adapter
+/// ownership the endpoint retires its registration authority and never
+/// addresses the group's pgid, so the endpoint's own finalizer completes
+/// without emitting a group-signal failure. The double-owner arrangement is
+/// exactly what produced the confirmed live
+/// `encoder group signal failed: Operation not permitted`: the endpoint
+/// SIGKILLed the group first, and the adapter then signalled a group that no
+/// longer had a live member.
 async fn revoke_during_endpoint_cleanup() -> anyhow::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let fixture = Fixture::new("ob10d")?;
@@ -2861,12 +2880,40 @@ async fn revoke_during_endpoint_cleanup() -> anyhow::Result<()> {
     let group_pgid = root.join("group.pgid");
     let adapter_pid_file = root.join("adapter.pid");
     let group_signals = root.join("group.signals");
-    let helper = root.join("group.sh");
+    let group_ready = root.join("group.ready");
+    let helper = root.join("group.py");
+    // The helper is the adapter's encoder child. It installs a real SIGTERM
+    // handler that records the signal and keeps running, so the group survives
+    // SIGTERM. Whoever owns the group must therefore deliver exactly one SIGTERM
+    // and then escalate to SIGKILL, and the recorded marker proves which party
+    // signalled. A `/bin/sh` trap cannot express this: the child inherits an
+    // ignored SIGTERM disposition, and POSIX makes `trap` a silent no-op for a
+    // signal ignored on entry, so the shell would die by default action and
+    // record nothing. Python installs the handler explicitly, so the
+    // disposition is observable.
     let script = format!(
-        "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{pgid}'\nprintf '%s\\n' \"$PPID\" > '{adapter}'\ntrap 'printf \"15\\n\" >> \"{signals}\"' TERM\nwhile :; do sleep 0.05; done\n",
+        r#"#!/usr/bin/env python3
+import os
+import signal
+import time
+
+def on_term(_signum, _frame):
+    with open("{signals}", 'a') as handle:
+        handle.write('15\n')
+
+signal.signal(signal.SIGTERM, on_term)
+with open("{pgid}", 'w') as handle:
+    handle.write(str(os.getpid()) + '\n')
+with open("{adapter}", 'w') as handle:
+    handle.write(str(os.getppid()) + '\n')
+open("{ready}", 'w').close()
+while True:
+    time.sleep(0.05)
+"#,
+        signals = group_signals.display(),
         pgid = group_pgid.display(),
         adapter = adapter_pid_file.display(),
-        signals = group_signals.display(),
+        ready = group_ready.display(),
     );
     std::fs::write(&helper, script)?;
     std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))?;
@@ -2882,42 +2929,41 @@ async fn revoke_during_endpoint_cleanup() -> anyhow::Result<()> {
     let attached = next_json(&mut control_socket).await?;
     anyhow::ensure!(attached["type"] == "result", "observe attach failed: {attached}");
 
-    wait_file(&group_pgid, Duration::from_secs(60)).await?;
-    wait_file(&adapter_pid_file, Duration::from_secs(15)).await?;
+    wait_file(&group_ready, Duration::from_secs(60)).await?;
     let adapter_pid: i32 = wait_pid_file(&adapter_pid_file, Duration::from_secs(30)).await?;
     let pgid = read_pgid(&group_pgid)?;
     // Let the real adapter commit `Armed` and block inside the encode.
     tokio::time::sleep(Duration::from_millis(800)).await;
-    anyhow::ensure!(process_group_alive(pgid), "the registered group died before the endpoint took authority");
+    anyhow::ensure!(process_group_alive(pgid), "the registered group died before the session was released");
 
-    // Release the final control reference. The real endpoint finalizer moves the
-    // registration to `Revoking`, takes signal authority and signals the group.
+    // Release the final control reference. The endpoint finalizer retires its
+    // registration authority and SIGTERMs its own direct adapter child. Only the
+    // adapter may signal the group, and it does so from its signal branch.
     control_socket.send(Message::Close(None)).await?;
     drop(control_socket);
-    let signals = wait_signals(&group_signals, Duration::from_secs(20)).await?;
-    anyhow::ensure!(signals.contains("15"),
-        "F4.2: the endpoint did not take signal authority over the registered group: {signals:?}");
-    anyhow::ensure!(process_group_alive(pgid), "the group settled before the adapter requested revoke");
 
-    // Interrupt the live adapter. Its `finalize()` must request revoke and wait
-    // for the endpoint's typed acknowledgement before it reaps the leader.
-    anyhow::ensure!(unsafe { libc::kill(adapter_pid, libc::SIGTERM) } == 0, "SIGTERM the live adapter");
-    tokio::time::sleep(Duration::from_millis(1200)).await;
-    anyhow::ensure!(process_group_alive(pgid),
-        "F4.2: the adapter reaped the registered leader before the endpoint retired signal authority");
-    anyhow::ensure!(process_alive(adapter_pid),
-        "F4.2: the adapter exited before it consumed the endpoint's revoke acknowledgement");
+    // The sole owner settles the group: one SIGTERM, then SIGKILL because the
+    // group ignores SIGTERM.
+    let signals = wait_signals(&group_signals, Duration::from_secs(30)).await?;
+    anyhow::ensure!(signals.trim() == "15",
+        "F4.2: the group must record exactly one own-owner SIGTERM, got {signals:?}");
+    anyhow::ensure!(wait_group_reaped(pgid, Duration::from_secs(20)).await,
+        "F4.2: the retained group was never reaped by its owner");
+    anyhow::ensure!(wait_process_gone(adapter_pid, Duration::from_secs(20)).await,
+        "F4.2: the adapter did not exit after settling its own group");
 
-    // The endpoint's SIGTERM grace ends, `mark_revoked` retires authority, the
-    // adapter consumes the acknowledgement and reaps the retained leader.
-    anyhow::ensure!(wait_group_reaped(pgid, Duration::from_secs(15)).await,
-        "F4.2: the adapter never reaped the retained leader");
-    anyhow::ensure!(wait_process_gone(adapter_pid, Duration::from_secs(15)).await,
-        "F4.2: the adapter did not exit after reaping its leader");
+    // The endpoint never signalled the group. A second signal owner shows up as
+    // the confirmed live EPERM: the endpoint settles the group first and the
+    // adapter then addresses a group with no live member.
+    let stderr = std::fs::read_to_string(root.join("endpoint.err")).unwrap_or_default();
+    anyhow::ensure!(!stderr.contains("encoder group signal failed"),
+        "F4.2: the endpoint signalled the registered group it does not own:\n{stderr}");
+    anyhow::ensure!(!stderr.contains("Operation not permitted"),
+        "F4.2: a group-signal EPERM leaked out of the endpoint's finalizer:\n{stderr}");
 
     let session_dir = root.join(format!("endpoint/m-{}", &fixture.session_id().replace("-", "")[..12]));
     wait_dir_gone(&session_dir, Duration::from_secs(20)).await?;
-    eprintln!("F4.2: live adapter revoke waited for endpoint authority before leader reap");
+    eprintln!("F4.2: the adapter was the sole group signaller and reaper; the endpoint retired authority without signalling");
 
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;

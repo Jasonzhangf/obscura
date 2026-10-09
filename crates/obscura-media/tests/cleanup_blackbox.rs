@@ -57,6 +57,33 @@ async fn serve_control(listener: UnixListener) {
     }
 }
 
+/// The same real control peer, but it also records the pgid the adapter bound
+/// through `Register`. The pgid always comes from the adapter's typed request,
+/// never from a log or a guessed pid.
+async fn serve_control_recording(listener: UnixListener, bound: std::sync::Arc<std::sync::Mutex<Option<i32>>>) {
+    let Ok((stream, _)) = listener.accept().await else { return; };
+    let (read, mut write) = stream.into_split();
+    let mut reader = BufReader::new(read);
+    loop {
+        let mut line = String::new();
+        let count = match reader.read_line(&mut line).await { Ok(count) => count, Err(_) => return };
+        if count == 0 { return; }
+        let request: EncoderControlRequest = match serde_json::from_str(line.trim_end()) { Ok(request) => request, Err(_) => return };
+        let response = match request {
+            EncoderControlRequest::Acquire { .. } => EncoderControlResponse::Acquire { permit: EncoderPermit::Granted },
+            EncoderControlRequest::Register { pgid, .. } => {
+                *bound.lock().unwrap() = Some(pgid);
+                EncoderControlResponse::Register { refused: false }
+            }
+            EncoderControlRequest::Revoke { .. } => EncoderControlResponse::Revoke { refused: false },
+            EncoderControlRequest::Settle { .. } => EncoderControlResponse::Settle,
+        };
+        let mut bytes = serde_json::to_vec(&response).unwrap();
+        bytes.push(b'\n');
+        if write.write_all(&bytes).await.is_err() { return; }
+    }
+}
+
 async fn write_frame(socket: &mut UnixStream, packet: &FramePacket, pixels: &[u8]) {
     let mut header = serde_json::to_vec(packet).unwrap();
     header.push(b'\n');
@@ -791,4 +818,77 @@ async fn standalone_adapter_pins_exited_leader_while_registration_is_unresolved(
     group.disarm();
     drop(held.receiver.take());
     drop(held.dir);
+}
+
+/// The ownership regression for the confirmed live defect: on the healthy
+/// single-frame path FFmpeg exits immediately after emitting its access unit,
+/// so by the time the sole owner finalizes the group its only member is an
+/// unreaped zombie leader. That group is not signalable, and the base owner
+/// signalled it unconditionally, producing
+/// `encoder group signal failed: Operation not permitted (os error 1)`.
+///
+/// This drives a REAL standalone adapter against the REAL `ffmpeg` binary for
+/// one frame and asserts both halves of the contract:
+///   1. the frame is genuinely encoded (a decodable H.264 access unit), and
+///   2. cleanup emits no group-signal failure, the group is gone, and the
+///      leader was reaped.
+/// Pre-fix this fails on the stderr assertion; post-fix it must pass.
+#[tokio::test]
+async fn standalone_adapter_encodes_frame_and_cleans_up_without_group_signal_failure() {
+    let dir = Directory::new();
+    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+    let video = UnixListener::bind(dir.0.join("video")).unwrap();
+    let control = UnixListener::bind(dir.0.join("encoder-control.sock")).unwrap();
+    std::fs::set_permissions(dir.0.join("encoder-control.sock"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let bound: std::sync::Arc<std::sync::Mutex<Option<i32>>> = std::sync::Arc::new(std::sync::Mutex::new(None));
+    drop(tokio::spawn(serve_control_recording(control, std::sync::Arc::clone(&bound))));
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+    command.arg("--frames-socket").arg(dir.0.join("raw"))
+        .arg("--video-socket").arg(dir.0.join("video"))
+        // The real encoder, not a wrapper: this is the production shape whose
+        // leader exits immediately after the one-frame encode.
+        .arg("--ffmpeg").arg("ffmpeg");
+    let child = command.stdout(Stdio::null()).stderr(Stdio::piped()).kill_on_drop(true).spawn().unwrap();
+    let (mut source, _) = raw.accept().await.unwrap();
+    let mut receiver = BufReader::new(video.accept().await.unwrap().0);
+
+    let (packet, pixels) = frame(64, 48);
+    write_frame(&mut source, &packet, &pixels).await;
+    let (reply, coded) = tokio::time::timeout(Duration::from_secs(20), read_video(&mut receiver)).await
+        .expect("the adapter never emitted an access unit for a healthy frame");
+
+    // 1. A real access unit was produced.
+    assert!(matches!(reply, VideoPacket::AccessUnit { .. }),
+        "a healthy frame must produce an AccessUnit, got {reply:?}");
+    assert!(!coded.is_empty(), "the emitted H.264 access unit must not be empty");
+
+    // Close the media session: the adapter settles the retained group and exits.
+    write_frame(&mut source, &FramePacket::Closed { session_id: FRAME_SESSION.into() }, &[]).await;
+    assert!(matches!(
+        read_video(&mut receiver).await.0,
+        VideoPacket::Closed { .. }
+    ), "the adapter must forward the session Close");
+
+    // The adapter settles the retained group before it exits.
+    let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output()).await
+        .expect("the adapter did not exit after the frame").unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // 2. Cleanup issued no group signal to a group that had no live member.
+    assert!(
+        !stderr.contains("encoder group signal failed"),
+        "the sole owner signalled a group with no live member: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Operation not permitted"),
+        "a group-signal EPERM leaked out of ownership cleanup: {stderr}"
+    );
+
+    // The bound group is gone and its leader was reaped, not left a zombie.
+    let pgid = bound.lock().unwrap().expect("Register must have bound the encoder pgid");
+    assert!(wait_group_gone(pgid, Duration::from_secs(5)).await,
+        "the encoder process group survived healthy completion");
+    assert!(!leader_is_zombie(pgid),
+        "the encoder leader was left an unreaped zombie after healthy completion");
 }
