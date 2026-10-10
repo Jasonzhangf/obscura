@@ -68,8 +68,8 @@ pub const ENCODE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Bounded window the adapter waits for the endpoint's typed revoke
 /// acknowledgement. It must cover the endpoint's own signal-completion path:
-/// SIGTERM grace plus SIGKILL grace (`stop_armed_encoder_group` bounds each at
-/// two seconds) plus scheduling slack. A response that does not arrive inside
+/// The endpoint has no signal authority; this remains a bounded ownership
+/// acknowledgement window plus scheduling slack. A response that does not arrive inside
 /// this window is an explicit ownership failure, never an implicit
 /// acknowledgement.
 const REVOKE_ACK_TIMEOUT: Duration = Duration::from_secs(10);
