@@ -136,7 +136,7 @@ async fn exercise() -> anyhow::Result<()> {
     // for the whole case. Peer A moves to the second profile, so A's adapter is
     // the one that finalizes slowly below.
     let (mut control_h, _token_h, session_default) = connect_observe(&connector_h, address).await?;
-    let (mut control_a, _token_a, session_a) = connect_bound(&connector_a, address, "p1").await?;
+    let (control_a, _token_a, session_a) = connect_bound(&connector_a, address, "p1").await?;
     anyhow::ensure!(session_a == session_p1, "A bound the wrong session: {session_a} != {session_p1}");
     anyhow::ensure!(session_a != session_default, "the two profiles resolved to one session");
 
@@ -276,10 +276,6 @@ async fn wait_file(path: &std::path::Path, timeout: Duration) -> anyhow::Result<
 fn process_alive(pid: i32) -> bool {
     // Safety: signal 0 performs an existence/permission check only.
     unsafe { libc::kill(pid, 0) == 0 }
-}
-
-fn unix_ms() -> u128 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis()
 }
 
 /// SIGTERM the endpoint so its real shutdown path reaps the slow adapters

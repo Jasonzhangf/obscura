@@ -78,7 +78,6 @@ impl DeviceSpec {
 struct HostFixture {
     root: PathBuf,
     socket_dir: PathBuf,
-    profile_root: PathBuf,
     child: Child,
 }
 
@@ -100,7 +99,7 @@ impl HostFixture {
             .kill_on_drop(true)
             .spawn()
             .expect("start Host");
-        let fixture = Self { root, socket_dir, profile_root, child };
+        let fixture = Self { root, socket_dir, child };
         fixture.wait_socket("host.sock").await;
         fixture.wait_socket("remote-admission.sock").await;
         fixture
@@ -108,7 +107,6 @@ impl HostFixture {
 
     fn admission_path(&self) -> PathBuf { self.socket_dir.join("remote-admission.sock") }
     fn host_path(&self) -> PathBuf { self.socket_dir.join("host.sock") }
-    fn profile_root(&self) -> &Path { &self.profile_root }
 
     /// Count the per-session sockets the Host bound. A refused admission must
     /// not add one.
