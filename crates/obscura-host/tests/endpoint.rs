@@ -450,24 +450,24 @@ async fn open_media_consumer(
     video
 }
 
-/// BB-EX-MEDIA-35 fixtures: two profiles, so selecting the second one resolves
-/// to its own exact session and a second adapter.
+/// Catalog fixture. One profile: every remote peer is admitted to the catalog
+/// default session, so two control connections hold independent references to
+/// one exact-session media entry.
 fn write_two_profile_catalog(root: &std::path::Path) {
     let catalog = serde_json::json!({
-        "catalog_revision": 2,
+        "catalog_revision": 1,
         "profiles": [
-            {"profile_id": "default", "display_name": "Default", "default": true},
-            {"profile_id": "p1", "display_name": "Secondary", "default": false}
+            {"profile_id": "default", "display_name": "Default", "default": true}
         ],
         "default_profile_id": "default",
-        "next_id": 2
+        "next_id": 1
     });
     std::fs::create_dir_all(root.join("profiles")).unwrap();
     std::fs::write(root.join("profiles/catalog.json"), serde_json::to_string_pretty(&catalog).unwrap()).unwrap();
 }
 
 #[tokio::test]
-async fn exact_session_final_release_runs_finalizer_before_reader_join() {
+async fn shared_session_release_finalizes_only_after_last_control() {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     tokio::time::timeout(Duration::from_secs(180), async {
         let root = PathBuf::from("/tmp").join(format!("ob35-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
@@ -499,11 +499,9 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
         let html = "data:text/html,<style>body{margin:0;background:white}button{width:80px;height:80px;border:0;background:red}</style><button id='t'>t</button>";
         state_a = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state_a),"command":{"type":"resize","width":160,"height":120}})).await;
         let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state_a),"command":{"type":"navigate","url":html}})).await;
-        let bound = local_request(&mut local, serde_json::json!({"id":4,"operation":identity(&state_a),"command":{"type":"profile_select","profile_id":"p1"}})).await;
-        let session_b = bound["status"]["session_id"].as_str().unwrap().to_string();
-        assert_ne!(session_a, session_b, "two profiles must resolve to two sessions");
-        // p1 is materialized as its own exact session; the observer rebind gives
-        // it a live page and a frame source for the second adapter.
+        // Every remote peer is admitted to the catalog default session, so the
+        // two control connections below hold independent references to one
+        // exact-session media entry.
         drop(local);
 
         let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -532,7 +530,8 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
         let (mut control_b, token_b) = connect_endpoint_control(&connector_b, address).await;
         let ready_b = endpoint_ready(&mut control_b).await;
         assert_eq!(ready_b["version"], 11);
-        assert_eq!(ready_b["session_id"].as_str(), Some(session_b.as_str()));
+        assert_eq!(ready_b["session_id"].as_str(), Some(session_a.as_str()));
+        assert_eq!(ready_a["session_id"], ready_b["session_id"], "both controls hold the same exact session");
 
         control_a.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await.unwrap();
         let attached_a: serde_json::Value = serde_json::from_str(control_a.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
@@ -550,28 +549,25 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
             assert!(tokio::time::Instant::now() < deadline, "A never produced an access unit: {header}");
         }
         loop {
-            let header = media_frame(&mut video_b, &session_b).await;
+            let header = media_frame(&mut video_b, &session_a).await;
             if header["type"] == "access_unit" { break; }
             assert!(tokio::time::Instant::now() < deadline, "B never produced an access unit: {header}");
         }
 
-        let dir_a = root.join(format!("endpoint/m-{}", &session_a.replace("-", "")[..12]));
-        let dir_b = root.join(format!("endpoint/m-{}", &session_b.replace("-", "")[..12]));
-        assert!(wait_dir(&dir_a, Duration::from_secs(10)).await, "A per-session directory was never bound");
-        assert!(wait_dir(&dir_b, Duration::from_secs(10)).await, "B per-session directory was never bound");
-        assert!(dir_a.join("encoded.sock").exists(), "A encoded socket missing while healthy");
-        assert!(dir_a.join("encoder-control.sock").exists(), "A encoder-control socket missing while healthy");
+        let dir = root.join(format!("endpoint/m-{}", &session_a.replace("-", "")[..12]));
+        assert!(wait_dir(&dir, Duration::from_secs(10)).await, "the per-session directory was never bound");
+        assert!(dir.join("encoded.sock").exists(), "encoded socket missing while healthy");
+        assert!(dir.join("encoder-control.sock").exists(), "encoder-control socket missing while healthy");
 
-        // Observe A's and B's real adapter processes while both sessions are
-        // healthy. The per-session media directory path identifies the exact
-        // session's adapter; B's adapter must survive A's release.
-        let adapter_a = processes_matching(&dir_a.to_string_lossy());
-        let adapter_b = processes_matching(&dir_b.to_string_lossy());
-        assert_eq!(adapter_a.len(), 1, "A's adapter process was not observed: {adapter_a:?}");
-        assert_eq!(adapter_b.len(), 1, "B's adapter process was not observed: {adapter_b:?}");
-        let adapter_a_pid = adapter_a[0];
+        // One adapter serves the shared session. Its directory path and pid are
+        // the identity of the exact session both controls hold.
+        let adapters = processes_matching(&dir.to_string_lossy());
+        assert_eq!(adapters.len(), 1, "exactly one adapter serves the shared session: {adapters:?}");
+        let adapter_pid = adapters[0];
 
-        // Release A's final control reference while its reader is live.
+        // Release A's final control reference while its reader is live and B
+        // still holds the same exact session. The endpoint reference count must
+        // keep the shared session out of finalization.
         drop(control_a);
         let terminal = media_terminal(&mut video_a).await;
         assert!(
@@ -579,23 +575,30 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
             "A did not reach an explicit media terminal: {terminal}"
         );
         assert!(
-            wait_absent(&dir_a, Duration::from_secs(20)).await,
-            "A's adapter/socket directory was not removed after final release"
+            !wait_absent(&dir, Duration::from_secs(5)).await,
+            "A's release finalized the session B still holds"
         );
-        assert!(!dir_a.join("encoded.sock").exists(), "A encoded socket survived finalization");
-        assert!(!dir_a.join("encoder-control.sock").exists(), "A encoder-control socket survived finalization");
-
-        // A's adapter was reaped, and releasing A did not reap B's adapter.
-        assert!(wait_pid_gone(adapter_a_pid, Duration::from_secs(20)).await, "A's adapter process survived finalization");
-        assert!(processes_matching(&dir_b.to_string_lossy()).contains(&adapter_b[0]), "A's release reaped B's adapter");
+        assert!(dir.join("encoded.sock").exists(), "A's release removed the shared encoded socket");
+        assert!(dir.join("encoder-control.sock").exists(), "A's release removed the shared encoder-control socket");
+        assert!(processes_matching(&dir.to_string_lossy()).contains(&adapter_pid), "A's release reaped B's adapter");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         loop {
-            let header = media_frame(&mut video_b, &session_b).await;
+            let header = media_frame(&mut video_b, &session_a).await;
             if header["type"] == "access_unit" { break; }
             assert!(tokio::time::Instant::now() < deadline, "B stopped decoding after A finalized: {header}");
         }
-        assert!(dir_b.exists(), "A's release must not remove B's session directory");
+        assert!(dir.exists(), "A's release must not remove B's session directory");
+
+        // Only the last reference releases the session: adapter reaped,
+        // directory and sockets removed.
+        drop(control_b);
+        assert!(
+            wait_absent(&dir, Duration::from_secs(20)).await,
+            "the shared session was not finalized after the last release"
+        );
+        assert!(!dir.join("encoded.sock").exists(), "encoded socket survived finalization");
+        assert!(wait_pid_gone(adapter_pid, Duration::from_secs(20)).await, "the adapter survived the last release");
 
         let _ = unsafe { libc::kill(endpoint.id().unwrap() as i32, libc::SIGTERM) };
         let _ = endpoint.wait().await;
@@ -603,9 +606,8 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
         let _ = host.wait().await;
         drop(video_a);
         drop(video_b);
-        drop(control_b);
         let _ = std::fs::remove_dir_all(&root);
-    }).await.expect("BB-EX-MEDIA-35 case timed out");
+    }).await.expect("shared session release case timed out");
 }
 
 /// The one access token this test configures on the Host and the endpoint.
