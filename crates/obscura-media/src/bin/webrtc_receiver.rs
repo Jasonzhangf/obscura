@@ -14,7 +14,7 @@ use rtc::{media::io::sample_builder::SampleBuilder, rtp::codec::h264::H264Packet
     rtp_transceiver::rtp_sender::RtpCodecKind};
 use tokio::{net::TcpStream, process::Command as ProcessCommand,
     sync::{mpsc, Notify}, time::timeout};
-use tokio_rustls::{TlsConnector, rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName}}};
+use tokio_rustls::{TlsConnector, rustls::{self, pki_types::{CertificateDer, ServerName}}};
 use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}, WebSocketStream};
 use webrtc_rs::{data_channel::{DataChannel, DataChannelEvent}, media_stream::track_remote::{TrackRemote, TrackRemoteEvent},
     peer_connection::{PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfiguration,
@@ -35,8 +35,8 @@ const INPUT_FIXTURE: &str = "data:text/html,<style>body{margin:0}button{position
 struct Args {
     #[arg(long)] address: SocketAddr,
     #[arg(long)] ca: PathBuf,
-    #[arg(long)] client_cert: PathBuf,
-    #[arg(long)] client_key: PathBuf,
+    /// The one access token the Host and endpoint share.
+    #[arg(long)] token: String,
     #[arg(long, default_value = "localhost")] server_name: String,
     #[arg(long, default_value = "127.0.0.1")] bind_ip: IpAddr,
     #[arg(long, default_value_t = 3)] frames: usize,
@@ -52,7 +52,7 @@ struct Args {
     #[arg(long, default_value = "off")] terminal_trigger: String,
     /// Transport that carries a self-triggered `detach`/`rebind` fence.
     /// `data-channel` is the declared browser-operation path; `wss` keeps the
-    /// separate mTLS control-socket coverage.
+    /// separate WSS control-socket coverage.
     #[arg(long, default_value = "data-channel")] terminal_transport: String,
     /// Written once the first frame is decoded, so an external producer can
     /// close the source at a known active point.
@@ -194,9 +194,13 @@ async fn main() -> Result<()> {
         if !browser_path_done && evidence.len() >= 1 && evidence.last().is_some_and(|frame|
             frame.descriptor.source.width == 160 && frame.descriptor.source.height == 120) {
             let initial_epoch = status.control.epoch;
-            let forbidden = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 100, command: Command::Evaluate { expression: "window.location.href".into() }, operation: None }).await?;
-            expect_error(forbidden, "REMOTE_COMMAND_FORBIDDEN")?;
+            // Remote evaluation is no longer fenced by a remote-command list.
+            // A mutation still needs an operation identity, and this attachment
+            // is an observer, so the surviving refusal is the agent-only gate.
+            let evaluate = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 100, command: Command::Evaluate { expression: "window.location.href".into() },
+                    operation: Some(operation_for(&status)?) }).await?;
+            expect_error(evaluate, "AGENT_REQUIRED")?;
             let forbidden_input = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
                 Request { id: 118, command: Command::Input {
                     envelope: InputEnvelope {
@@ -433,7 +437,7 @@ impl Terminal {
 /// frame must belong to the admitted session, so a replacement binding cannot
 /// leak into the old stream. A self-triggered fence is issued over the
 /// authenticated DataChannel by default; `--terminal-transport wss` keeps the
-/// separate mTLS control-socket coverage. On the DataChannel path the caller
+/// separate WSS control-socket coverage. On the DataChannel path the caller
 /// must observe the correlated BrowserResponse at the trigger request id
 /// before the terminal is reported.
 async fn run_terminal_mode(
@@ -854,7 +858,7 @@ async fn fence(
     }
 }
 
-/// Read the correlated Host result for a fence request sent on the mTLS control
+/// Read the correlated Host result for a fence request sent on the WSS control
 /// socket. The control socket is independent of the WebRTC peer, so a
 /// detach/rebind receipt is delivered even when the fence tears the old media
 /// stream down.
@@ -914,13 +918,12 @@ fn next_matching_timestamp(
 async fn connect_control(args: &Args) -> Result<(Socket, Response)> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(std::fs::read(&args.ca)?))?;
-    let config = rustls::ClientConfig::builder().with_root_certificates(roots)
-        .with_client_auth_cert(vec![CertificateDer::from(std::fs::read(&args.client_cert)?)],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(std::fs::read(&args.client_key)?)))?;
+    let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
     let name = ServerName::try_from(args.server_name.clone()).context("invalid TLS server name")?;
     let tls = connector.connect(name, TcpStream::connect(args.address).await?).await?;
-    let request = format!("wss://{}/control", args.address).into_client_request()?;
+    let mut request = format!("wss://{}/control", args.address).into_client_request()?;
+    request.headers_mut().insert("authorization", format!("Bearer {}", args.token).parse()?);
     let (mut socket, _) = client_async(request, tls).await?;
     let ready = next_response(&mut socket).await?;
     Ok((socket, ready))
@@ -939,7 +942,7 @@ async fn next_response(socket: &mut Socket) -> Result<Response> {
     }
 }
 
-/// Read the correlated Host result for a fence request sent on the mTLS control
+/// Read the correlated Host result for a fence request sent on the WSS control
 /// socket. The control socket is independent of the WebRTC peer, so a
 /// detach/rebind receipt is delivered even when the fence tears the old media
 /// stream down.

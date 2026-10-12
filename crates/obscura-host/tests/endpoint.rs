@@ -1,13 +1,12 @@
 #![cfg(unix)]
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use futures_util::{SinkExt, StreamExt};
-use sha2::{Digest, Sha256};
-use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName}};
+use tokio_rustls::rustls::{self, pki_types::{CertificateDer, ServerName}};
 use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 #[tokio::test]
-async fn mutual_tls_endpoint_preserves_host_and_fences_remote_agent_access() {
+async fn token_endpoint_preserves_host_and_serves_remote_operations() {
     tokio::time::timeout(Duration::from_secs(90), exercise()).await.unwrap();
 }
 
@@ -26,57 +25,15 @@ async fn exercise() {
     let ca = ca.self_signed(&ca_key).unwrap();
     let host_key = rcgen::KeyPair::generate().unwrap();
     let host_cert = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.to_string()]).unwrap().signed_by(&host_key, &ca, &ca_key).unwrap();
-    let client_key = rcgen::KeyPair::generate().unwrap();
-    let mut client_params = rcgen::CertificateParams::new(vec![]).unwrap();
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client_cert = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
     std::fs::write(root.join("server.der"), host_cert.der()).unwrap();
     std::fs::write(root.join("key.der"), host_key.serialize_der()).unwrap();
     std::fs::set_permissions(root.join("key.der"), std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(root.join("ca.der"), ca.der()).unwrap();
-    let client_fingerprint = hex(&Sha256::digest(client_cert.der()));
-    let authorized = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "registry_sha256": "00".repeat(32),
-        "clients": [{
-            "device_id": "test-device",
-            "client_certificate_sha256": client_fingerprint,
-            "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
-            "initial_profile_grant": {
-                "selection": "default_profile",
-                "authorization_revision": 1
-            }
-        }]
-    });
-    std::fs::write(root.join("authorized-clients.json"), serde_json::to_vec(&authorized).unwrap()).unwrap();
-    let registry = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "host_id": "host-test",
-        "devices": [{
-            "device_id": "test-device",
-            "device_label": "test client",
-            "client_certificate_sha256": hex(&Sha256::digest(client_cert.der())),
-            "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
-            "initial_profile_grant": {
-                "selection": "default_profile",
-                "authorization_revision": 1
-            },
-            "scope_revision": 1,
-            "status": "active",
-            "not_before_unix": 0,
-            "not_after_unix": 4102444800i64,
-            "created_at_unix": 0,
-            "revoked_at_unix": null
-        }]
-    });
-    std::fs::write(root.join("registry.json"), serde_json::to_vec(&registry).unwrap()).unwrap();
-    write_catalog(&root, &["local".to_string(), "test-device".to_string()]);
+    write_catalog(&root);
     let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
-        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .arg("--access-token").arg(ACCESS_TOKEN)
 .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
     wait_socket(root.join("host/host.sock")).await;
     let local = tokio::net::UnixStream::connect(root.join("host/host.sock")).await.unwrap();
@@ -94,37 +51,48 @@ async fn exercise() {
         .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("key.der"))
-        .arg("--client-ca").arg(root.join("ca.der")).arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--media-bin").arg(media)
         .stdout(Stdio::null()).stderr(std::fs::File::create(root.join("endpoint.err")).unwrap()).kill_on_drop(true).spawn().unwrap();
     // Exact-session encoded sockets are bound lazily on first session admission,
     // so endpoint readiness is the socket directory created after TCP bind.
     wait_socket(root.join("endpoint")).await;
     let mut roots = rustls::RootCertStore::empty(); roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
+    // The wrong token is the only refusal on the connection path: the endpoint
+    // answers with the typed REMOTE_TOKEN_INVALID frame and never a Ready.
     let anonymous = rustls::ClientConfig::builder().with_root_certificates(roots.clone()).with_no_client_auth();
     let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(anonymous)).connect(ServerName::try_from("localhost").unwrap(), tcp).await;
-    if let Ok(tls) = tls { assert!(client_async(format!("wss://localhost:{}/control", address.port()), tls).await.is_err()); }
+    let tls = tokio_rustls::TlsConnector::from(Arc::new(anonymous)).connect(ServerName::try_from("localhost").unwrap(), tcp).await.unwrap();
+    let mut wrong = format!("wss://localhost:{}/control", address.port()).into_client_request().unwrap();
+    wrong.headers_mut().insert("authorization", "Bearer wrong-token".parse().unwrap());
+    let (mut refused, _) = client_async(wrong, tls).await.unwrap();
+    let refusal: serde_json::Value = serde_json::from_str(refused.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+    assert_eq!(refusal["type"], "error", "a wrong token must be refused: {refusal}");
+    assert_eq!(refusal["code"], "REMOTE_TOKEN_INVALID");
+    let follow_up = refused.next().await;
+    // The endpoint closes the refused connection; a Ready must never follow.
+    assert!(!matches!(&follow_up, Some(Ok(Message::Text(text))) if text.contains("ready")), "a wrong token must not receive Ready: {follow_up:?}");
+    drop(refused);
     let client = rustls::ClientConfig::builder().with_root_certificates(roots)
-        .with_client_auth_cert(vec![client_cert.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der()))).unwrap();
+        .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
     let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
-    let (mut control, response) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await.unwrap();
+    let mut control_request = format!("wss://localhost:{}/control", address.port()).into_client_request().unwrap();
+    control_request.headers_mut().insert("authorization", format!("Bearer {ACCESS_TOKEN}").parse().unwrap());
+    let (mut control, response) = client_async(control_request, tls).await.unwrap();
     let token = response.headers()["x-obscura-media-token"].to_str().unwrap().to_string();
     let ready: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(ready["version"], 11);
     if let Ok(serial) = std::env::var("OBSCURA_ENDPOINT_ADB_SERIAL") {
         assert!(!bind_ip.is_loopback(), "Device probe requires an explicit reachable bind IP");
-        // Ephemeral test-only pairing, never installed into device/system trust.
-        std::fs::write(root.join("ca.pem"), ca.pem()).unwrap();
-        std::fs::write(root.join("client.pem"), client_cert.pem()).unwrap();
-        std::fs::write(root.join("client.key"), client_key.serialize_pem()).unwrap();
-        std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Ephemeral test-only credential, never installed into device/system trust.
+        std::fs::write(root.join("token.txt"), ACCESS_TOKEN).unwrap();
         device_ready(&serial, &root, address, ready["session_id"].as_str().unwrap()).await;
     }
     control.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"agent"}}"#)).await.unwrap();
     let rejected: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-    assert_eq!(rejected["code"], "REMOTE_COMMAND_FORBIDDEN");
+    // The removed remote fence is gone: this is now the session's own rule that
+    // only one agent attachment may exist, and the local connection holds it.
+    assert_eq!(rejected["code"], "AGENT_BUSY", "unexpected agent attach response: {rejected}");
     control.send(Message::text(r#"{"id":2,"command":{"type":"attach","mode":"observe","viewport":{"device":"phone","css_width":391,"css_height":701,"orientation":"portrait"}}}"#)).await.unwrap();
     let attached: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(attached["value"]["mode"], "observe");
@@ -139,7 +107,9 @@ async fn exercise() {
     assert_eq!(state["viewport_owner"], attached["value"]["attachment_id"]);
     control.send(Message::text(r#"{"id":9,"command":{"type":"resize","width":100,"height":100}}"#)).await.unwrap();
     let resize: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-    assert_eq!(resize["code"], "REMOTE_COMMAND_FORBIDDEN");
+    // The removed remote fence is gone: the surviving rule is the session's own
+    // requirement that a browser mutation carries an operation identity.
+    assert_eq!(resize["code"], "OPERATION_REQUIRED", "unexpected resize response: {resize}");
     control.send(Message::text(r#"{"id":20,"command":{"type":"profile_catalog"}}"#)).await.unwrap();
     let catalog: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
     assert_eq!(catalog["type"], "result", "profile catalog was not forwarded: {catalog}");
@@ -153,22 +123,13 @@ async fn exercise() {
     assert_eq!(selected["code"], "OPERATION_REQUIRED");
     control.send(Message::text(r#"{"id":23,"command":{"type":"flush_profiles"}}"#)).await.unwrap();
     let flush: serde_json::Value = serde_json::from_str(control.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-    assert_eq!(flush["code"], "REMOTE_COMMAND_FORBIDDEN");
+    // The removed remote fence is gone: a remote attachment may flush profiles.
+    assert_eq!(flush["type"], "result", "remote flush_profiles must now be served: {flush}");
+    assert_eq!(flush["value"]["flushed"], true);
     let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
     let mut invalid = format!("wss://localhost:{}/media", address.port()).into_client_request().unwrap();
     invalid.headers_mut().insert("authorization", "Bearer invalid".parse().unwrap());
     assert!(client_async(invalid, tls).await.is_err());
-    let other_key = rcgen::KeyPair::generate().unwrap();
-    let mut other_params = rcgen::CertificateParams::new(vec![]).unwrap();
-    other_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let other_cert = other_params.signed_by(&other_key, &ca, &ca_key).unwrap();
-    let mut roots = rustls::RootCertStore::empty(); roots.add(ca.der().clone()).unwrap();
-    let other = rustls::ClientConfig::builder().with_root_certificates(roots)
-        .with_client_auth_cert(vec![other_cert.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(other_key.serialize_der()))).unwrap();
-    let tls = tokio_rustls::TlsConnector::from(Arc::new(other)).connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
-    let mut crossed = format!("wss://localhost:{}/media", address.port()).into_client_request().unwrap();
-    crossed.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
-    assert!(client_async(crossed, tls).await.is_err(), "media token must bind the paired certificate");
     let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
     let mut request = format!("wss://localhost:{}/media", address.port()).into_client_request().unwrap();
     request.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
@@ -253,19 +214,10 @@ fn identity(state: &serde_json::Value) -> serde_json::Value {
         "viewport_revision":state["viewport_revision"],"document_revision":state["document_revision"]})
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
 
-/// Minimal endpoint fixtures for the applied-receipt cases: a self-signed CA,
-/// one server certificate and one authorized client. The receipt cases never
-/// admit a peer, so no Host is required.
+/// Minimal endpoint fixtures for the applied-receipt cases: a self-signed CA
+/// and one server certificate. The receipt cases never admit a peer, so no Host
+/// is required.
 struct ReceiptFixtures {
     root: PathBuf,
 }
@@ -283,26 +235,9 @@ impl ReceiptFixtures {
         let server_key = rcgen::KeyPair::generate().unwrap();
         let server = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap()
             .signed_by(&server_key, &ca, &ca_key).unwrap();
-        let client_key = rcgen::KeyPair::generate().unwrap();
-        let mut client_params = rcgen::CertificateParams::new(vec![]).unwrap();
-        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
         std::fs::write(root.join("server.der"), server.der()).unwrap();
         std::fs::write(root.join("server.key"), server_key.serialize_der()).unwrap();
         std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::write(root.join("ca.der"), ca.der()).unwrap();
-        let projection = serde_json::json!({
-            "schema_version": 2,
-            "authorization_revision": 7,
-            "registry_sha256": "cc".repeat(32),
-            "clients": [{
-                "device_id": "receipt-device",
-                "client_certificate_sha256": hex(&Sha256::digest(client.der())),
-                "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
-                "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 7}
-            }]
-        });
-        std::fs::write(root.join("authorized-clients.json"), serde_json::to_vec_pretty(&projection).unwrap()).unwrap();
         Self { root }
     }
 
@@ -315,8 +250,6 @@ impl ReceiptFixtures {
             .arg("--socket-dir").arg(self.root.join("endpoint"))
             .arg("--server-cert").arg(self.root.join("server.der"))
             .arg("--server-key").arg(self.root.join("server.key"))
-            .arg("--client-ca").arg(self.root.join("ca.der"))
-            .arg("--authorized-clients").arg(self.root.join("authorized-clients.json"))
             .arg("--media-bin").arg(media)
             .arg("--applied-receipt-path").arg(receipt)
             .arg("--endpoint-generation").arg(generation.to_string())
@@ -365,9 +298,10 @@ async fn applied_receipt_is_written_after_bind_with_v1_shape_and_0600() {
         assert_eq!(receipt["schema_version"], 1);
         assert_eq!(receipt["endpoint_generation"], 3);
         assert!(receipt.get("status").is_none(), "applied receipt must not carry a status field: {receipt}");
-        assert_eq!(receipt["authorization_revision"], 7);
-        assert_eq!(receipt["registry_sha256"], "cc".repeat(32));
-        assert_eq!(receipt["projection_sha256"].as_str().unwrap().len(), 64);
+        // The receipt states only what the listener actually applied.
+        let mut fields: Vec<&str> = receipt.as_object().unwrap().keys().map(String::as_str).collect();
+        fields.sort_unstable();
+        assert_eq!(fields, ["bound_address", "endpoint_generation", "endpoint_pid", "schema_version"], "unexpected receipt fields: {receipt}");
         let bound: std::net::SocketAddr = receipt["bound_address"].as_str().unwrap().parse().unwrap();
         assert_eq!(bound, address);
         let pid = receipt["endpoint_pid"].as_u64().unwrap() as u32;
@@ -491,7 +425,9 @@ async fn connect_endpoint_control(
     address: std::net::SocketAddr,
 ) -> (tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String) {
     let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
-    let (control, response) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await.unwrap();
+    let mut request = format!("wss://localhost:{}/control", address.port()).into_client_request().unwrap();
+    request.headers_mut().insert("authorization", format!("Bearer {ACCESS_TOKEN}").parse().unwrap());
+    let (control, response) = client_async(request, tls).await.unwrap();
     let token = response.headers()["x-obscura-media-token"].to_str().unwrap().to_string();
     (control, token)
 }
@@ -514,125 +450,20 @@ async fn open_media_consumer(
     video
 }
 
-async fn write_two_session_fixtures(root: &std::path::Path, client_a: &[u8], client_b: &[u8]) {
-    let fingerprint_a = hex(&Sha256::digest(client_a));
-    let fingerprint_b = hex(&Sha256::digest(client_b));
-    let scopes = serde_json::json!(["observe_human_control", "profile_read", "profile_create", "profile_select"]);
-    let registry = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "host_id": "host-bb35",
-        "devices": [
-            {
-                "device_id": "device-a", "device_label": "session a",
-                "client_certificate_sha256": fingerprint_a, "scopes": scopes,
-                "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 1},
-                "scope_revision": 1, "status": "active",
-                "not_before_unix": 0, "not_after_unix": 4102444800i64,
-                "created_at_unix": 0, "revoked_at_unix": null
-            },
-            {
-                "device_id": "device-b", "device_label": "session b",
-                "client_certificate_sha256": fingerprint_b, "scopes": scopes,
-                "initial_profile_grant": {"selection": {"profile_id": "p1"}, "authorization_revision": 1},
-                "scope_revision": 1, "status": "active",
-                "not_before_unix": 0, "not_after_unix": 4102444800i64,
-                "created_at_unix": 0, "revoked_at_unix": null
-            }
-        ]
-    });
-    std::fs::write(root.join("registry.json"), serde_json::to_vec(&registry).unwrap()).unwrap();
-    let projection = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "registry_sha256": "dd".repeat(32),
-        "clients": [
-            {
-                "device_id": "device-a", "client_certificate_sha256": fingerprint_a, "scopes": scopes,
-                "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 1}
-            },
-            {
-                "device_id": "device-b", "client_certificate_sha256": fingerprint_b, "scopes": scopes,
-                "initial_profile_grant": {"selection": {"profile_id": "p1"}, "authorization_revision": 1}
-            }
-        ]
-    });
-    std::fs::write(root.join("authorized-clients.json"), serde_json::to_vec(&projection).unwrap()).unwrap();
-    let members = serde_json::json!(["local", "device-a", "device-b"]);
+/// BB-EX-MEDIA-35 fixtures: two profiles, so selecting the second one resolves
+/// to its own exact session and a second adapter.
+fn write_two_profile_catalog(root: &std::path::Path) {
     let catalog = serde_json::json!({
         "catalog_revision": 2,
         "profiles": [
-            {"profile_id": "default", "display_name": "Default", "default": true,
-             "access": {"owner_device_id": "local", "members": members}},
-            {"profile_id": "p1", "display_name": "Secondary", "default": false,
-             "access": {"owner_device_id": "local", "members": members}}
+            {"profile_id": "default", "display_name": "Default", "default": true},
+            {"profile_id": "p1", "display_name": "Secondary", "default": false}
         ],
         "default_profile_id": "default",
         "next_id": 2
     });
     std::fs::create_dir_all(root.join("profiles")).unwrap();
     std::fs::write(root.join("profiles/catalog.json"), serde_json::to_string_pretty(&catalog).unwrap()).unwrap();
-}
-
-/// B1 fixtures: two authorized devices that resolve to the same default
-/// profile session, so revoking one observer leaves the shared session alive
-/// for the other.
-fn write_shared_session_fixtures(root: &std::path::Path, client_a: &[u8], client_b: &[u8]) {
-    let fingerprint_a = hex(&Sha256::digest(client_a));
-    let fingerprint_b = hex(&Sha256::digest(client_b));
-    let scopes = serde_json::json!(["observe_human_control", "profile_read", "profile_create", "profile_select"]);
-    let grant = serde_json::json!({"selection": "default_profile", "authorization_revision": 1});
-    let device = |id: &str, label: &str, fingerprint: &str| serde_json::json!({
-        "device_id": id, "device_label": label,
-        "client_certificate_sha256": fingerprint, "scopes": scopes.clone(),
-        "initial_profile_grant": grant.clone(),
-        "scope_revision": 1, "status": "active",
-        "not_before_unix": 0, "not_after_unix": 4102444800i64,
-        "created_at_unix": 0, "revoked_at_unix": null
-    });
-    let registry = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "host_id": "host-b1",
-        "devices": [device("device-a", "observer a", &fingerprint_a), device("device-b", "observer b", &fingerprint_b)]
-    });
-    std::fs::write(root.join("registry.json"), serde_json::to_vec(&registry).unwrap()).unwrap();
-    let projection = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "registry_sha256": "ee".repeat(32),
-        "clients": [
-            {"device_id": "device-a", "client_certificate_sha256": fingerprint_a, "scopes": scopes.clone(), "initial_profile_grant": grant.clone()},
-            {"device_id": "device-b", "client_certificate_sha256": fingerprint_b, "scopes": scopes, "initial_profile_grant": grant}
-        ]
-    });
-    std::fs::write(root.join("authorized-clients.json"), serde_json::to_vec(&projection).unwrap()).unwrap();
-    let members = serde_json::json!(["local", "device-a", "device-b"]);
-    let catalog = serde_json::json!({
-        "catalog_revision": 1,
-        "profiles": [
-            {"profile_id": "default", "display_name": "Default", "default": true,
-             "access": {"owner_device_id": "local", "members": members}}
-        ],
-        "default_profile_id": "default",
-        "next_id": 1
-    });
-    std::fs::create_dir_all(root.join("profiles")).unwrap();
-    std::fs::write(root.join("profiles/catalog.json"), serde_json::to_string_pretty(&catalog).unwrap()).unwrap();
-}
-
-/// Rewrite the committed registry to revoke `device-a` while leaving
-/// `device-b` active. The Host re-reads this file for every remote command.
-fn revoke_device_a(root: &std::path::Path) {
-    let path = root.join("registry.json");
-    let mut registry: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    for device in registry["devices"].as_array_mut().unwrap() {
-        if device["device_id"] == "device-a" {
-            device["status"] = serde_json::json!("revoked");
-            device["revoked_at_unix"] = serde_json::json!(4102444800i64);
-        }
-    }
-    std::fs::write(&path, serde_json::to_vec(&registry).unwrap()).unwrap();
 }
 
 #[tokio::test]
@@ -649,22 +480,16 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
         let server_key = rcgen::KeyPair::generate().unwrap();
         let server = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap()
             .signed_by(&server_key, &ca, &ca_key).unwrap();
-        let client_a_key = rcgen::KeyPair::generate().unwrap();
-        let client_b_key = rcgen::KeyPair::generate().unwrap();
-        let mut client_params = rcgen::CertificateParams::new(vec![]).unwrap();
-        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let client_a = client_params.clone().signed_by(&client_a_key, &ca, &ca_key).unwrap();
-        let client_b = client_params.clone().signed_by(&client_b_key, &ca, &ca_key).unwrap();
         std::fs::write(root.join("server.der"), server.der()).unwrap();
         std::fs::write(root.join("server.key"), server_key.serialize_der()).unwrap();
         std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::write(root.join("ca.der"), ca.der()).unwrap();
-        write_two_session_fixtures(&root, &client_a.der().to_vec(), &client_b.der().to_vec()).await;
+        write_two_profile_catalog(&root);
 
         let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
             .arg("--socket-dir").arg(root.join("host"))
             .arg("--profile-root").arg(root.join("profiles"))
-            .arg("--authorization-registry").arg(root.join("registry.json"))
+            .arg("--access-token").arg(ACCESS_TOKEN)
             .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
         wait_socket(root.join("host/host.sock")).await;
         let mut local = BufReader::new(tokio::net::UnixStream::connect(root.join("host/host.sock")).await.unwrap());
@@ -690,18 +515,15 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
             .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
             .arg("--socket-dir").arg(root.join("endpoint"))
             .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
-            .arg("--client-ca").arg(root.join("ca.der")).arg("--authorized-clients").arg(root.join("authorized-clients.json"))
             .arg("--media-bin").arg(&media_bin)
             .stdout(Stdio::null()).stderr(std::fs::File::create(root.join("endpoint.err")).unwrap()).kill_on_drop(true).spawn().unwrap();
         wait_socket(root.join("endpoint")).await;
 
         let mut roots = rustls::RootCertStore::empty(); roots.add(ca.der().clone()).unwrap();
-        let client_a_config = rustls::ClientConfig::builder().with_root_certificates(roots.clone())
-            .with_client_auth_cert(vec![client_a.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_a_key.serialize_der()))).unwrap();
-        let client_b_config = rustls::ClientConfig::builder().with_root_certificates(roots)
-            .with_client_auth_cert(vec![client_b.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_b_key.serialize_der()))).unwrap();
-        let connector_a = tokio_rustls::TlsConnector::from(Arc::new(client_a_config));
-        let connector_b = tokio_rustls::TlsConnector::from(Arc::new(client_b_config));
+        let client_config = rustls::ClientConfig::builder().with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector_a = tokio_rustls::TlsConnector::from(Arc::new(client_config.clone()));
+        let connector_b = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 
         let (mut control_a, token_a) = connect_endpoint_control(&connector_a, address).await;
         let ready_a = endpoint_ready(&mut control_a).await;
@@ -786,145 +608,17 @@ async fn exact_session_final_release_runs_finalizer_before_reader_join() {
     }).await.expect("BB-EX-MEDIA-35 case timed out");
 }
 
-/// B1: a correlated `REMOTE_PRINCIPAL_REVOKED` denial is terminal for the
-/// denied attachment's media. Two observers share one exact session; revoking
-/// one principal must close that observer's `/media` stream while the other
-/// observer keeps receiving frames.
-#[tokio::test]
-async fn correlated_authorization_denial_fences_only_denied_attachment() {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-    tokio::time::timeout(Duration::from_secs(180), async {
-        let root = PathBuf::from("/tmp").join(format!("ob1-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
-        std::fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
-        let ca_key = rcgen::KeyPair::generate().unwrap();
-        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Obscura b1 CA");
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let server_key = rcgen::KeyPair::generate().unwrap();
-        let server = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap()
-            .signed_by(&server_key, &ca, &ca_key).unwrap();
-        let client_a_key = rcgen::KeyPair::generate().unwrap();
-        let client_b_key = rcgen::KeyPair::generate().unwrap();
-        let mut client_params = rcgen::CertificateParams::new(vec![]).unwrap();
-        client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-        let client_a = client_params.clone().signed_by(&client_a_key, &ca, &ca_key).unwrap();
-        let client_b = client_params.clone().signed_by(&client_b_key, &ca, &ca_key).unwrap();
-        std::fs::write(root.join("server.der"), server.der()).unwrap();
-        std::fs::write(root.join("server.key"), server_key.serialize_der()).unwrap();
-        std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::fs::write(root.join("ca.der"), ca.der()).unwrap();
-        write_shared_session_fixtures(&root, &client_a.der().to_vec(), &client_b.der().to_vec());
+/// The one access token this test configures on the Host and the endpoint.
+const ACCESS_TOKEN: &str = "endpoint-test-access-token";
 
-        let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
-            .arg("--socket-dir").arg(root.join("host"))
-            .arg("--profile-root").arg(root.join("profiles"))
-            .arg("--authorization-registry").arg(root.join("registry.json"))
-            .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
-        wait_socket(root.join("host/host.sock")).await;
-        let mut local = BufReader::new(tokio::net::UnixStream::connect(root.join("host/host.sock")).await.unwrap());
-        let mut line = String::new(); local.read_line(&mut line).await.unwrap();
-        let mut state = local_request(&mut local, serde_json::json!({"id":1,"command":{"type":"attach","mode":"agent"}})).await;
-        let session_id = state["session_id"].as_str().unwrap().to_string();
-        let html = "data:text/html,<style>body{margin:0;background:white}</style><div style='width:80px;height:80px;background:red'></div>";
-        state = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state),"command":{"type":"resize","width":160,"height":120}})).await;
-        let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state),"command":{"type":"navigate","url":html}})).await;
-        drop(local);
-
-        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = reservation.local_addr().unwrap();
-        drop(reservation);
-        let media_bin = PathBuf::from(env!("CARGO_BIN_EXE_obscura-host")).with_file_name("obscura-media");
-        assert!(media_bin.is_file(), "Build obscura-media before endpoint acceptance");
-        let mut endpoint = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"))
-            .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
-            .arg("--socket-dir").arg(root.join("endpoint"))
-            .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
-            .arg("--client-ca").arg(root.join("ca.der")).arg("--authorized-clients").arg(root.join("authorized-clients.json"))
-            .arg("--media-bin").arg(&media_bin)
-            .stdout(Stdio::null()).stderr(std::fs::File::create(root.join("endpoint.err")).unwrap()).kill_on_drop(true).spawn().unwrap();
-        wait_socket(root.join("endpoint")).await;
-
-        let mut roots = rustls::RootCertStore::empty(); roots.add(ca.der().clone()).unwrap();
-        let client_a_config = rustls::ClientConfig::builder().with_root_certificates(roots.clone())
-            .with_client_auth_cert(vec![client_a.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_a_key.serialize_der()))).unwrap();
-        let client_b_config = rustls::ClientConfig::builder().with_root_certificates(roots)
-            .with_client_auth_cert(vec![client_b.der().clone()], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_b_key.serialize_der()))).unwrap();
-        let connector_a = tokio_rustls::TlsConnector::from(Arc::new(client_a_config));
-        let connector_b = tokio_rustls::TlsConnector::from(Arc::new(client_b_config));
-
-        let (mut control_a, token_a) = connect_endpoint_control(&connector_a, address).await;
-        let ready_a = endpoint_ready(&mut control_a).await;
-        assert_eq!(ready_a["session_id"].as_str(), Some(session_id.as_str()));
-        let (mut control_b, token_b) = connect_endpoint_control(&connector_b, address).await;
-        let ready_b = endpoint_ready(&mut control_b).await;
-        assert_eq!(ready_b["session_id"].as_str(), Some(session_id.as_str()));
-
-        control_a.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await.unwrap();
-        let attached_a: serde_json::Value = serde_json::from_str(control_a.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        assert_eq!(attached_a["value"]["mode"], "observe");
-        control_b.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await.unwrap();
-        let attached_b: serde_json::Value = serde_json::from_str(control_b.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        assert_eq!(attached_b["value"]["mode"], "observe");
-
-        let mut video_a = open_media_consumer(&connector_a, address, &token_a).await;
-        let mut video_b = open_media_consumer(&connector_b, address, &token_b).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let header = media_frame(&mut video_a, &session_id).await;
-            if header["type"] == "access_unit" { break; }
-            assert!(tokio::time::Instant::now() < deadline, "A never produced an access unit: {header}");
-        }
-        loop {
-            let header = media_frame(&mut video_b, &session_id).await;
-            if header["type"] == "access_unit" { break; }
-            assert!(tokio::time::Instant::now() < deadline, "B never produced an access unit: {header}");
-        }
-
-        // Revoke device-a in the committed registry. The Host re-reads this
-        // file for every remote command, so A's next request is denied.
-        revoke_device_a(&root);
-        control_a.send(Message::text(r#"{"id":9,"command":{"type":"status"}}"#)).await.unwrap();
-        let denial: serde_json::Value = serde_json::from_str(control_a.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-        assert_eq!(denial["type"], "error", "A did not receive a correlated denial: {denial}");
-        assert_eq!(denial["id"], 9);
-        assert_eq!(denial["code"], "REMOTE_PRINCIPAL_REVOKED", "unexpected denial: {denial}");
-
-        // A's existing media grant must be fenced. The stream ends explicitly.
-        let terminal = media_terminal(&mut video_a).await;
-        assert!(matches!(terminal["type"].as_str(), Some("closed") | Some("unavailable") | Some("transport_end")),
-            "A's media survived a terminal authorization denial: {terminal}");
-
-        // B is untouched and keeps receiving frames for the shared session.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        loop {
-            let header = media_frame(&mut video_b, &session_id).await;
-            if header["type"] == "access_unit" { break; }
-            assert!(tokio::time::Instant::now() < deadline, "B stopped after A was revoked: {header}");
-        }
-
-        let _ = unsafe { libc::kill(endpoint.id().unwrap() as i32, libc::SIGTERM) };
-        let _ = endpoint.wait().await;
-        let _ = unsafe { libc::kill(host.id().unwrap() as i32, libc::SIGTERM) };
-        let _ = host.wait().await;
-        drop(video_a); drop(video_b); drop(control_b);
-        let _ = std::fs::remove_dir_all(&root);
-    }).await.expect("B1 two-observer case timed out");
-}
-
-fn write_catalog(root: &std::path::Path, members: &[String]) {
-    let members: Vec<serde_json::Value> = members.iter().cloned().map(serde_json::Value::String).collect();
-    let access = serde_json::json!({
-        "owner_device_id": "local",
-        "members": members
-    });
+/// A minimal persistent catalog. It carries no membership and no access record.
+fn write_catalog(root: &std::path::Path) {
     let catalog = serde_json::json!({
         "catalog_revision": 1,
         "profiles": [{
             "profile_id": "default",
             "display_name": "Default",
-            "default": true,
-            "access": access
+            "default": true
         }],
         "default_profile_id": "default",
         "next_id": 1
@@ -959,17 +653,16 @@ async fn device_ready(serial: &str, root: &std::path::Path, address: std::net::S
     let remote = format!("/data/local/tmp/{}", root.file_name().unwrap().to_str().unwrap());
     assert!(adb(serial, &["shell", "mkdir", "-m", "700", &remote]).await.unwrap().status.success());
     let result: anyhow::Result<_> = async {
-        for name in ["ca.pem", "client.pem", "client.key"] {
-            anyhow::ensure!(adb(serial, &["push", root.join(name).to_str().unwrap(), &format!("{remote}/{name}")]).await?.status.success(), "Device fixture upload failed");
-        }
-        anyhow::ensure!(adb(serial, &["shell", "chmod", "600", &format!("{remote}/client.key")]).await?.status.success(), "Device private key permissions failed");
-        let command = format!("curl -i -sS --http1.1 --max-time 2 --cacert {remote}/ca.pem --cert {remote}/client.pem --key {remote}/client.key -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' https://{address}/control");
+        let token = root.join("token.txt");
+        anyhow::ensure!(adb(serial, &["push", token.to_str().unwrap(), &format!("{remote}/token.txt")]).await?.status.success(), "Device fixture upload failed");
+        anyhow::ensure!(adb(serial, &["shell", "chmod", "600", &format!("{remote}/token.txt")]).await?.status.success(), "Device token permissions failed");
+        let command = format!("curl -i -sS -k --http1.1 --max-time 2 -H 'Authorization: Bearer {ACCESS_TOKEN}' -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' https://{address}/control");
         adb(serial, &["shell", &command]).await
     }.await;
-    // Remove only the three test credentials, including on upload/curl errors.
-    let removed = adb(serial, &["shell", "rm", "-f", &format!("{remote}/ca.pem"), &format!("{remote}/client.pem"), &format!("{remote}/client.key")]).await;
+    // Remove only the ephemeral test token, including on upload/curl errors.
+    let removed = adb(serial, &["shell", "rm", "-f", &format!("{remote}/token.txt")]).await;
     let directory = adb(serial, &["shell", "rmdir", &remote]).await;
-    assert!(removed.unwrap().status.success() && directory.unwrap().status.success(), "Temporary device credential cleanup failed");
+    assert!(removed.unwrap().status.success() && directory.unwrap().status.success(), "Temporary device token cleanup failed");
     let result = result.unwrap();
     let response = String::from_utf8_lossy(&result.stdout);
     assert!(response.contains("101 Switching Protocols") && response.contains(session), "Device TLS/WSS ready failed: {:?}; {}", result.status, String::from_utf8_lossy(&result.stderr));

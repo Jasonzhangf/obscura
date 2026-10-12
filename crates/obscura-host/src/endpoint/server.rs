@@ -5,7 +5,27 @@ use tokio::{net::{TcpListener, UnixListener}, process::Child, sync::{watch, ones
 use tokio_rustls::{TlsAcceptor, rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}}};
 use tokio_tungstenite::{accept_hdr_async_with_config, tungstenite::{handshake::server::{Request, Response, ErrorResponse}, protocol::WebSocketConfig}};
 use super::{Args, channels, encoder_control};
-use crate::remote_authorization::{self, EndpointStatusReceipt};
+
+/// Typed endpoint-applied receipt. It records only the transport facts the
+/// service needs to confirm a real bind: the bound address, the generation and
+/// the pid. No authorization state is part of it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EndpointStatusReceipt {
+    schema_version: u32,
+    endpoint_generation: u64,
+    endpoint_pid: u32,
+    bound_address: String,
+}
+
+impl EndpointStatusReceipt {
+    /// The v1 applied receipt. It carries no `status` field and is written by
+    /// the endpoint only after the TCP listener and local socket directory are
+    /// ready.
+    fn applied_v1(bound_address: String, endpoint_generation: u64, endpoint_pid: u32) -> Self {
+        Self { schema_version: 1, endpoint_generation, endpoint_pid, bound_address }
+    }
+}
 
 /// Bounded window the session finalizer waits for an acquired encoder permit to
 /// settle through the control stream before it treats adapter exit as the
@@ -115,7 +135,6 @@ impl std::error::Error for SessionTerminal {}
 /// confirms an exact `(session_id, generation)` binding, so the `/media`
 /// subscriber can only ever read that exact session's encoded stream.
 struct Grant {
-    peer: Vec<u8>,
     active: watch::Sender<channels::MediaState>,
     media_used: bool,
     media: Option<watch::Receiver<Option<Arc<EncodedFrame>>>>,
@@ -157,7 +176,14 @@ impl Drop for SessionAcquisition {
     }
 }
 fn reject() -> ErrorResponse {
-    tokio_tungstenite::tungstenite::http::Response::builder().status(403).body(Some("Endpoint authorization rejected".into())).unwrap()
+    tokio_tungstenite::tungstenite::http::Response::builder().status(403).body(Some("Endpoint request rejected".into())).unwrap()
+}
+
+/// The client's `Authorization: Bearer <token>` value, if present. The endpoint
+/// never rewrites it: the same value reaches the Host admission frame.
+fn bearer(request: &Request) -> Option<String> {
+    request.headers().get("authorization").and_then(|header| header.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer ")).map(str::to_owned)
 }
 
 /// Owns exactly one adapter direct child. The child is never moved into the
@@ -687,12 +713,12 @@ impl EndpointOwner {
 
 pub async fn serve(args: Args) -> Result<()> {
     if args.enable_webrtc { ensure!(args.webrtc_bind_ip.is_some(), "--enable-webrtc requires explicit --webrtc-bind-ip"); }
-    let projection = remote_authorization::LoadedProjection::load(&args.authorized_clients)?;
     let key_permissions = std::fs::metadata(&args.server_key)?.permissions().mode();
     ensure!(key_permissions & 0o077 == 0, "Endpoint private key must not be group/world accessible");
-    let mut roots = rustls::RootCertStore::empty(); roots.add(CertificateDer::from(std::fs::read(&args.client_ca)?))?;
-    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
-    let tls = rustls::ServerConfig::builder().with_client_cert_verifier(verifier)
+    // The listener keeps its own TLS identity. No client certificate and no CA
+    // is verified: the client's bearer token is the only credential, and the
+    // Host owns the comparison.
+    let tls = rustls::ServerConfig::builder().with_no_client_auth()
         .with_single_cert(vec![CertificateDer::from(std::fs::read(&args.server_cert)?)],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(std::fs::read(&args.server_key)?)))?;
     let acceptor = TlsAcceptor::from(Arc::new(tls));
@@ -702,8 +728,7 @@ pub async fn serve(args: Args) -> Result<()> {
     let directory = Directory(args.socket_dir.clone());
     // Applied receipt is written only after the TCP listener and the local
     // socket directory exist.
-    write_applied_receipt(&args, &projection, bound)?;
-    let projection = Arc::new(projection);
+    write_applied_receipt(&args, bound)?;
     let registry: Arc<AsyncMutex<SessionMediaRegistry>> = Arc::new(AsyncMutex::new(SessionMediaRegistry::default()));
     let grants: Grants = Arc::new(Mutex::new(HashMap::new()));
     let permits = Arc::new(Semaphore::new(32));
@@ -727,7 +752,6 @@ pub async fn serve(args: Args) -> Result<()> {
                 let media_bin = args.media_bin.clone();
                 let ffmpeg = args.ffmpeg.clone();
                 let registry = Arc::clone(&registry);
-                let projection = Arc::clone(&projection);
                 clients.spawn(async move {
                     let _permit = permit;
                     let binding_guard = SessionBindingGuard::new(
@@ -737,31 +761,28 @@ pub async fn serve(args: Args) -> Result<()> {
                     let bound = Arc::clone(&binding_guard.bound);
                     let timed = tokio::time::timeout(Duration::from_secs(3600), async move {
                         let tls = tokio::time::timeout(Duration::from_secs(5), acceptor.accept(socket)).await??;
-                        let peer_cert = tls.get_ref().1.peer_certificates().context("Paired client certificate required")?[0].as_ref();
-                        let peer = peer_cert.to_vec();
-                        let peer_sha256 = remote_authorization::sha256(peer_cert);
-                        let (principal, initial) = projection.principal_for_cert(&peer_sha256)
-                            .context("ENDPOINT_CLIENT_NOT_AUTHORIZED: peer certificate is not in the authorized-client projection")?;
                         let token = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
                         let mut media_active = None;
                         let mut is_control = false;
+                        let mut control_token: Option<String> = None;
                         let grants_for_handshake = grants.clone();
                         let mut config = WebSocketConfig::default();
                         config.max_message_size = Some(64 * 1024); config.max_frame_size = Some(64 * 1024);
                         config.max_write_buffer_size = 5 * 1024 * 1024;
-                        let remote = tokio::time::timeout(Duration::from_secs(5), accept_hdr_async_with_config(tls, |request: &Request, mut response: Response| {
+                        let mut remote = tokio::time::timeout(Duration::from_secs(5), accept_hdr_async_with_config(tls, |request: &Request, mut response: Response| {
                             if request.uri().query().is_some() || request.headers().contains_key("origin") { return Err(reject()); }
                             match request.uri().path() {
                                 "/control" => {
                                     is_control = true;
+                                    control_token = bearer(request);
                                     response.headers_mut().insert("x-obscura-media-token", token.parse().unwrap());
                                 }
                                 "/media" => {
-                                    let supplied = request.headers().get("authorization").and_then(|h| h.to_str().ok()).and_then(|h| h.strip_prefix("Bearer ")).ok_or_else(reject)?;
+                                    let supplied = bearer(request).ok_or_else(reject)?;
                                     let mut entries = grants_for_handshake.lock().expect("grant owner");
-                                    let grant = entries.get_mut(supplied).ok_or_else(reject)?;
-                                    if grant.peer != peer || !grant.active.borrow().attached || grant.media_used {
-                                        eprintln!("media reject: peer={} attached={} used={}", grant.peer == peer, grant.active.borrow().attached, grant.media_used);
+                                    let grant = entries.get_mut(&supplied).ok_or_else(reject)?;
+                                    if !grant.active.borrow().attached || grant.media_used {
+                                        eprintln!("media reject: attached={} used={}", grant.active.borrow().attached, grant.media_used);
                                         return Err(reject());
                                     }
                                     let media = grant.media.clone().ok_or_else(|| { eprintln!("media reject: no session binding"); reject() })?;
@@ -772,9 +793,11 @@ pub async fn serve(args: Args) -> Result<()> {
                             Ok(response)
                         }, Some(config))).await??;
                         if is_control {
+                            // The Host owns the one token comparison: the client's
+                            // bearer value is forwarded verbatim in the admission
+                            // frame and a denial is mapped back to this socket.
                             let (active, _) = watch::channel(channels::MediaState::default());
                             grants.lock().expect("grant owner").insert(token.clone(), Grant {
-                                peer,
                                 active: active.clone(),
                                 media_used: false,
                                 media: None,
@@ -785,7 +808,7 @@ pub async fn serve(args: Args) -> Result<()> {
                                 media_bin: media_bin.clone(), ffmpeg: ffmpeg.clone(),
                                 bound,
                             };
-                            channels::control(remote, &host_dir, active, grant, principal, initial, enable_webrtc, webrtc_bind).await
+                            channels::control(remote, &host_dir, active, grant, control_token.unwrap_or_default(), enable_webrtc, webrtc_bind).await
                         } else {
                             let (active, media) = media_active.context("Missing media grant")?;
                             channels::media(remote, media, active).await
@@ -1000,11 +1023,11 @@ async fn release_exact_session(registry: &Arc<AsyncMutex<SessionMediaRegistry>>,
     }
 }
 
-fn write_applied_receipt(args: &Args, projection: &remote_authorization::LoadedProjection, bound: SocketAddr) -> Result<()> {
+fn write_applied_receipt(args: &Args, bound: SocketAddr) -> Result<()> {
     let Some(path) = &args.applied_receipt_path else { return Ok(()); };
     let Some(parent) = path.parent() else { return Ok(()); };
     std::fs::create_dir_all(parent)?;
-    let receipt = EndpointStatusReceipt::applied_v1(projection, bound.to_string(), args.endpoint_generation, std::process::id());
+    let receipt = EndpointStatusReceipt::applied_v1(bound.to_string(), args.endpoint_generation, std::process::id());
     let bytes = serde_json::to_vec(&receipt)?;
     let tmp = path.with_extension("json.tmp");
     {

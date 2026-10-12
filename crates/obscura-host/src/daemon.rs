@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -9,9 +9,8 @@ use crate::worker::{self, Completion, Work, WorkKind};
 use crate::catalog::{self, ProfileCatalogStore};
 use crate::remote_admission::{
     self, AdmissionRead, RemoteAdmissionErrorCode, RemoteAdmissionRequest, RemoteAdmissionResult,
-    RemoteConnectionIo, RemotePrincipalContext, RemoteScope,
+    RemoteConnectionIo,
 };
-use crate::remote_authorization::{self, AuthFailure};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -21,17 +20,16 @@ use tokio::time::{timeout, Duration};
 const MAX_FRAME: usize = 64 * 1024;
 enum Event {
     Request { connection: u64, request: Request, reply: oneshot::Sender<Response> },
-    /// One typed remote admission request. The main loop owns registry
-    /// verification, catalog membership and the route reservation; the
-    /// accepted stream task only carries bytes.
+    /// One typed remote admission request. The main loop owns the token
+    /// comparison and the route reservation; the accepted stream task only
+    /// carries bytes.
     RemoteAdmission { connection: u64, request: RemoteAdmissionRequest, reply: oneshot::Sender<RemoteAdmissionResult> },
     Gone(u64),
     MediaGone(String),
     /// Detach one connection without retiring its identity, for a profile
     /// rebind. Rejected when the caller still owns an open input lease.
     Release { connection: u64, reply: oneshot::Sender<Result<(), &'static str>> },
-    /// One typed local-admin request. The main loop owns the catalog store, the
-    /// registry validation and the per-connection replay map.
+    /// One typed local-admin request. The main loop owns the catalog store.
     Admin { connection: u64, request: AdminRequest, reply: oneshot::Sender<AdminResponse> },
 }
 
@@ -861,68 +859,16 @@ struct Route {
     reservation_id: String,
 }
 
-/// Re-read the current committed registry and verify the presented principal.
-/// This is the per-command authorization truth; a stale or revoked revision is
-/// refused with no fallback to a cached projection.
-fn verify_current_authorization(
-    registry_path: Option<&std::path::Path>,
-    principal: &RemotePrincipalContext,
-) -> Result<(), AuthFailure> {
-    let Some(path) = registry_path else {
-        return Err(AuthFailure::new(
-            RemoteAdmissionErrorCode::RemoteAuthRequired,
-            "Host has no authorization registry configured",
-        ));
-    };
-    let registry = remote_authorization::RegistryFile::load(path).map_err(|cause| {
-        AuthFailure::new(RemoteAdmissionErrorCode::RemoteAuthRequired, format!("Authorization registry unavailable: {cause}"))
-    })?;
-    registry.authorize(principal).map(|_| ())
-}
-
-/// Per-command remote gate. Scope and registry revision are re-checked for
-/// every request; a bare endpoint allowlist never substitutes for this.
-fn remote_request_gate(
-    id: u64,
-    request: &Request,
-    principal: &RemotePrincipalContext,
-    registry_path: Option<&std::path::Path>,
-) -> Option<Response> {
-    let local_only = matches!(
-        request.command,
-        Command::FlushProfiles {}
-            | Command::CloseSession {}
-            | Command::Evaluate { .. }
-            | Command::Resize { .. }
-            | Command::ResumeAgent { .. }
-    ) || matches!(request.command, Command::Attach { mode: Mode::Agent, .. });
-    if local_only {
-        return Some(error(id, "REMOTE_COMMAND_FORBIDDEN", "Remote access permits observation and human browser operations only"));
-    }
-    if let Err(failure) = verify_current_authorization(registry_path, principal) {
-        return Some(error(id, failure.code.as_str(), failure.message));
-    }
-    let required = match &request.command {
-        Command::ProfileCatalog {} => RemoteScope::ProfileRead,
-        Command::ProfileCreate { .. } => RemoteScope::ProfileCreate,
-        Command::ProfileSelect { .. } => RemoteScope::ProfileSelect,
-        _ => RemoteScope::ObserveHumanControl,
-    };
-    if !principal.scopes.contains(&required) {
-        return Some(error(id, "REMOTE_PROFILE_SCOPE_REQUIRED", format!("Remote principal lacks {} scope", required.wire_name())));
-    }
-    None
-}
-
-/// Resolve one completely decoded admission request against the current
-/// registry and Host catalog, then reserve the route on the same accepted
-/// stream. Every denial is returned as a correlated `RemoteAdmissionResult`.
+/// Reserve one session for a completely decoded admission request on the same
+/// accepted stream. The endpoint forwards the client's bearer token verbatim;
+/// the comparison against the Host's configured token is the only check on the
+/// connection path. After it passes, the Host resolves the catalog default
+/// profile and reserves exactly one route.
 async fn resolve_remote_admission(
-    registry_path: Option<&std::path::Path>,
+    access_token: Option<&str>,
     catalog: &ProfileCatalogStore,
     sessions: &mut HashMap<String, SessionRuntime>,
     conn_route: &mut HashMap<u64, Route>,
-    conn_principal: &mut HashMap<u64, RemotePrincipalContext>,
     socket_dir: &std::path::Path,
     connection: u64,
     request: RemoteAdmissionRequest,
@@ -931,56 +877,28 @@ async fn resolve_remote_admission(
 ) -> RemoteAdmissionResult {
     let request_id = request.request_id;
     let deny = |code: RemoteAdmissionErrorCode, message: String| RemoteAdmissionResult::denial(request_id, code, message);
-    let Some(path) = registry_path else {
-        return deny(RemoteAdmissionErrorCode::RemoteAuthRequired, "Host has no authorization registry configured".into());
-    };
-    let registry = match remote_authorization::RegistryFile::load(path) {
-        Ok(registry) => registry,
-        Err(cause) => return deny(RemoteAdmissionErrorCode::RemoteAuthRequired, format!("Authorization registry unavailable: {cause}")),
-    };
-    let grant = match registry.authorize(&request.principal) {
-        Ok(grant) => grant,
-        Err(failure) => return deny(failure.code, failure.message),
-    };
-    if request.initial != grant {
-        return deny(RemoteAdmissionErrorCode::RemotePrincipalRevoked, "Initial profile grant does not match the current registry".into());
+    // The one check: the forwarded bearer token must equal the configured one.
+    match access_token {
+        Some(expected) if !expected.is_empty() && expected == request.token => {}
+        _ => return deny(RemoteAdmissionErrorCode::RemoteTokenInvalid, "Remote access token is invalid".into()),
     }
-    if request.principal.device_id != request.initial.device_id {
-        return deny(RemoteAdmissionErrorCode::RemoteAuthRequired, "Admission principal and initial grant belong to different devices".into());
-    }
-    if !request.principal.scopes.contains(&RemoteScope::ObserveHumanControl) {
-        return deny(RemoteAdmissionErrorCode::RemoteProfileScopeRequired, "Remote principal lacks observe_human_control".into());
-    }
-    let profile_id = match grant.selection {
-        remote_admission::InitialProfileSelection::DefaultProfile => match catalog.default_id() {
-            Some(id) => id,
-            None => return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, "Catalog has no default profile".into()),
-        },
-        remote_admission::InitialProfileSelection::ProfileId(id) => id,
+    // The initial profile is the catalog default. Nothing selects it any more.
+    let Some(profile_id) = catalog.default_id() else {
+        return deny(RemoteAdmissionErrorCode::RemoteSessionUnavailable, "Catalog has no profile".into());
     };
-    let Some(entry) = catalog.record(&profile_id) else {
-        return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Profile {profile_id} does not exist"));
-    };
-    let Some(access) = entry.access.as_ref() else {
-        return deny(RemoteAdmissionErrorCode::ProfileAccessMigrationRequired, format!("Profile {profile_id} has no Host-side access record"));
-    };
-    if !access.grants(&request.principal.device_id) {
-        return deny(RemoteAdmissionErrorCode::RemoteInitialProfileAccessDenied, format!("Profile {profile_id} does not grant this device"));
-    }
     let profile_dir = catalog.profile_dir(&profile_id);
     if !sessions.contains_key(&profile_id) {
         match spawn_session(profile_id.clone(), profile_dir, allow_private_network, fault_tx.clone(), socket_dir).await {
             Ok(runtime) => { sessions.insert(profile_id.clone(), runtime); }
-            Err(cause) => return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Session unavailable: {cause}")),
+            Err(cause) => return deny(RemoteAdmissionErrorCode::RemoteSessionUnavailable, format!("Session unavailable: {cause}")),
         }
     }
     let Some(runtime) = sessions.get(&profile_id) else {
-        return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Session {profile_id} unavailable"));
+        return deny(RemoteAdmissionErrorCode::RemoteSessionUnavailable, format!("Session {profile_id} unavailable"));
     };
     let session_id = runtime.session.id.clone();
     let reservation_id = uuid::Uuid::new_v4().to_string();
     conn_route.insert(connection, Route { profile_id, session_id: session_id.clone(), reservation_id: reservation_id.clone() });
-    conn_principal.insert(connection, request.principal.clone());
     RemoteAdmissionResult::Ok { request_id, reservation_id, session_id }
 }
 
@@ -988,9 +906,8 @@ async fn resolve_remote_admission(
 // Local admin authority (`host-admin.sock`)
 //
 // One UTF-8 JSON object plus LF per frame, request/response, same-uid local
-// peer only. The catalog store remains the single membership source: this
-// layer validates intent, registered devices and revision, then calls the
-// existing `ProfileCatalogStore::create`/`assign_access`/`select`.
+// peer only. The catalog store is the single source: this layer only reads the
+// catalog and calls `ProfileCatalogStore::create`/`select`.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -999,33 +916,10 @@ struct AdminRequest {
     schema_version: u32,
     id: u64,
     op: String,
-    #[serde(default)] intent: Option<String>,
-    #[serde(default)] attempt_id: Option<String>,
     #[serde(default)] expected_catalog_revision: Option<u64>,
     #[serde(default)] profile_id: Option<String>,
-    #[serde(default)] owner_device_id: Option<String>,
-    #[serde(default)] device_id: Option<String>,
-    #[serde(default)] members: Option<Vec<String>>,
     #[serde(default)] display_name: Option<String>,
     #[serde(default)] make_default: Option<bool>,
-}
-
-impl AdminRequest {
-    /// Compare the typed mutating request without the per-frame `id`, so an
-    /// exact retry may carry a new request id but any changed field is refused.
-    fn same_attempt(&self, other: &AdminRequest) -> bool {
-        self.schema_version == other.schema_version
-            && self.op == other.op
-            && self.intent == other.intent
-            && self.attempt_id == other.attempt_id
-            && self.expected_catalog_revision == other.expected_catalog_revision
-            && self.profile_id == other.profile_id
-            && self.owner_device_id == other.owner_device_id
-            && self.device_id == other.device_id
-            && self.members == other.members
-            && self.display_name == other.display_name
-            && self.make_default == other.make_default
-    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1033,18 +927,6 @@ struct AdminProfile {
     profile_id: String,
     display_name: String,
     default: bool,
-    owner_device_id: Option<String>,
-    members: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, PartialEq)]
-struct AdminMembershipReceipt {
-    receipt_type: String,
-    catalog_revision: u64,
-    profile_id: String,
-    device_id: String,
-    owner_device_id: String,
-    members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1058,14 +940,12 @@ struct AdminResponse {
     #[serde(skip_serializing_if = "Option::is_none")] default_profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] profiles: Option<Vec<AdminProfile>>,
     #[serde(skip_serializing_if = "Option::is_none")] profile: Option<AdminProfile>,
-    #[serde(skip_serializing_if = "Option::is_none")] membership_receipt: Option<AdminMembershipReceipt>,
 }
 
 fn admin_ok(id: u64) -> AdminResponse {
     AdminResponse {
         schema_version: 1, id, state: "ok".into(), code: None, message: None,
         catalog_revision: None, default_profile_id: None, profiles: None, profile: None,
-        membership_receipt: None,
     }
 }
 
@@ -1082,26 +962,6 @@ fn admin_profile(entry: &catalog::ProfileEntry) -> AdminProfile {
         profile_id: entry.profile_id.clone(),
         display_name: entry.display_name.clone(),
         default: entry.default,
-        owner_device_id: entry.access.as_ref().map(|access| access.owner_device_id.clone()),
-        members: entry.access.as_ref().map(|access| access.members.iter().cloned().collect()).unwrap_or_default(),
-    }
-}
-
-#[derive(Default)]
-struct AdminConnState {
-    replay: HashMap<String, (AdminRequest, AdminResponse)>,
-    order: std::collections::VecDeque<String>,
-}
-
-impl AdminConnState {
-    fn remember(&mut self, attempt_id: String, request: AdminRequest, response: AdminResponse) {
-        const MAX_REPLAY: usize = 64;
-        if self.replay.insert(attempt_id.clone(), (request, response)).is_none() {
-            self.order.push_back(attempt_id);
-        }
-        while self.order.len() > MAX_REPLAY {
-            if let Some(oldest) = self.order.pop_front() { self.replay.remove(&oldest); }
-        }
     }
 }
 
@@ -1109,12 +969,7 @@ fn admin_revision_conflict(catalog: &ProfileCatalogStore, expected: Option<u64>)
     expected.is_some_and(|expected| expected != catalog.catalog_revision())
 }
 
-fn handle_admin(
-    catalog: &mut ProfileCatalogStore,
-    registry_path: Option<&std::path::Path>,
-    state: &mut AdminConnState,
-    request: AdminRequest,
-) -> AdminResponse {
+fn handle_admin(catalog: &mut ProfileCatalogStore, request: AdminRequest) -> AdminResponse {
     let id = request.id;
     if request.schema_version != 1 {
         return admin_error(id, "ADMIN_FRAME_MALFORMED", "schema_version must be 1");
@@ -1135,7 +990,7 @@ fn handle_admin(
                 return admin_error(id, "ADMIN_FRAME_MALFORMED", "display_name is required");
             };
             let make_default = request.make_default.unwrap_or(false);
-            match catalog.create(display_name, make_default, catalog::LOCAL_DEVICE_ID) {
+            match catalog.create(display_name, make_default) {
                 Ok(record) => {
                     let mut response = admin_ok(id);
                     response.catalog_revision = Some(catalog.catalog_revision());
@@ -1163,137 +1018,8 @@ fn handle_admin(
                 Err(error) => admin_error(id, error.code, error.message),
             }
         }
-        "admin.membership.set" => {
-            if let Some(attempt_id) = request.attempt_id.as_deref() {
-                if let Some((stored, response)) = state.replay.get(attempt_id) {
-                    if stored.same_attempt(&request) {
-                        if response.catalog_revision != Some(catalog.catalog_revision()) {
-                            return admin_error(id, "CATALOG_REVISION_CONFLICT", "attempt replay is stale relative to the committed catalog");
-                        }
-                        let mut replayed = response.clone();
-                        replayed.id = id;
-                        return replayed;
-                    }
-                    return admin_error(id, "ADMIN_FRAME_MALFORMED", "attempt_id replay with a changed field");
-                }
-            }
-            let response = admin_membership_set(catalog, registry_path, &request);
-            if response.state == "ok" {
-                if let Some(attempt_id) = request.attempt_id.clone() {
-                    state.remember(attempt_id, request.clone(), response.clone());
-                }
-            }
-            response
-        }
         _ => admin_error(id, "ADMIN_FRAME_MALFORMED", "unknown admin op"),
     }
-}
-
-fn admin_membership_set(
-    catalog: &mut ProfileCatalogStore,
-    registry_path: Option<&std::path::Path>,
-    request: &AdminRequest,
-) -> AdminResponse {
-    let id = request.id;
-    let Some(intent) = request.intent.as_deref() else {
-        return admin_error(id, "ADMIN_FRAME_MALFORMED", "intent is required and must be grant or remove");
-    };
-    if intent != "grant" && intent != "remove" {
-        return admin_error(id, "ADMIN_FRAME_MALFORMED", "intent must be exactly grant or remove");
-    }
-    let Some(attempt_id) = request.attempt_id.as_deref() else {
-        return admin_error(id, "ADMIN_FRAME_MALFORMED", "attempt_id is required");
-    };
-    if attempt_id.trim().is_empty() {
-        return admin_error(id, "ADMIN_FRAME_MALFORMED", "attempt_id must not be empty");
-    }
-    let (Some(profile_id), Some(owner), Some(device_id), Some(members)) =
-        (request.profile_id.as_deref(), request.owner_device_id.as_deref(), request.device_id.as_deref(), request.members.as_ref())
-    else {
-        return admin_error(id, "ADMIN_FRAME_MALFORMED", "profile_id, owner_device_id, device_id and members are required");
-    };
-    if admin_revision_conflict(catalog, request.expected_catalog_revision) {
-        return admin_error(id, "CATALOG_REVISION_CONFLICT", "expected_catalog_revision does not match the committed catalog");
-    }
-    if catalog.record(profile_id).is_none() {
-        return admin_error(id, "PROFILE_NOT_FOUND", "Unknown profile id");
-    }
-    let Some(registry_path) = registry_path else {
-        return admin_error(id, "PROFILE_ACCESS_FAILED", "authorization registry is not configured");
-    };
-    let registry = match remote_authorization::RegistryFile::load(registry_path) {
-        Ok(registry) => registry,
-        Err(error) => return admin_error(id, "PROFILE_ACCESS_FAILED", format!("authorization registry unavailable: {error}")),
-    };
-    if let Err((code, message)) = validate_membership_devices(&registry, intent, owner, device_id, members) {
-        return admin_error(id, code, message);
-    }
-    let requested: BTreeSet<String> = members.iter().cloned().collect();
-    match catalog.assign_access(profile_id, owner, requested) {
-        Ok(_) => {}
-        Err(error) => return admin_error(id, error.code, error.message),
-    }
-    let committed = catalog.access_for(profile_id);
-    let committed_members: Vec<String> = committed.map(|access| access.members.iter().cloned().collect()).unwrap_or_default();
-    let receipt_type = match intent {
-        "grant" if committed_members.iter().any(|member| member == device_id) => "export_eligible",
-        "remove" if !committed_members.iter().any(|member| member == device_id) => "removed",
-        "grant" => return admin_error(id, "MEMBERSHIP_REQUIRED", "granted members do not contain the target device"),
-        _ => return admin_error(id, "PROFILE_ACCESS_FAILED", "removed members still contain the target device"),
-    };
-    let mut response = admin_ok(id);
-    response.catalog_revision = Some(catalog.catalog_revision());
-    response.membership_receipt = Some(AdminMembershipReceipt {
-        receipt_type: receipt_type.into(),
-        catalog_revision: catalog.catalog_revision(),
-        profile_id: profile_id.to_string(),
-        device_id: device_id.to_string(),
-        owner_device_id: owner.to_string(),
-        members: committed_members,
-    });
-    response
-}
-
-fn validate_membership_devices(
-    registry: &remote_authorization::RegistryFile,
-    intent: &str,
-    owner: &str,
-    device_id: &str,
-    members: &[String],
-) -> Result<(), (&'static str, String)> {
-    let active: HashSet<&str> = registry.devices.iter()
-        .filter(|device| device.status == remote_authorization::DeviceStatus::Active)
-        .map(|device| device.device_id.as_str())
-        .collect();
-    let device = registry.devices.iter().find(|device| device.device_id == device_id)
-        .ok_or(("DEVICE_NOT_REGISTERED", "target device is not registered".to_string()))?;
-    if device.status != remote_authorization::DeviceStatus::Active {
-        return Err(("DEVICE_REVOKED", "target device is revoked".to_string()));
-    }
-    if device.scopes.is_empty() {
-        return Err(("DEVICE_NOT_REGISTERED", "target device has no scopes".to_string()));
-    }
-    if device.initial_profile_grant.authorization_revision != registry.authorization_revision {
-        return Err(("DEVICE_GRANT_STALE", "target device initial grant is stale".to_string()));
-    }
-    if owner != catalog::LOCAL_DEVICE_ID && !active.contains(owner) {
-        return Err(("DEVICE_NOT_REGISTERED", "profile owner is not an active registered device".to_string()));
-    }
-    for member in members {
-        if member != catalog::LOCAL_DEVICE_ID && !active.contains(member.as_str()) {
-            return Err(("DEVICE_NOT_REGISTERED", "member is not an active registered device".to_string()));
-        }
-    }
-    match intent {
-        "grant" if !members.iter().any(|member| member == device_id) => {
-            return Err(("MEMBERSHIP_REQUIRED", "granted members must contain the target device".to_string()));
-        }
-        "remove" if members.iter().any(|member| member == device_id) => {
-            return Err(("PROFILE_ACCESS_FAILED", "removed members must not contain the target device".to_string()));
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 async fn admin_write(write: &mut tokio::net::unix::OwnedWriteHalf, response: AdminResponse) -> Result<()> {
@@ -1346,7 +1072,7 @@ async fn admin_connection(stream: UnixStream, connection: u64, events: mpsc::Sen
 pub async fn serve(
     socket_dir: PathBuf,
     profile_root: Option<PathBuf>,
-    authorization_registry: Option<PathBuf>,
+    access_token: Option<String>,
     allow_private_network: bool,
 ) -> Result<()> {
     std::fs::DirBuilder::new().mode(0o700).create(&socket_dir).context("socket directory must be new")?;
@@ -1363,8 +1089,6 @@ pub async fn serve(
     let mut presented = default_profile.clone();
     let mut conn_session: HashMap<u64, String> = HashMap::new();
     let mut conn_route: HashMap<u64, Route> = HashMap::new();
-    let mut conn_principal: HashMap<u64, RemotePrincipalContext> = HashMap::new();
-    let mut conn_admin: HashMap<u64, AdminConnState> = HashMap::new();
 
     let listener = UnixListener::bind(socket_dir.join("host.sock"))?;
     std::fs::set_permissions(socket_dir.join("host.sock"), std::fs::Permissions::from_mode(0o600))?;
@@ -1565,21 +1289,17 @@ pub async fn serve(
                         }
                     }
                     conn_route.remove(&connection);
-                    conn_principal.remove(&connection);
-                    conn_admin.remove(&connection);
                 }
-                Event::Admin { connection, request, reply } => {
-                    let state = conn_admin.entry(connection).or_default();
-                    let response = handle_admin(&mut catalog, authorization_registry.as_deref(), state, request);
+                Event::Admin { request, reply, .. } => {
+                    let response = handle_admin(&mut catalog, request);
                     let _ = reply.send(response);
                 }
                 Event::RemoteAdmission { connection, request, reply } => {
                     let outcome = resolve_remote_admission(
-                        authorization_registry.as_deref(),
+                        access_token.as_deref(),
                         &catalog,
                         &mut sessions,
                         &mut conn_route,
-                        &mut conn_principal,
                         &socket_dir,
                         connection,
                         request,
@@ -1597,14 +1317,10 @@ pub async fn serve(
                 }
                 Event::Request { connection, request, reply } => {
                     let id = request.id;
-                    let remote_principal = conn_principal.get(&connection).cloned();
-                    if let Some(principal) = &remote_principal {
-                        if let Some(response) = remote_request_gate(id, &request, principal, authorization_registry.as_deref()) {
-                            let _ = reply.send(response);
-                            continue;
-                        }
-                    }
-                    let request_target = if remote_principal.is_some() {
+                    // A remote connection owns an admission route; a local one
+                    // uses the presented profile.
+                    let remote = conn_route.contains_key(&connection);
+                    let request_target = if remote {
                         conn_session.get(&connection).cloned().or_else(|| conn_route.get(&connection).map(|route| route.profile_id.clone()))
                     } else {
                         conn_session.get(&connection).cloned().or_else(|| Some(presented.clone()))
@@ -1620,11 +1336,7 @@ pub async fn serve(
                     }
                     match &request.command {
                         Command::ProfileCatalog {} => {
-                            let catalog_value = match &remote_principal {
-                                Some(principal) => catalog.remote_catalog(&principal.device_id),
-                                None => catalog.catalog(),
-                            };
-                            let _ = reply.send(Response::Result { id, value: ResultValue::ProfileCatalog { catalog: catalog_value } });
+                            let _ = reply.send(Response::Result { id, value: ResultValue::ProfileCatalog { catalog: catalog.catalog() } });
                             continue;
                         }
                         Command::FlushProfiles {} => {
@@ -1649,22 +1361,9 @@ pub async fn serve(
                                 let _ = reply.send(error(id, "OPERATION_REQUIRED", "Profile selection requires an operation identity for the bound session"));
                                 continue;
                             }
-                            let Some(target_entry) = catalog.record(&profile_id).cloned() else {
+                            if catalog.record(&profile_id).is_none() {
                                 let _ = reply.send(error(id, "PROFILE_NOT_FOUND", "Unknown profile id"));
                                 continue;
-                            };
-                            if let Some(principal) = &remote_principal {
-                                match &target_entry.access {
-                                    Some(access) if access.grants(&principal.device_id) => {}
-                                    Some(_) => {
-                                        let _ = reply.send(error(id, "REMOTE_INITIAL_PROFILE_ACCESS_DENIED", "Profile does not grant this remote device"));
-                                        continue;
-                                    }
-                                    None => {
-                                        let _ = reply.send(error(id, "PROFILE_ACCESS_MIGRATION_REQUIRED", "Profile has no Host-side access record"));
-                                        continue;
-                                    }
-                                }
                             }
                             let source_busy = pending.as_ref().is_some_and(|pending| pending.session_id == source && pending.operation.as_ref().is_some_and(|operation| operation.connection == connection))
                                 || sessions.get(&source).is_some_and(|runtime| runtime.session.input_lease.as_ref().is_some_and(|lease| lease.attachment_id == connection));
@@ -1702,7 +1401,7 @@ pub async fn serve(
                             };
                             conn_session.insert(connection, profile_id.clone());
                             let session_id = runtime.session.id.clone();
-                            if remote_principal.is_some() {
+                            if remote {
                                 conn_route.insert(connection, Route { profile_id: profile_id.clone(), session_id: session_id.clone(), reservation_id: String::new() });
                             } else {
                                 presented = profile_id.clone();
@@ -1716,23 +1415,6 @@ pub async fn serve(
                         let _ = reply.send(error(id, "SESSION_UNAVAILABLE", "No authorized session route for this connection"));
                         continue;
                     };
-                    if let Some(principal) = &remote_principal {
-                        match catalog.record(&target).and_then(|entry| entry.access.as_ref()) {
-                            Some(access) if access.grants(&principal.device_id) => {}
-                            Some(_) => {
-                                let _ = reply.send(error(id, "REMOTE_INITIAL_PROFILE_ACCESS_DENIED", "Profile does not grant this remote device"));
-                                continue;
-                            }
-                            None if catalog.record(&target).is_some() => {
-                                let _ = reply.send(error(id, "PROFILE_ACCESS_MIGRATION_REQUIRED", "Profile has no Host-side access record"));
-                                continue;
-                            }
-                            None => {
-                                let _ = reply.send(error(id, "SESSION_UNAVAILABLE", "Authorized profile is unavailable"));
-                                continue;
-                            }
-                        }
-                    }
                     let Some(runtime) = sessions.get_mut(&target) else {
                         let _ = reply.send(error(id, "SESSION_UNAVAILABLE", "Session is unavailable"));
                         continue;
@@ -1746,7 +1428,7 @@ pub async fn serve(
                         Admission::Replied(response) => {
                             if is_attach && matches!(response, Response::Result { .. }) {
                                 conn_session.insert(connection, target.clone());
-                                if remote_principal.is_some() {
+                                if remote {
                                     let session_id = session.id.clone();
                                     conn_route.insert(connection, Route { profile_id: target.clone(), session_id, reservation_id: String::new() });
                                 } else {
@@ -1798,15 +1480,9 @@ pub async fn serve(
                             let previous_sequence = session.begin_dispatch(&dispatch);
                             let result = match &dispatch.command {
                                 Command::ProfileCreate { display_name, make_default } => {
-                                    let owner = remote_principal.as_ref()
-                                        .map(|principal| principal.device_id.clone())
-                                        .unwrap_or_else(|| catalog::LOCAL_DEVICE_ID.to_string());
-                                    match catalog.create(display_name, *make_default, &owner) {
+                                    match catalog.create(display_name, *make_default) {
                                         Ok(profile) => {
-                                            let catalog_value = match &remote_principal {
-                                                Some(principal) => catalog.remote_catalog(&principal.device_id),
-                                                None => catalog.catalog(),
-                                            };
+                                            let catalog_value = catalog.catalog();
                                             Ok(Some(ResultValue::ProfileCreated { profile, catalog: catalog_value }))
                                         }
                                         Err(cause) => Err((cause.code, cause.message)),

@@ -5,6 +5,11 @@
 //! internal function or asserts on source text: the assertions are the bytes a
 //! real peer reads, the bytes it writes, and the persisted catalog file.
 //!
+//! No case configures an authorization registry, membership or scope. The
+//! admission frame is `{ token, request_id }`: the Host owns the one token
+//! comparison and binds the catalog default profile. A peer reaches another
+//! profile with an explicit `profile_select` on its own attachment.
+//!
 //! RP-42/43/44 (endpoint consumer rules) live in the `endpoint_*` tests at the
 //! bottom of this file; they run the real `obscura-endpoint` binary against a
 //! controlled Host admission socket.
@@ -17,36 +22,19 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName}};
-use tokio_tungstenite::{client_async, tungstenite::Message};
+use tokio_rustls::rustls::{self, pki_types::ServerName};
+use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}};
 
-const OBSERVE: &str = "observe_human_control";
-const READ: &str = "profile_read";
-const CREATE: &str = "profile_create";
-const SELECT: &str = "profile_select";
-const ALL_SCOPES: [&str; 4] = [OBSERVE, READ, CREATE, SELECT];
+/// The one access token this Host is configured with.
+const TOKEN: &str = "remote-admission-r1-token";
 
 fn tmp_root(name: &str) -> PathBuf {
     let root = PathBuf::from("/tmp").join(format!("ora-{name}-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&root).unwrap();
     root
-}
-
-fn hex_fingerprint(byte: u8) -> String {
-    format!("{byte:02x}").repeat(32)
-}
-
-fn fingerprint_array(byte: u8) -> Value {
-    Value::Array((0..32).map(|_| json!(byte)).collect())
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn profile_entry(profile_id: &str, display_name: &str, default: bool, access: Option<(&str, &[&str])>) -> Value {
@@ -66,135 +54,53 @@ fn catalog(default_profile_id: &str, next_id: u64, profiles: Vec<Value>) -> Valu
     })
 }
 
+/// One remote peer. It carries the one access token and nothing else: no device
+/// identity, scope, grant or initial profile selection takes part in admission.
 #[derive(Clone)]
 struct DeviceSpec {
-    device_id: String,
-    fingerprint: String,
-    scopes: Vec<&'static str>,
-    selection: Value,
-    revision: u64,
-    status: &'static str,
+    token: String,
 }
 
 impl DeviceSpec {
-    fn new(device_id: &str, fingerprint_byte: u8, scopes: &[&'static str], selection: Value, revision: u64) -> Self {
-        Self {
-            device_id: device_id.into(),
-            fingerprint: hex_fingerprint(fingerprint_byte),
-            scopes: scopes.to_vec(),
-            selection,
-            revision,
-            status: "active",
-        }
+    fn new() -> Self {
+        Self { token: TOKEN.into() }
     }
 
-    fn revoked(mut self) -> Self {
-        self.status = "revoked";
-        self
-    }
-
-    fn registry_entry(&self) -> Value {
-        json!({
-            "device_id": self.device_id,
-            "device_label": self.device_id,
-            "client_certificate_sha256": self.fingerprint,
-            "scopes": self.scopes,
-            "initial_profile_grant": {"selection": self.selection, "authorization_revision": self.revision},
-            "scope_revision": 1,
-            "status": self.status,
-            "not_before_unix": 0,
-            "not_after_unix": 4_102_444_800i64,
-            "created_at_unix": 0,
-            "revoked_at_unix": null,
-        })
-    }
-
-    fn projection_entry(&self) -> Value {
-        json!({
-            "device_id": self.device_id,
-            "client_certificate_sha256": self.fingerprint,
-            "scopes": self.scopes,
-            "initial_profile_grant": {"selection": self.selection, "authorization_revision": self.revision},
-        })
+    fn wrong_token() -> Self {
+        Self { token: "not-the-host-token".into() }
     }
 
     fn admission(&self, request_id: u64) -> Value {
-        self.admission_with_selection(self.selection.clone(), request_id)
+        json!({"token": self.token, "request_id": request_id})
     }
-
-    fn admission_with_selection(&self, selection: Value, request_id: u64) -> Value {
-        json!({
-            "principal": {
-                "device_id": self.device_id,
-                "client_cert_sha256": fingerprint_array_hex(&self.fingerprint),
-                "scopes": self.scopes,
-                "authorization_revision": self.revision,
-            },
-            "initial": {
-                "device_id": self.device_id,
-                "authorization_revision": self.revision,
-                "selection": selection,
-            },
-            "request_id": request_id,
-        })
-    }
-}
-
-fn fingerprint_array_hex(hex: &str) -> Value {
-    let bytes = hex.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    let mut index = 0;
-    while index + 1 < bytes.len() {
-        out.push(json!(u8::from_str_radix(std::str::from_utf8(&bytes[index..index + 2]).unwrap(), 16).unwrap()));
-        index += 2;
-    }
-    Value::Array(out)
 }
 
 struct HostFixture {
     root: PathBuf,
     socket_dir: PathBuf,
     profile_root: PathBuf,
-    registry: PathBuf,
     child: Child,
 }
 
 impl HostFixture {
-    async fn start(name: &str, catalog_value: Value, devices: &[DeviceSpec]) -> Self {
+    /// Start the real Host with a catalog and one access token.
+    async fn start(name: &str, catalog_value: Value) -> Self {
         let root = tmp_root(name);
         let socket_dir = root.join("sock");
         let profile_root = root.join("profiles");
         std::fs::create_dir_all(&profile_root).unwrap();
         std::fs::write(profile_root.join("catalog.json"), serde_json::to_vec_pretty(&catalog_value).unwrap()).unwrap();
-        let revision = devices.iter().map(|device| device.revision).max().unwrap_or(1);
-        let registry = root.join("registry.json");
-        let authorized = root.join("authorized-clients.json");
-        let registry_value = json!({
-            "schema_version": 2,
-            "authorization_revision": revision,
-            "host_id": "host-test",
-            "devices": devices.iter().map(DeviceSpec::registry_entry).collect::<Vec<_>>(),
-        });
-        let registry_bytes = serde_json::to_vec_pretty(&registry_value).unwrap();
-        let projection_value = json!({
-            "schema_version": 2,
-            "authorization_revision": revision,
-            "registry_sha256": sha256_hex(&registry_bytes),
-            "clients": devices.iter().map(DeviceSpec::projection_entry).collect::<Vec<_>>(),
-        });
-        std::fs::write(&registry, &registry_bytes).unwrap();
-        std::fs::write(&authorized, serde_json::to_vec_pretty(&projection_value).unwrap()).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
             .arg("--socket-dir").arg(&socket_dir)
             .arg("--profile-root").arg(&profile_root)
-            .arg("--authorization-registry").arg(&registry)
+            .arg("--access-token").arg(TOKEN)
             .arg("--allow-private-network")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .expect("start Host");
-        let fixture = Self { root, socket_dir, profile_root, registry, child };
+        let fixture = Self { root, socket_dir, profile_root, child };
         fixture.wait_socket("host.sock").await;
         fixture.wait_socket("remote-admission.sock").await;
         fixture
@@ -203,7 +109,18 @@ impl HostFixture {
     fn admission_path(&self) -> PathBuf { self.socket_dir.join("remote-admission.sock") }
     fn host_path(&self) -> PathBuf { self.socket_dir.join("host.sock") }
     fn profile_root(&self) -> &Path { &self.profile_root }
-    fn registry_path(&self) -> &Path { &self.registry }
+
+    /// Count the per-session sockets the Host bound. A refused admission must
+    /// not add one.
+    fn session_sockets(&self) -> usize {
+        std::fs::read_dir(&self.socket_dir).unwrap().flatten()
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with("session-") && name.ends_with(".sock")
+            })
+            .count()
+    }
 
     async fn wait_socket(&self, name: &str) {
         let path = self.socket_dir.join(name);
@@ -222,19 +139,6 @@ impl HostFixture {
     async fn local(&self) -> Conn {
         let stream = UnixStream::connect(self.host_path()).await.expect("connect host.sock");
         Conn { reader: BufReader::new(stream) }
-    }
-
-    /// Rewrite the registry with a fresh revision, keeping every device's
-    /// declared revision rebind-consistent with the new global revision unless
-    /// the device is explicitly pinned stale.
-    fn rewrite_registry(&self, revision: u64, devices: &[DeviceSpec]) {
-        let registry_value = json!({
-            "schema_version": 2,
-            "authorization_revision": revision,
-            "host_id": "host-test",
-            "devices": devices.iter().map(DeviceSpec::registry_entry).collect::<Vec<_>>(),
-        });
-        std::fs::write(&self.registry, serde_json::to_vec_pretty(&registry_value).unwrap()).unwrap();
     }
 
     fn terminate(&mut self) {
@@ -301,18 +205,23 @@ async fn admit_ok(fixture: &HostFixture, device: &DeviceSpec, request_id: u64) -
     (conn, result, ready)
 }
 
-async fn expect_denial(conn: &mut Conn, request_id: u64, code: &str) {
-    let result = conn.read_json().await;
-    assert_eq!(result["type"], "err", "expected a typed denial: {result}");
-    assert_eq!(result["request_id"], request_id, "decoded denial keeps its request id: {result}");
-    assert_eq!(result["code"], code, "denial code: {result}");
-    conn.expect_eof().await;
-}
-
 async fn attach_observe(conn: &mut Conn) -> Value {
     conn.write_json(&json!({"id": 2, "command": {"type": "attach", "mode": "observe"}})).await;
     let response = conn.read_json().await;
     assert_eq!(response["type"], "result", "attach response: {response}");
+    response["value"].clone()
+}
+
+/// Bind one peer to `profile_id` with an operation identity for its own
+/// attachment, and return the `ProfileSelected` value.
+async fn select_profile(conn: &mut Conn, status: &Value, profile_id: &str) -> Value {
+    conn.write_json(&json!({
+        "id": 3,
+        "operation": operation(status),
+        "command": {"type": "profile_select", "profile_id": profile_id},
+    })).await;
+    let response = conn.read_json().await;
+    assert_eq!(response["type"], "result", "profile_select response: {response}");
     response["value"].clone()
 }
 
@@ -337,13 +246,13 @@ fn default_access<'a>(owner: &'a str, members: &'a [&'a str]) -> Option<(&'a str
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn rp01_remote_catalog_filters_to_accessible_profiles() {
+async fn rp01_remote_catalog_is_unfiltered() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x11, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp01", catalog("default", 3, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
             profile_entry("p1", "Other", false, default_access("dev-b", &["dev-b"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let (mut conn, _, _) = admit_ok(&fixture, &device_a, 1).await;
         attach_observe(&mut conn).await;
         conn.write_json(&json!({"id": 3, "command": {"type": "profile_catalog"}})).await;
@@ -352,45 +261,19 @@ async fn rp01_remote_catalog_filters_to_accessible_profiles() {
         let catalog = &response["value"]["catalog"];
         let ids: Vec<&str> = catalog["profiles"].as_array().unwrap().iter()
             .map(|profile| profile["profile_id"].as_str().unwrap()).collect();
-        assert_eq!(ids, vec!["default"], "remote catalog leaked another device's profile: {catalog}");
+        assert_eq!(ids, vec!["default", "p1"], "a Host-side access record must not filter the remote catalog: {catalog}");
         assert_eq!(catalog["default_profile_id"], "default");
     }).await.expect("rp01 timed out");
 }
 
 #[tokio::test]
-async fn rp02_remote_create_persists_remote_owner() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x21, &ALL_SCOPES, json!("default_profile"), 7);
-        let fixture = HostFixture::start("rp02", catalog("default", 2, vec![
-            profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
-        let (mut conn, _, _) = admit_ok(&fixture, &device_a, 1).await;
-        let status = attach_observe(&mut conn).await;
-        conn.write_json(&json!({
-            "id": 3,
-            "operation": operation(&status),
-            "command": {"type": "profile_create", "display_name": "Remote", "make_default": false},
-        })).await;
-        let response = conn.read_json().await;
-        assert_eq!(response["type"], "result", "create response: {response}");
-        let created = &response["value"]["profile"];
-        assert_eq!(created["display_name"], "Remote");
-        let persisted: Value = serde_json::from_slice(&std::fs::read(fixture.profile_root().join("catalog.json")).unwrap()).unwrap();
-        let entry = persisted["profiles"].as_array().unwrap().iter()
-            .find(|profile| profile["profile_id"] == created["profile_id"]).expect("created profile persisted");
-        assert_eq!(entry["access"]["owner_device_id"], "dev-a", "remote create must record the remote owner: {entry}");
-        assert_eq!(entry["access"]["members"], json!(["dev-a"]));
-    }).await.expect("rp02 timed out");
-}
-
-#[tokio::test]
 async fn rp03_remote_select_rebinds_without_killing_source() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x31, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp03", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
             profile_entry("p1", "Work", false, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let (mut conn, result, _) = admit_ok(&fixture, &device_a, 1).await;
         let status = attach_observe(&mut conn).await;
         conn.write_json(&json!({
@@ -411,35 +294,13 @@ async fn rp03_remote_select_rebinds_without_killing_source() {
 }
 
 #[tokio::test]
-async fn rp04_missing_scope_is_denied_before_ready() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        // No observe_human_control scope: the admission itself is refused.
-        let no_observe = DeviceSpec::new("dev-c", 0x41, &[READ], json!("default_profile"), 7);
-        // Observe only: admission succeeds, but a profile command is refused.
-        let observe_only = DeviceSpec::new("dev-d", 0x42, &[OBSERVE], json!("default_profile"), 7);
-        let fixture = HostFixture::start("rp04", catalog("default", 2, vec![
-            profile_entry("default", "Default", true, default_access("dev-c", &["dev-c", "dev-d"])),
-        ]), &[no_observe.clone(), observe_only.clone()]).await;
-        let mut denied = fixture.admission().await;
-        denied.write_json(&no_observe.admission(1)).await;
-        expect_denial(&mut denied, 1, "REMOTE_PROFILE_SCOPE_REQUIRED").await;
-        let (mut conn, _, _) = admit_ok(&fixture, &observe_only, 2).await;
-        attach_observe(&mut conn).await;
-        conn.write_json(&json!({"id": 3, "command": {"type": "profile_catalog"}})).await;
-        let response = conn.read_json().await;
-        assert_eq!(response["type"], "error", "missing profile_read must be refused: {response}");
-        assert_eq!(response["code"], "REMOTE_PROFILE_SCOPE_REQUIRED");
-    }).await.expect("rp04 timed out");
-}
-
-#[tokio::test]
 async fn rp05_two_profile_storage_is_isolated() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x51, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp05", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
             profile_entry("p1", "Work", false, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut local = fixture.local().await;
         assert_eq!(local.read_json().await["type"], "ready");
         local.write_json(&json!({"id": 1, "command": {"type": "attach", "mode": "agent"}})).await;
@@ -479,18 +340,18 @@ async fn rp05_two_profile_storage_is_isolated() {
 // RP-06/RP-07 categories: legacy access migration and independent observers.
 
 #[tokio::test]
-async fn rp_migration_legacy_catalog_without_access_refuses_remote_binding() {
+async fn rp_migration_legacy_catalog_without_access_admits_remote_binding() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x52, &ALL_SCOPES, json!("default_profile"), 7);
-        // A legacy entry has no Host-side access record. Remote binding must
-        // refuse with the typed migration code instead of granting a default.
+        let device_a = DeviceSpec::new();
+        // A legacy entry has no Host-side access record. It must admit a remote
+        // binding like any other entry.
         let fixture = HostFixture::start("rpmig", catalog("default", 2, vec![
             profile_entry("default", "Default", true, None),
-        ]), std::slice::from_ref(&device_a)).await;
-        let mut denied = fixture.admission().await;
-        denied.write_json(&device_a.admission(1)).await;
-        expect_denial(&mut denied, 1, "PROFILE_ACCESS_MIGRATION_REQUIRED").await;
-        // The legacy entry is still readable over the local Ready-first socket.
+        ])).await;
+        let (mut conn, result, _) = admit_ok(&fixture, &device_a, 1).await;
+        attach_observe(&mut conn).await;
+        assert_eq!(result["type"], "ok");
+        // The legacy entry is equally readable over the local Ready-first socket.
         let mut local = fixture.local().await;
         assert_eq!(local.read_json().await["type"], "ready");
         local.write_json(&json!({"id": 1, "command": {"type": "profile_catalog"}})).await;
@@ -503,12 +364,12 @@ async fn rp_migration_legacy_catalog_without_access_refuses_remote_binding() {
 #[tokio::test]
 async fn rp07_other_observer_keeps_its_own_session_after_peer_select() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x53, &ALL_SCOPES, json!("default_profile"), 7);
-        let device_b = DeviceSpec::new("dev-b", 0x54, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
+        let device_b = DeviceSpec::new();
         let fixture = HostFixture::start("rp07", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a", "dev-b"])),
             profile_entry("p1", "Work", false, default_access("dev-a", &["dev-a", "dev-b"])),
-        ]), &[device_a.clone(), device_b.clone()]).await;
+        ])).await;
         let (mut first, first_result, _) = admit_ok(&fixture, &device_a, 1).await;
         let (mut second, second_result, _) = admit_ok(&fixture, &device_b, 2).await;
         let first_status = attach_observe(&mut first).await;
@@ -535,96 +396,28 @@ async fn rp07_other_observer_keeps_its_own_session_after_peer_select() {
 }
 
 #[tokio::test]
-async fn rp09_unauthorized_initial_profile_is_denied_before_ready() {
+async fn rp13_two_peers_observe_the_same_session() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x61, &ALL_SCOPES, json!("default_profile"), 7);
-        let device_b = DeviceSpec::new("dev-b", 0x62, &ALL_SCOPES, json!("default_profile"), 7);
-        let fixture = HostFixture::start("rp09", catalog("default", 3, vec![
-            profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-            profile_entry("p1", "Work", false, default_access("dev-b", &["dev-b"])),
-        ]), &[device_a, device_b.clone()]).await;
-        let mut denied = fixture.admission().await;
-        denied.write_json(&device_b.admission(1)).await;
-        expect_denial(&mut denied, 1, "REMOTE_INITIAL_PROFILE_ACCESS_DENIED").await;
-        // RP-10: a reconnect must not recover the profile through any fallback.
-        let mut reconnect = fixture.admission().await;
-        reconnect.write_json(&device_b.admission(2)).await;
-        expect_denial(&mut reconnect, 2, "REMOTE_INITIAL_PROFILE_ACCESS_DENIED").await;
-    }).await.expect("rp09 timed out");
-}
-
-#[tokio::test]
-async fn rp11_unbound_initial_selection_is_denied() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x71, &ALL_SCOPES, json!({"profile_id": "missing"}), 7);
-        let fixture = HostFixture::start("rp11", catalog("default", 2, vec![
-            profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
-        let mut conn = fixture.admission().await;
-        conn.write_json(&device_a.admission(1)).await;
-        expect_denial(&mut conn, 1, "REMOTE_INITIAL_PROFILE_UNBOUND").await;
-    }).await.expect("rp11 timed out");
-}
-
-#[tokio::test]
-async fn rp12_stale_or_revoked_grant_is_denied() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let mut stale = DeviceSpec::new("dev-a", 0x81, &ALL_SCOPES, json!("default_profile"), 7);
-        stale.revision = 6; // registry is at revision 7: the principal is stale.
-        let revoked = DeviceSpec::new("dev-b", 0x82, &ALL_SCOPES, json!("default_profile"), 7).revoked();
-        let fixture = HostFixture::start("rp12", catalog("default", 2, vec![
-            profile_entry("default", "Default", true, default_access("dev-a", &["dev-a", "dev-b"])),
-        ]), &[DeviceSpec { revision: 7, ..stale.clone() }, revoked.clone()]).await;
-        let mut stale_conn = fixture.admission().await;
-        stale_conn.write_json(&stale.admission(1)).await;
-        expect_denial(&mut stale_conn, 1, "REMOTE_PRINCIPAL_REVOKED").await;
-        let mut revoked_conn = fixture.admission().await;
-        revoked_conn.write_json(&revoked.admission(2)).await;
-        expect_denial(&mut revoked_conn, 2, "REMOTE_PRINCIPAL_REVOKED").await;
-    }).await.expect("rp12 timed out");
-}
-
-#[tokio::test]
-async fn rp13_two_registered_devices_observe_the_same_session() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x91, &ALL_SCOPES, json!("default_profile"), 7);
-        let device_b = DeviceSpec::new("dev-b", 0x92, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
+        let device_b = DeviceSpec::new();
         let fixture = HostFixture::start("rp13", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a", "dev-b"])),
-        ]), &[device_a.clone(), device_b.clone()]).await;
+        ])).await;
         let (mut first, first_result, _) = admit_ok(&fixture, &device_a, 1).await;
         let (mut second, second_result, _) = admit_ok(&fixture, &device_b, 2).await;
-        assert_eq!(first_result["session_id"], second_result["session_id"], "both devices must bind the same profile session");
+        assert_eq!(first_result["session_id"], second_result["session_id"], "both peers must bind the same profile session");
         attach_observe(&mut first).await;
         attach_observe(&mut second).await;
     }).await.expect("rp13 timed out");
 }
 
 #[tokio::test]
-async fn rp14_revoking_second_device_keeps_owner_alive() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0xa1, &ALL_SCOPES, json!("default_profile"), 7);
-        let device_b = DeviceSpec::new("dev-b", 0xa2, &ALL_SCOPES, json!("default_profile"), 7);
-        let fixture = HostFixture::start("rp14", catalog("default", 2, vec![
-            profile_entry("default", "Default", true, default_access("dev-a", &["dev-a", "dev-b"])),
-        ]), &[device_a.clone(), device_b.clone()]).await;
-        fixture.rewrite_registry(8, &[DeviceSpec { revision: 8, ..device_a.clone() }, DeviceSpec { revision: 8, ..device_b.clone() }.revoked()]);
-        let mut denied = fixture.admission().await;
-        denied.write_json(&device_b.admission(1)).await;
-        expect_denial(&mut denied, 1, "REMOTE_PRINCIPAL_REVOKED").await;
-        let rebind_a = DeviceSpec { revision: 8, ..device_a };
-        let (mut owner, _, _) = admit_ok(&fixture, &rebind_a, 2).await;
-        attach_observe(&mut owner).await;
-    }).await.expect("rp14 timed out");
-}
-
-#[tokio::test]
 async fn rp17_disconnect_releases_reservation_without_touching_other_routes() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0xb1, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp17", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let (reserved, _, _) = admit_ok(&fixture, &device_a, 1).await;
         drop(reserved); // EOF after Ok, before Attach.
         let mut local = fixture.local().await;
@@ -637,10 +430,10 @@ async fn rp17_disconnect_releases_reservation_without_touching_other_routes() {
 #[tokio::test]
 async fn rp18_rejected_attach_reclaims_only_its_own_route() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0xc1, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp18", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let (mut conn, _, _) = admit_ok(&fixture, &device_a, 1).await;
         conn.write_json(&json!({"id": 2, "command": {"type": "attach", "mode": "observe",
             "viewport": {"device": "phone", "css_width": 0, "css_height": 0, "orientation": "portrait"}}})).await;
@@ -655,17 +448,16 @@ async fn rp18_rejected_attach_reclaims_only_its_own_route() {
 #[tokio::test]
 async fn rp19_local_host_socket_stays_ready_first() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0xd1, &ALL_SCOPES, json!("default_profile"), 7);
         let fixture = HostFixture::start("rp19", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut local = fixture.local().await;
         let ready = local.read_json().await;
         assert_eq!(ready["type"], "ready", "local host.sock must publish Ready before any request");
         local.write_json(&json!({"id": 1, "command": {"type": "profile_catalog"}})).await;
         let response = local.read_json().await;
         assert_eq!(response["type"], "result", "local catalog: {response}");
-        // Local maintenance still owns FlushProfiles; the remote path must not.
+        // The local socket still owns the maintenance drain.
         local.write_json(&json!({"id": 2, "command": {"type": "flush_profiles"}})).await;
         let flushed = local.read_json().await;
         assert_eq!(flushed["type"], "result", "local flush: {flushed}");
@@ -674,53 +466,35 @@ async fn rp19_local_host_socket_stays_ready_first() {
 }
 
 #[tokio::test]
-async fn rp20_revision_change_rejects_attach_without_destroying_owner() {
+async fn rp21_concurrent_remote_admissions_keep_distinct_routes() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0xe1, &ALL_SCOPES, json!("default_profile"), 7);
-        let fixture = HostFixture::start("rp20", catalog("default", 2, vec![
-            profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
-        let mut local = fixture.local().await;
-        assert_eq!(local.read_json().await["type"], "ready");
-        local.write_json(&json!({"id": 1, "command": {"type": "attach", "mode": "observe"}})).await;
-        assert_eq!(local.read_json().await["type"], "result");
-        let (mut conn, _, _) = admit_ok(&fixture, &device_a, 1).await;
-        // Advance the registry revision after admission but before Attach.
-        fixture.rewrite_registry(9, std::slice::from_ref(&device_a));
-        conn.write_json(&json!({"id": 2, "command": {"type": "attach", "mode": "observe"}})).await;
-        let response = conn.read_json().await;
-        assert_eq!(response["type"], "error", "stale revision must refuse control: {response}");
-        assert_eq!(response["code"], "REMOTE_PRINCIPAL_REVOKED");
-        // The pre-existing local attachment must survive the refusal.
-        local.write_json(&json!({"id": 2, "command": {"type": "status"}})).await;
-        assert_eq!(local.read_json().await["type"], "result", "owner attachment was destroyed by a stale remote refusal");
-    }).await.expect("rp20 timed out");
-}
-
-#[tokio::test]
-async fn rp21_concurrent_remote_admissions_keep_distinct_sessions() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0xf1, &ALL_SCOPES, json!("default_profile"), 7);
-        let device_b = DeviceSpec::new("dev-b", 0xf2, &ALL_SCOPES, json!({"profile_id": "p1"}), 7);
+        let device_a = DeviceSpec::new();
+        let device_b = DeviceSpec::new();
         let fixture = HostFixture::start("rp21", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
             profile_entry("p1", "Work", false, default_access("dev-b", &["dev-b"])),
-        ]), &[device_a.clone(), device_b.clone()]).await;
+        ])).await;
+        // Every peer is admitted to the catalog default session.
         let (mut first, first_result, _) = admit_ok(&fixture, &device_a, 1).await;
         let (mut second, second_result, _) = admit_ok(&fixture, &device_b, 2).await;
-        assert_ne!(first_result["session_id"], second_result["session_id"], "independent profiles must not share a session");
-        attach_observe(&mut first).await;
+        assert_eq!(first_result["session_id"], second_result["session_id"], "both peers must be admitted to the catalog default");
+        let first_status = attach_observe(&mut first).await;
         attach_observe(&mut second).await;
+        // One peer selects the other profile. The two routes must stay distinct.
+        let selected = select_profile(&mut first, &first_status, "p1").await;
+        assert_eq!(selected["binding"]["profile_id"], "p1");
+        assert_ne!(selected["binding"]["session_id"], second_result["session_id"], "an explicit selection must not share the peer's session");
+        assert_eq!(selected["status"]["session_id"], selected["binding"]["session_id"]);
     }).await.expect("rp21 timed out");
 }
 
 #[tokio::test]
 async fn rp22_interleaved_local_accept_keeps_routes_separate() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x11, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp22", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut local = fixture.local().await;
         assert_eq!(local.read_json().await["type"], "ready");
         let (mut remote, _, _) = admit_ok(&fixture, &device_a, 1).await;
@@ -733,10 +507,10 @@ async fn rp22_interleaved_local_accept_keeps_routes_separate() {
 #[tokio::test]
 async fn rp23_repeated_admission_frame_is_invalid_request() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x12, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp23", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let (mut conn, result, _) = admit_ok(&fixture, &device_a, 1).await;
         // A second admission-shaped frame is not a browser Request.
         conn.write_json(&device_a.admission(2)).await;
@@ -750,39 +524,12 @@ async fn rp23_repeated_admission_frame_is_invalid_request() {
 }
 
 #[tokio::test]
-async fn rp24_admission_denial_creates_no_route() {
-    tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x13, &ALL_SCOPES, json!("default_profile"), 8);
-        let unbound_device = DeviceSpec::new("dev-b", 0x14, &ALL_SCOPES, json!({"profile_id": "missing"}), 8);
-        let fixture = HostFixture::start("rp24", catalog("default", 2, vec![
-            profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), &[device_a.clone(), unbound_device.clone()]).await;
-
-        // A request selection that differs from the registry-owned grant is a
-        // principal/revocation mismatch, not an unbound profile.
-        let mut denied = fixture.admission().await;
-        denied.write_json(&device_a.admission_with_selection(json!({"profile_id": "nope"}), 1)).await;
-        expect_denial(&mut denied, 1, "REMOTE_PRINCIPAL_REVOKED").await;
-
-        // The distinct true-unbound case uses the registry-owned selection:
-        // the registry itself points at a profile the catalog does not contain.
-        let mut unbound = fixture.admission().await;
-        unbound.write_json(&unbound_device.admission(2)).await;
-        expect_denial(&mut unbound, 2, "REMOTE_INITIAL_PROFILE_UNBOUND").await;
-
-        // Neither denial leaks a reservation into the healthy owner route.
-        let (mut healthy, _, _) = admit_ok(&fixture, &device_a, 2).await;
-        attach_observe(&mut healthy).await;
-    }).await.expect("rp24 timed out");
-}
-
-#[tokio::test]
 async fn rp25_eof_before_handoff_writes_no_result() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x14, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp25", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut empty = fixture.admission().await;
         empty.reader.get_mut().shutdown().await.unwrap();
         empty.expect_eof().await;
@@ -794,10 +541,10 @@ async fn rp25_eof_before_handoff_writes_no_result() {
 #[tokio::test]
 async fn rp26_eof_after_ok_before_attach_releases_reservation() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x15, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp26", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let (conn, _, _) = admit_ok(&fixture, &device_a, 1).await;
         drop(conn);
         let (mut healthy, _, _) = admit_ok(&fixture, &device_a, 2).await;
@@ -808,10 +555,10 @@ async fn rp26_eof_after_ok_before_attach_releases_reservation() {
 #[tokio::test]
 async fn rp27_eof_after_ready_releases_connection_route() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x16, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp27", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let (mut conn, _, _) = admit_ok(&fixture, &device_a, 1).await;
         attach_observe(&mut conn).await;
         drop(conn);
@@ -823,10 +570,10 @@ async fn rp27_eof_after_ready_releases_connection_route() {
 #[tokio::test]
 async fn rp30_shutdown_removes_owned_sockets() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x17, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let mut fixture = HostFixture::start("rp30", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let (mut remote, _, _) = admit_ok(&fixture, &device_a, 1).await;
         attach_observe(&mut remote).await;
         let mut local = fixture.local().await;
@@ -841,10 +588,10 @@ async fn rp30_shutdown_removes_owned_sockets() {
 #[tokio::test]
 async fn rp31_coalesced_admission_and_attach_share_one_reader() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x18, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp31", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut conn = fixture.admission().await;
         let mut coalesced = serde_json::to_string(&device_a.admission(1)).unwrap();
         coalesced.push('\n');
@@ -864,10 +611,10 @@ async fn rp31_coalesced_admission_and_attach_share_one_reader() {
 #[tokio::test]
 async fn rp32_fragmented_admission_frame_is_accumulated() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x19, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp32", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut conn = fixture.admission().await;
         let mut frame = serde_json::to_string(&device_a.admission(1)).unwrap();
         frame.push('\n');
@@ -885,10 +632,9 @@ async fn rp32_fragmented_admission_frame_is_accumulated() {
 #[tokio::test]
 async fn rp33_malformed_newline_json_is_uncorrelated_refusal() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x1a, &ALL_SCOPES, json!("default_profile"), 7);
         let fixture = HostFixture::start("rp33", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut conn = fixture.admission().await;
         conn.write_bytes(b"{not-json}\n").await;
         let result = conn.read_json().await;
@@ -902,10 +648,9 @@ async fn rp33_malformed_newline_json_is_uncorrelated_refusal() {
 #[tokio::test]
 async fn rp34_structurally_invalid_request_is_refused_before_binding() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x1b, &ALL_SCOPES, json!("default_profile"), 7);
         let fixture = HostFixture::start("rp34", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut conn = fixture.admission().await;
         conn.write_json(&json!({"principal": {}, "initial": {}, "request_id": 1})).await;
         let result = conn.read_json().await;
@@ -919,10 +664,9 @@ async fn rp34_structurally_invalid_request_is_refused_before_binding() {
 #[tokio::test]
 async fn rp35_oversized_frame_without_delimiter_is_refused_at_the_bound() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x1c, &ALL_SCOPES, json!("default_profile"), 7);
         let fixture = HostFixture::start("rp35", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut conn = fixture.admission().await;
         let oversized = vec![b'x'; 64 * 1024 + 1];
         conn.write_bytes(&oversized).await;
@@ -937,10 +681,9 @@ async fn rp35_oversized_frame_without_delimiter_is_refused_at_the_bound() {
 #[tokio::test]
 async fn rp36_partial_frame_at_eof_is_not_empty_eof() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x1d, &ALL_SCOPES, json!("default_profile"), 7);
         let fixture = HostFixture::start("rp36", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut conn = fixture.admission().await;
         conn.write_bytes(b"{\"principal\":").await;
         conn.reader.get_mut().shutdown().await.unwrap();
@@ -954,10 +697,9 @@ async fn rp36_partial_frame_at_eof_is_not_empty_eof() {
 #[tokio::test]
 async fn rp37_empty_eof_writes_no_result() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x1e, &ALL_SCOPES, json!("default_profile"), 7);
         let fixture = HostFixture::start("rp37", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut conn = fixture.admission().await;
         conn.reader.get_mut().shutdown().await.unwrap();
         conn.expect_eof().await;
@@ -967,10 +709,10 @@ async fn rp37_empty_eof_writes_no_result() {
 #[tokio::test]
 async fn rp40_failing_stream_does_not_touch_healthy_routes() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x1f, &ALL_SCOPES, json!("default_profile"), 7);
+        let device_a = DeviceSpec::new();
         let fixture = HostFixture::start("rp40", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut local = fixture.local().await;
         assert_eq!(local.read_json().await["type"], "ready");
         let mut malformed = fixture.admission().await;
@@ -986,10 +728,9 @@ async fn rp40_failing_stream_does_not_touch_healthy_routes() {
 #[tokio::test]
 async fn rp41_newline_at_the_consumed_bound_is_oversized() {
     tokio::time::timeout(Duration::from_secs(120), async {
-        let device_a = DeviceSpec::new("dev-a", 0x2a, &ALL_SCOPES, json!("default_profile"), 7);
         let fixture = HostFixture::start("rp41", catalog("default", 2, vec![
             profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
-        ]), std::slice::from_ref(&device_a)).await;
+        ])).await;
         let mut conn = fixture.admission().await;
         let mut frame = vec![b'x'; 64 * 1024];
         frame.push(b'\n');
@@ -1000,6 +741,36 @@ async fn rp41_newline_at_the_consumed_bound_is_oversized() {
         assert_eq!(result["code"], "REMOTE_ADMISSION_MALFORMED");
         conn.expect_eof().await;
     }).await.expect("rp41 timed out");
+}
+
+/// BB13: the Host owns the one token comparison. A wrong token is refused with
+/// `REMOTE_TOKEN_INVALID`, receives no session and creates no session, while the
+/// configured token still admits the catalog default session.
+#[tokio::test]
+async fn bb13_wrong_token_is_refused_without_creating_a_session() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let fixture = HostFixture::start("bb13", catalog("default", 2, vec![
+            profile_entry("default", "Default", true, default_access("dev-a", &["dev-a"])),
+        ])).await;
+        let sessions_before = fixture.session_sockets();
+        assert_eq!(sessions_before, 1, "the catalog default session is the only session at startup");
+
+        let mut denied = fixture.admission().await;
+        denied.write_json(&DeviceSpec::wrong_token().admission(1)).await;
+        let refusal = denied.read_json().await;
+        assert_eq!(refusal["type"], "err", "a wrong token must be refused: {refusal}");
+        assert_eq!(refusal["code"], "REMOTE_TOKEN_INVALID");
+        assert_eq!(refusal["request_id"], 1);
+        assert!(refusal.get("session_id").is_none(), "a refusal must not carry a session: {refusal}");
+        assert!(refusal.get("reservation_id").is_none(), "a refusal must not carry a reservation: {refusal}");
+        denied.expect_eof().await;
+        assert_eq!(fixture.session_sockets(), sessions_before, "a refused admission must not create a session");
+
+        // The configured token still admits the catalog default session.
+        let (_, admitted, ready) = admit_ok(&fixture, &DeviceSpec::new(), 2).await;
+        assert_eq!(admitted["session_id"], ready["session_id"]);
+        assert_eq!(fixture.session_sockets(), sessions_before, "admitting the default session must not create a second one");
+    }).await.expect("bb13 timed out");
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,7 +807,7 @@ async fn wait_path(path: &Path) {
 }
 
 async fn endpoint_control_outcome(name: &str, reply: Option<Value>) -> ControlOutcome {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
     let root = tmp_root(name);
     let host_dir = root.join("host");
     std::fs::create_dir_all(&host_dir).unwrap();
@@ -1049,28 +820,10 @@ async fn endpoint_control_outcome(name: &str, reply: Option<Value>) -> ControlOu
     let server_key = rcgen::KeyPair::generate().unwrap();
     let server = rcgen::CertificateParams::new(vec!["localhost".into(), "127.0.0.1".into()]).unwrap()
         .signed_by(&server_key, &ca, &ca_key).unwrap();
-    let client_key = rcgen::KeyPair::generate().unwrap();
-    let mut client_params = rcgen::CertificateParams::new(vec![]).unwrap();
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client = client_params.signed_by(&client_key, &ca, &ca_key).unwrap();
     std::fs::write(root.join("server.der"), server.der()).unwrap();
     std::fs::write(root.join("server.key"), server_key.serialize_der()).unwrap();
     std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::write(root.join("ca.der"), ca.der()).unwrap();
-
-    let projection = json!({
-        "schema_version": 2,
-        "authorization_revision": 7,
-        "registry_sha256": sha256_hex(b"endpoint-test-registry-material"),
-        "clients": [{
-            "device_id": "dev-e",
-            "client_certificate_sha256": sha256_hex(&client.der().to_vec()),
-            "scopes": ALL_SCOPES,
-            "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 7},
-        }],
-    });
-    let authorized = root.join("authorized-clients.json");
-    std::fs::write(&authorized, serde_json::to_vec_pretty(&projection).unwrap()).unwrap();
 
     let admission_listener = tokio::net::UnixListener::bind(host_dir.join("remote-admission.sock")).unwrap();
     let fake = tokio::spawn(async move {
@@ -1105,8 +858,6 @@ async fn endpoint_control_outcome(name: &str, reply: Option<Value>) -> ControlOu
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der"))
         .arg("--server-key").arg(root.join("server.key"))
-        .arg("--client-ca").arg(root.join("ca.der"))
-        .arg("--authorized-clients").arg(&authorized)
         .arg("--media-bin").arg(&media_bin)
         .stdout(Stdio::null()).stderr(Stdio::inherit())
         .kill_on_drop(true)
@@ -1115,16 +866,14 @@ async fn endpoint_control_outcome(name: &str, reply: Option<Value>) -> ControlOu
     wait_path(&root.join("endpoint")).await;
 
     let mut roots = rustls::RootCertStore::empty();
-    roots.add(CertificateDer::from(ca.der().to_vec())).unwrap();
+    roots.add(rustls::pki_types::CertificateDer::from(ca.der().to_vec())).unwrap();
     let client_config = rustls::ClientConfig::builder().with_root_certificates(roots)
-        .with_client_auth_cert(
-            vec![CertificateDer::from(client.der().to_vec())],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der())),
-        )
-        .unwrap();
+        .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
     let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tokio::net::TcpStream::connect(address).await.unwrap()).await.unwrap();
-    let (mut ws, _) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await.unwrap();
+    let mut request = format!("wss://localhost:{}/control", address.port()).into_client_request().unwrap();
+    request.headers_mut().insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
+    let (mut ws, _) = client_async(request, tls).await.unwrap();
     let outcome = match tokio::time::timeout(Duration::from_secs(30), ws.next()).await {
         Ok(Some(Ok(Message::Text(text)))) => ControlOutcome::Message(serde_json::from_str(&text).unwrap()),
         Ok(Some(Ok(_))) => ControlOutcome::Failed,
@@ -1158,12 +907,12 @@ async fn rp42_endpoint_rejects_mismatched_request_id() {
         let outcome = endpoint_control_outcome("rp42", Some(json!({
             "type": "err",
             "request_id": 999,
-            "code": "REMOTE_PRINCIPAL_REVOKED",
+            "code": "REMOTE_SESSION_UNAVAILABLE",
             "message": "mismatched correlation",
         }))).await;
         assert!(!forwarded_ready(&outcome), "endpoint forwarded Ready for a mismatched request id: {outcome:?}");
         assert!(
-            !matches!(&outcome, ControlOutcome::Message(value) if value["code"] == "REMOTE_PRINCIPAL_REVOKED"),
+            !matches!(&outcome, ControlOutcome::Message(value) if value["code"] == "REMOTE_SESSION_UNAVAILABLE"),
             "endpoint must not relay a mismatched Some(id) refusal: {outcome:?}"
         );
     }).await.expect("rp42 timed out");
@@ -1175,12 +924,12 @@ async fn rp43_endpoint_rejects_illegal_none_code() {
         let outcome = endpoint_control_outcome("rp43", Some(json!({
             "type": "err",
             "request_id": null,
-            "code": "REMOTE_AUTH_REQUIRED",
+            "code": "REMOTE_SESSION_UNAVAILABLE",
             "message": "illegal uncorrelated refusal",
         }))).await;
         assert!(!forwarded_ready(&outcome), "endpoint forwarded Ready for an illegal None code: {outcome:?}");
         assert!(
-            !matches!(&outcome, ControlOutcome::Message(value) if value["code"] == "REMOTE_AUTH_REQUIRED"),
+            !matches!(&outcome, ControlOutcome::Message(value) if value["code"] == "REMOTE_SESSION_UNAVAILABLE"),
             "None must never become an EOF or another wire terminal: {outcome:?}"
         );
     }).await.expect("rp43 timed out");

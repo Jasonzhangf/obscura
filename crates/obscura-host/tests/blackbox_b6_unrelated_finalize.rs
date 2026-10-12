@@ -1,31 +1,31 @@
 #![cfg(unix)]
-//! B6 black-box regression: releasing one real exact session must not hold the
-//! endpoint's shared registry across that session's slow supervisor wait. Two
-//! real sessions run against one `obscura-endpoint`; while session A's adapter
-//! is slow to exit, a fresh authorized attachment to session B must still be
-//! served. The observable is external: the second attach response arrives while
-//! session A's adapter process is still alive, instead of only after A's
-//! supervisor wait releases the registry.
+//! B6 black-box regression: a fresh remote admission must not be serialized
+//! behind another session's slow finalize. Two real sessions run against one
+//! `obscura-endpoint`; peer H keeps the catalog default session bound, and peer
+//! A moves to the second profile so A's adapter is the one that finalizes
+//! slowly. While A's adapter is still alive, a fresh admission to the still
+//! bound default session must be served. The observable is external: the
+//! admission and attach responses arrive while A's adapter process is alive,
+//! instead of only after A's slow supervisor wait completes.
 //!
-//! Everything here is external to the endpoint: real mTLS/WSS control, the real
-//! per-session `--media-bin` adapter process under `--socket-dir`, and real
-//! process liveness. No private state, counters or source structure are
-//! asserted.
+//! Everything here is external to the endpoint: real TLS/WSS control with the
+//! one access token, the real per-session `--media-bin` adapter process under
+//! `--socket-dir`, and real process liveness. No private state, counters or
+//! source structure are asserted.
 
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio_rustls::rustls::{self, pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName}};
-use tokio_tungstenite::{client_async, tungstenite::Message};
+use tokio_rustls::rustls::{self, pki_types::ServerName};
+use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}};
 
 #[tokio::test]
-async fn slow_session_finalize_does_not_block_a_second_session() {
+async fn admission_is_not_serialized_behind_an_unrelated_finalize() {
     tokio::time::timeout(Duration::from_secs(180), exercise())
         .await
-        .expect("B6 public registry-lock case timed out")
-        .expect("B6 public registry-lock case failed");
+        .expect("B6 unrelated-finalize case timed out")
+        .expect("B6 unrelated-finalize case failed");
 }
 
 async fn exercise() -> anyhow::Result<()> {
@@ -42,28 +42,16 @@ async fn exercise() -> anyhow::Result<()> {
     let server_key = rcgen::KeyPair::generate()?;
     let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
         .signed_by(&server_key, &ca, &ca_key)?;
-    let client_a_key = rcgen::KeyPair::generate()?;
-    let client_b_key = rcgen::KeyPair::generate()?;
-    let mut client_params = rcgen::CertificateParams::new(vec![])?;
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client_a = client_params.clone().signed_by(&client_a_key, &ca, &ca_key)?;
-    let client_b = client_params.clone().signed_by(&client_b_key, &ca, &ca_key)?;
     std::fs::write(root.join("server.der"), server.der())?;
     std::fs::write(root.join("server.key"), server_key.serialize_der())?;
     std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(root.join("ca.der"), ca.der())?;
-    std::fs::write(root.join("client-a.der"), client_a.der())?;
-    std::fs::write(root.join("client-a.key"), client_a_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client-a.key"), std::fs::Permissions::from_mode(0o600))?;
-    std::fs::write(root.join("client-b.der"), client_b.der())?;
-    std::fs::write(root.join("client-b.key"), client_b_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client-b.key"), std::fs::Permissions::from_mode(0o600))?;
-    write_two_session_fixtures(&root, &client_a.der().to_vec(), &client_b.der().to_vec())?;
+    write_two_profile_catalog(&root)?;
 
     let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
-        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .arg("--access-token").arg(TOKEN)
         .stdout(Stdio::null()).stderr(std::fs::File::create(root.join("host.err"))?).kill_on_drop(true).spawn()?;
     wait_socket(root.join("host/host.sock")).await;
     let mut local = BufReader::new(tokio::net::UnixStream::connect(root.join("host/host.sock")).await?);
@@ -75,7 +63,7 @@ async fn exercise() -> anyhow::Result<()> {
     let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state),"command":{"type":"navigate","url":html}})).await?;
     // Materialize the second profile as its own exact session.
     let bound = local_request(&mut local, serde_json::json!({"id":4,"operation":identity(&state),"command":{"type":"profile_select","profile_id":"p1"}})).await?;
-    let session_b = bound["status"]["session_id"].as_str().expect("second session identity missing").to_string();
+    let session_p1 = bound["status"]["session_id"].as_str().expect("second session identity missing").to_string();
     drop(local);
 
     let reservation = std::net::TcpListener::bind((bind_ip, 0))?;
@@ -86,8 +74,8 @@ async fn exercise() -> anyhow::Result<()> {
     // to the `--video-socket` it is handed) and stays alive for five seconds
     // after SIGTERM, so session A's supervisor wait is observable from the
     // outside. The handler records the direct adapter pid and the observation
-    // marker only when the endpoint signals it; B's adapter never overwrites
-    // the file.
+    // marker only when the endpoint signals it; the default session's adapter
+    // never overwrites the file.
     let pid_file = root.join("a.pid");
     let marker = root.join("a-signalled");
     let media_bin = root.join("adapter.sh");
@@ -130,8 +118,6 @@ async fn exercise() -> anyhow::Result<()> {
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der"))
         .arg("--server-key").arg(root.join("server.key"))
-        .arg("--client-ca").arg(root.join("ca.der"))
-        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--media-bin").arg(&media_bin)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(root.join("endpoint.err"))?)
@@ -141,24 +127,18 @@ async fn exercise() -> anyhow::Result<()> {
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone())?;
-    let connector_a = tls_connector(&roots, &client_a, &client_a_key)?;
-    let connector_b = tls_connector(&roots, &client_b, &client_b_key)?;
+    let connector_a = tls_connector(&roots)?;
+    let connector_h = tls_connector(&roots)?;
+    let connector_b = tls_connector(&roots)?;
 
-    // Attach device A (default session) and device B (secondary session).
-    let (mut control_a, _token_a) = connect_control(&connector_a, address).await?;
-    let ready_a = next_json(&mut control_a).await?;
-    let session_a = ready_a["session_id"].as_str().expect("A session identity missing").to_string();
-    anyhow::ensure!(session_a != session_b, "the two profiles resolved to one session");
-    control_a.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
-    let attached_a = next_json(&mut control_a).await?;
-    anyhow::ensure!(attached_a["type"] == "result", "A attach failed: {attached_a}");
-
-    let (mut control_b, _token_b) = connect_control(&connector_b, address).await?;
-    let ready_b = next_json(&mut control_b).await?;
-    anyhow::ensure!(ready_b["session_id"].as_str() == Some(session_b.as_str()), "B Ready session changed: {ready_b}");
-    control_b.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
-    let attached_b = next_json(&mut control_b).await?;
-    anyhow::ensure!(attached_b["type"] == "result", "B attach failed: {attached_b}");
+    // The admission frame carries no profile selection, so every peer is
+    // admitted to the catalog default session. Peer H keeps that session bound
+    // for the whole case. Peer A moves to the second profile, so A's adapter is
+    // the one that finalizes slowly below.
+    let (mut control_h, _token_h, session_default) = connect_observe(&connector_h, address).await?;
+    let (mut control_a, _token_a, session_a) = connect_bound(&connector_a, address, "p1").await?;
+    anyhow::ensure!(session_a == session_p1, "A bound the wrong session: {session_a} != {session_p1}");
+    anyhow::ensure!(session_a != session_default, "the two profiles resolved to one session");
 
     let dir_a = root.join(format!("endpoint/m-{}", &session_a.replace("-", "")[..12]));
     anyhow::ensure!(wait_dir(&dir_a, Duration::from_secs(10)).await, "A session directory was never bound");
@@ -170,34 +150,29 @@ async fn exercise() -> anyhow::Result<()> {
     // Abruptly close A's control connection. The endpoint releases A's exact
     // session reference and finalizes A: it SIGTERMs the adapter, which traps
     // TERM, records its pid, touches the marker and then stays alive for five
-    // seconds. The marker proves A's slow supervisor wait is in progress,
-    // which pre-fix happens while the shared registry lock is held.
+    // seconds. The marker proves A's slow supervisor wait is in progress.
     drop(control_a);
     wait_file(&marker, Duration::from_secs(15)).await?;
     let pid_a: i32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
     anyhow::ensure!(process_alive(pid_a), "A's adapter was not alive when its supervisor wait began (pid {pid_a})");
 
-    // A fresh authorized attachment to the *other* session must be served while
-    // A is still finalizing. Pre-fix, the registry mutex is held across A's
-    // supervisor wait, so this only completes after A's adapter is reaped.
+    // A fresh admission to the *other*, still bound session must be served while
+    // A is finalizing: the default session is already bound by peer H, so this
+    // admission must not wait for A's supervisor wait to finish.
     let started = tokio::time::Instant::now();
-    let (mut retry_b, _retry_token) = connect_control(&connector_b, address).await?;
-    let retry_ready = next_json(&mut retry_b).await?;
-    anyhow::ensure!(retry_ready["session_id"].as_str() == Some(session_b.as_str()), "retry Ready session changed: {retry_ready}");
-    retry_b.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
-    let retry_attached = next_json(&mut retry_b).await?;
+    let (mut probe, _probe_token, probe_session) = connect_observe(&connector_b, address).await?;
     let elapsed = started.elapsed();
-    anyhow::ensure!(retry_attached["type"] == "result", "B retry attach failed: {retry_attached}");
+    anyhow::ensure!(probe_session == session_default, "the probe bound the wrong session: {probe_session}");
 
     let a_still_alive = process_alive(pid_a);
-    eprintln!("B6: second-session attach completed in {elapsed:?}; A adapter alive={a_still_alive} pid={pid_a}");
+    eprintln!("B6: unrelated-session admission completed in {elapsed:?}; A adapter alive={a_still_alive} pid={pid_a}");
     anyhow::ensure!(elapsed < Duration::from_secs(2),
-        "the second session was served only after session A's slow supervisor wait released the registry ({elapsed:?})");
+        "the unrelated session was served only after session A's slow supervisor wait finished ({elapsed:?})");
     anyhow::ensure!(a_still_alive,
-        "the second session was only served after session A's slow supervisor wait released the registry");
+        "the unrelated session was served only after session A's adapter was reaped");
 
-    let _ = &mut control_b;
-    let _ = &mut retry_b;
+    let _ = &mut control_h;
+    let _ = &mut probe;
     graceful_stop(&mut endpoint).await;
     let _ = host.kill().await;
     let _ = host.wait().await;
@@ -205,17 +180,10 @@ async fn exercise() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn tls_connector(
-    roots: &rustls::RootCertStore,
-    cert: &rcgen::Certificate,
-    key: &rcgen::KeyPair,
-) -> anyhow::Result<tokio_rustls::TlsConnector> {
+fn tls_connector(roots: &rustls::RootCertStore) -> anyhow::Result<tokio_rustls::TlsConnector> {
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots.clone())
-        .with_client_auth_cert(
-            vec![rustls::pki_types::CertificateDer::from(cert.der().to_vec())],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-        )?;
+        .with_no_client_auth();
     Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
 }
 
@@ -224,7 +192,9 @@ async fn connect_control(
     address: std::net::SocketAddr,
 ) -> anyhow::Result<(tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String)> {
     let tls = connector.connect(ServerName::try_from("localhost")?, tokio::net::TcpStream::connect(address).await?).await?;
-    let (control, response) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await?;
+    let mut request = format!("wss://localhost:{}/control", address.port()).into_client_request()?;
+    request.headers_mut().insert("authorization", format!("Bearer {TOKEN}").parse()?);
+    let (control, response) = client_async(request, tls).await?;
     let token = response.headers()["x-obscura-media-token"].to_str()?.to_string();
     Ok((control, token))
 }
@@ -234,6 +204,46 @@ async fn next_json(
 ) -> anyhow::Result<serde_json::Value> {
     let message = control.next().await.ok_or_else(|| anyhow::anyhow!("control socket closed"))??;
     Ok(serde_json::from_str(&message.into_text()?)?)
+}
+
+/// Admit one peer and attach it as an observer of its admitted session.
+async fn connect_observe(
+    connector: &tokio_rustls::TlsConnector,
+    address: std::net::SocketAddr,
+) -> anyhow::Result<(tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String, String)> {
+    let (mut control, token) = connect_control(connector, address).await?;
+    let ready = next_json(&mut control).await?;
+    anyhow::ensure!(ready["type"] == "ready", "admission did not publish Ready: {ready}");
+    control.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
+    let attached = next_json(&mut control).await?;
+    anyhow::ensure!(attached["type"] == "result", "attach failed: {attached}");
+    let session_id = attached["value"]["session_id"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("attach returned no session identity: {attached}"))?.to_string();
+    Ok((control, token, session_id))
+}
+
+/// Admit one peer, attach it as an observer, then bind it to `profile_id` with
+/// an operation identity for its own attachment. Returns the bound session.
+async fn connect_bound(
+    connector: &tokio_rustls::TlsConnector,
+    address: std::net::SocketAddr,
+    profile_id: &str,
+) -> anyhow::Result<(tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String, String)> {
+    let (mut control, token) = connect_control(connector, address).await?;
+    let ready = next_json(&mut control).await?;
+    anyhow::ensure!(ready["type"] == "ready", "admission did not publish Ready: {ready}");
+    control.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
+    let attached = next_json(&mut control).await?;
+    anyhow::ensure!(attached["type"] == "result", "attach failed: {attached}");
+    let operation = identity(&attached["value"]);
+    let request = serde_json::json!({"id":2,"operation":operation,
+        "command":{"type":"profile_select","profile_id":profile_id}});
+    control.send(Message::text(request.to_string())).await?;
+    let selected = next_json(&mut control).await?;
+    anyhow::ensure!(selected["type"] == "result", "profile_select failed: {selected}");
+    let session_id = selected["value"]["binding"]["session_id"].as_str()
+        .ok_or_else(|| anyhow::anyhow!("profile_select returned no session binding: {selected}"))?.to_string();
+    Ok((control, token, session_id))
 }
 
 async fn wait_socket(path: PathBuf) {
@@ -297,68 +307,17 @@ async fn local_request(socket: &mut BufReader<tokio::net::UnixStream>, request: 
     Ok(reply["value"].clone())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
+/// The one access token this test configures on the Host.
+const TOKEN: &str = "b6-access-token";
 
-fn write_two_session_fixtures(root: &std::path::Path, client_a: &[u8], client_b: &[u8]) -> anyhow::Result<()> {
-    let fingerprint_a = hex(&Sha256::digest(client_a));
-    let fingerprint_b = hex(&Sha256::digest(client_b));
-    let scopes = serde_json::json!(["observe_human_control", "profile_read", "profile_create", "profile_select"]);
-    let registry = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "host_id": "host-b6",
-        "devices": [
-            {
-                "device_id": "device-a", "device_label": "session a",
-                "client_certificate_sha256": fingerprint_a, "scopes": scopes,
-                "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 1},
-                "scope_revision": 1, "status": "active",
-                "not_before_unix": 0, "not_after_unix": 4102444800i64,
-                "created_at_unix": 0, "revoked_at_unix": null
-            },
-            {
-                "device_id": "device-b", "device_label": "session b",
-                "client_certificate_sha256": fingerprint_b, "scopes": scopes,
-                "initial_profile_grant": {"selection": {"profile_id": "p1"}, "authorization_revision": 1},
-                "scope_revision": 1, "status": "active",
-                "not_before_unix": 0, "not_after_unix": 4102444800i64,
-                "created_at_unix": 0, "revoked_at_unix": null
-            }
-        ]
-    });
-    std::fs::write(root.join("registry.json"), serde_json::to_vec(&registry)?)?;
-    let projection = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "registry_sha256": "dd".repeat(32),
-        "clients": [
-            {
-                "device_id": "device-a", "client_certificate_sha256": fingerprint_a, "scopes": scopes,
-                "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 1}
-            },
-            {
-                "device_id": "device-b", "client_certificate_sha256": fingerprint_b, "scopes": scopes,
-                "initial_profile_grant": {"selection": {"profile_id": "p1"}, "authorization_revision": 1}
-            }
-        ]
-    });
-    std::fs::write(root.join("authorized-clients.json"), serde_json::to_vec(&projection)?)?;
-    let members = serde_json::json!(["local", "device-a", "device-b"]);
+/// Two profiles, so each peer can resolve to its own exact session. The
+/// catalog carries no membership and no access record.
+fn write_two_profile_catalog(root: &std::path::Path) -> anyhow::Result<()> {
     let catalog = serde_json::json!({
         "catalog_revision": 2,
         "profiles": [
-            {"profile_id": "default", "display_name": "Default", "default": true,
-             "access": {"owner_device_id": "local", "members": members}},
-            {"profile_id": "p1", "display_name": "Secondary", "default": false,
-             "access": {"owner_device_id": "local", "members": members}}
+            {"profile_id": "default", "display_name": "Default", "default": true},
+            {"profile_id": "p1", "display_name": "Secondary", "default": false}
         ],
         "default_profile_id": "default",
         "next_id": 2

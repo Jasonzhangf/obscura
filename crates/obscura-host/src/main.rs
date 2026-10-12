@@ -5,8 +5,6 @@ mod daemon;
 #[cfg(unix)]
 mod remote_admission;
 #[cfg(unix)]
-mod remote_authorization;
-#[cfg(unix)]
 mod worker;
 #[cfg(unix)]
 mod media;
@@ -23,10 +21,11 @@ struct Args {
     /// child directory. When omitted the Host runs a single in-memory profile.
     #[arg(long)]
     profile_root: Option<std::path::PathBuf>,
-    /// Explicit typed authorization registry. Required for remote admission.
-    /// The path is configuration truth, never discovered from payload or logs.
+    /// The one access token for remote connections. The Host compares the
+    /// `Authorization: Bearer` value the endpoint forwards. When unset, every
+    /// remote admission is refused with REMOTE_TOKEN_INVALID.
     #[arg(long)]
-    authorization_registry: Option<std::path::PathBuf>,
+    access_token: Option<String>,
     #[arg(long)]
     allow_private_network: bool,
 }
@@ -38,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     daemon::serve(
         args.socket_dir,
         args.profile_root,
-        args.authorization_registry,
+        args.access_token,
         args.allow_private_network,
     )
     .await

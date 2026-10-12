@@ -7,12 +7,12 @@ use obscura_media::webrtc_endpoint::{BrowserResponseDispatch, WebRtcBrowserRespo
 use tokio::{io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader}, net::UnixStream, sync::{mpsc, watch}};
 use tokio_tungstenite::{WebSocketStream, tungstenite::Message};
 
-use crate::remote_admission::{self, InitialProfileGrant, RemoteAdmissionErrorCode, RemoteAdmissionRequest, RemoteAdmissionResult, RemotePrincipalContext};
+use crate::remote_admission::{self, RemoteAdmissionErrorCode, RemoteAdmissionRequest, RemoteAdmissionResult};
 use super::server::{AcquireError, SessionDurable, SessionGrant};
 
 pub type Socket = WebSocketStream<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>;
 
-/// Exact admitted media subscription state for one mTLS control attachment.
+/// Exact admitted media subscription state for one control attachment.
 /// Authority is only set after the Host confirms the final `Attach`/rebind; a
 /// reservation or endpoint handshake alone never grants media rights.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,8 +38,7 @@ pub async fn control(
     host_dir: &Path,
     active: watch::Sender<MediaState>,
     grant: SessionGrant,
-    principal: RemotePrincipalContext,
-    initial: InitialProfileGrant,
+    token: String,
     enable_webrtc: bool,
     webrtc_bind: Option<SocketAddr>,
 ) -> Result<()> {
@@ -49,7 +48,7 @@ pub async fn control(
     let local = UnixStream::connect(&admission_path).await.context("Connect Host remote admission")?;
     let (read, mut write) = local.into_split(); let mut reader = BufReader::new(read);
     let request_id = 1u64;
-    let request = RemoteAdmissionRequest { principal, initial, request_id };
+    let request = RemoteAdmissionRequest { token, request_id };
     remote_admission::write_remote_admission_request(&mut write, &request).await?;
     let Some(result) = remote_admission::read_remote_admission_result(&mut reader).await? else {
         bail!("Host closed the remote admission stream before a result");
@@ -168,17 +167,8 @@ pub async fn control(
                     }
                 };
                 let request_id = request.id;
-                let result = forward_remote_request(&mut write, &mut reader, request).await?;
-                let terminal_denial = is_terminal_authorization_denial(&result, request_id);
+                let result = host_request(&mut write, &mut reader, request).await?;
                 let detached = response_ends_media(&active.borrow(), &result);
-                // A correlated authorization denial is terminal for this
-                // attachment even though it is not a Status/ProfileSelected
-                // result. Commit the attachment-local media fence before any
-                // cleanup await so the old /media grant cannot keep streaming
-                // while release_binding waits on the session supervisor.
-                if terminal_denial {
-                    fence_media_state(&active);
-                }
                 // Publish the new exact media binding and forward the response
                 // only after it. The media admission path never blocks on the
                 // adapter connection or a first frame, so the consumer cannot
@@ -202,12 +192,6 @@ pub async fn control(
                     }
                 }
                 send(&mut remote, Message::text(serde_json::to_string(&result)?)).await?;
-                if terminal_denial {
-                    release_binding(&grant, &mut binding).await;
-                    fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
-                        &mut browser_responses, &mut terminal_pending);
-                    break;
-                }
                 if detached {
                     fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
                         &mut browser_responses, &mut terminal_pending);
@@ -226,10 +210,9 @@ pub async fn control(
                     continue;
                 };
                 let request_id = request.id;
-                let result = forward_remote_request(&mut write, &mut reader, request).await?;
-                let terminal_denial = is_terminal_authorization_denial(&result, request_id);
+                let result = host_request(&mut write, &mut reader, request).await?;
                 let admitted = active.borrow().clone();
-                let mut terminal = terminal_response(&admitted, &result, request_id);
+                let mut terminal = response_ends_media(&admitted, &result);
                 // Commit the terminal disposition and the reserved terminal
                 // dispatch BEFORE the media fence, so closing the filtered frame
                 // watch cannot end `run_inner` before the correlated response is
@@ -239,28 +222,21 @@ pub async fn control(
                     let _ = terminal_pending.as_ref().context("WebRTC terminal-pending sender unavailable")?
                         .send(true);
                 }
-                if terminal_denial {
-                    fence_media_state(&active);
-                }
                 let detached = update_media_state(&active, &result);
                 // Resolve the exact media binding before publishing the Host
                 // result. A retained finalization failure is an explicit
                 // attachment terminal: the client must not receive the
                 // published ProfileSelected success for a session whose media
-                // binding could not be acquired. A terminal authorization
-                // denial is fenced separately and must still receive its
-                // correlated response before attachment cleanup.
+                // binding could not be acquired.
                 let mut response = result.clone();
                 let mut finalization_terminal = false;
-                if !terminal_denial {
-                    if let Err(error) = reconcile_binding(&grant, &active, &mut binding).await {
-                        match error {
-                            AcquireError::FinalizationFailed(failure) => {
-                                response = media_binding_failure(request_id, &failure);
-                                finalization_terminal = true;
-                            }
-                            AcquireError::Acquire(error) => eprintln!("media binding acquire failed: {error:#}"),
+                if let Err(error) = reconcile_binding(&grant, &active, &mut binding).await {
+                    match error {
+                        AcquireError::FinalizationFailed(failure) => {
+                            response = media_binding_failure(request_id, &failure);
+                            finalization_terminal = true;
                         }
+                        AcquireError::Acquire(error) => eprintln!("media binding acquire failed: {error:#}"),
                     }
                 }
                 if finalization_terminal {
@@ -285,12 +261,6 @@ pub async fn control(
                 } else {
                     response_tx.send(BrowserResponseDispatch::Ordinary(response)).await
                         .context("WebRTC browser response receiver ended")?;
-                }
-                if terminal_denial {
-                    release_binding(&grant, &mut binding).await;
-                    fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
-                        &mut browser_responses, &mut terminal_pending);
-                    continue;
                 }
                 if terminal || detached {
                     fence_without_terminal(&mut webrtc_task, &mut webrtc_filter, &mut browser_requests,
@@ -415,28 +385,6 @@ fn exact_session_stream(
     task
 }
 
-/// Forward a raw browser request over the already-admitted stream. The endpoint
-/// no longer substitutes a bare command allowlist for Host scope/access
-/// checks; only the local-only maintenance drain stays endpoint-refused.
-async fn forward_remote_request(
-    write: &mut tokio::net::unix::OwnedWriteHalf,
-    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
-    request: Request,
-) -> Result<Response> {
-    if matches!(request.command, Command::FlushProfiles {}) {
-        return Ok(remote_command_error(request.id));
-    }
-    host_request(write, reader, request).await
-}
-
-fn remote_command_error(id: u64) -> Response {
-    Response::Error {
-        id,
-        code: "REMOTE_COMMAND_FORBIDDEN".into(),
-        message: "FlushProfiles is a Host-local maintenance command".into(),
-    }
-}
-
 /// Acquire the exact-session media reference for a new binding and release the
 /// previous one. The control attach path never blocks on an adapter connection
 /// or a first frame; `acquire` only binds resources and returns the encoded
@@ -513,18 +461,6 @@ fn fence_without_terminal(
     *terminal_pending = None;
 }
 
-/// True only for the frozen typed resident authorization denials. Other
-/// errors, navigation results and log text never trigger the transition.
-fn is_terminal_authorization_denial(response: &Response, request_id: u64) -> bool {
-    matches!(
-        response,
-        Response::Error { id, code, .. }
-            if *id == request_id
-                && (code == RemoteAdmissionErrorCode::RemoteAuthRequired.as_str()
-                    || code == RemoteAdmissionErrorCode::RemotePrincipalRevoked.as_str())
-    )
-}
-
 fn update_media_state(
     active: &watch::Sender<MediaState>,
     result: &Response,
@@ -580,15 +516,6 @@ fn response_ends_media(admitted: &MediaState, result: &Response) -> bool {
         _ => return false,
     };
     attachment_id.is_none() || admitted.session_id.as_deref() != session_id
-}
-
-/// The single terminal-response decision shared by the WSS and DataChannel
-/// browser-request paths. A response is terminal for this attachment when the
-/// Host either denied the resident principal (`REMOTE_AUTH_REQUIRED` /
-/// `REMOTE_PRINCIPAL_REVOKED`) or reported that the attachment ended, detached
-/// or moved to a different session.
-fn terminal_response(admitted: &MediaState, result: &Response, request_id: u64) -> bool {
-    is_terminal_authorization_denial(result, request_id) || response_ends_media(admitted, result)
 }
 
 async fn host_request(
@@ -781,44 +708,6 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
     use tokio_rustls::rustls;
-
-    /// B1: a correlated `REMOTE_PRINCIPAL_REVOKED` / `REMOTE_AUTH_REQUIRED`
-    /// denial is terminal for the attachment's media. `terminal_response`,
-    /// the one decision both request paths use, must classify the denial as
-    /// terminal even though it is not a `Status`/`ProfileSelected` result, and
-    /// the fence must invalidate existing and new `/media` grants.
-    #[test]
-    fn correlated_authorization_denial_fences_attachment_media() {
-        let (active, receiver) = watch::channel(MediaState {
-            attached: true,
-            session_id: Some("shared-session".into()),
-            generation: 4,
-        });
-        let admitted = active.borrow().clone();
-        let denied = Response::Error {
-            id: 200,
-            code: RemoteAdmissionErrorCode::RemotePrincipalRevoked.as_str().to_string(),
-            message: "Remote device is revoked".into(),
-        };
-        assert!(!response_ends_media(&active.borrow(), &denied),
-            "an authorization denial is not a Status/ProfileSelected result and must be fenced explicitly");
-        assert!(terminal_response(&admitted, &denied, 200),
-            "the shared terminal decision must treat a correlated denial as terminal");
-        assert!(!terminal_response(&admitted, &denied, 201),
-            "a denial for a different request id must not be treated as terminal");
-        fence_media_state(&active);
-        let fenced = receiver.borrow().clone();
-        assert!(!fenced.attached, "a terminal denial must clear the attachment-local media admission");
-        assert_eq!(fenced.session_id, None, "a terminal denial must drop the admitted session identity");
-        assert_eq!(fenced.generation, 5, "a terminal denial must bump the generation so existing /media streams wake");
-        let auth_required = Response::Error {
-            id: 5,
-            code: RemoteAdmissionErrorCode::RemoteAuthRequired.as_str().to_string(),
-            message: "Remote device is not registered".into(),
-        };
-        assert!(terminal_response(&admitted, &auth_required, 5),
-            "REMOTE_AUTH_REQUIRED must also be media-terminal for the denied attachment");
-    }
 
     #[tokio::test]
     async fn terminal_encoder_unavailable_closes_fanout_watch() {

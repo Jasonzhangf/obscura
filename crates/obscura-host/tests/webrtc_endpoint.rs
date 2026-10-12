@@ -5,8 +5,9 @@ use std::{path::PathBuf, time::Duration};
 use std::process::Stdio;
 
 use tokio::{io::{AsyncBufReadExt, AsyncWriteExt, BufReader}, net::TcpListener, process::Command};
-use sha2::{Digest, Sha256};
-use tokio_rustls::rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer}};
+
+/// The one access token the Host, the endpoint and the receiver share.
+const TOKEN: &str = "webrtc-endpoint-token";
 
 #[tokio::test]
 async fn real_receiver_gets_continuous_host_media_and_rejects_stale_binding() {
@@ -146,11 +147,11 @@ async fn final_failure_fixture_retains_pid_record_when_termination_unverified() 
     let _ = std::fs::remove_file(&sink);
 }
 
-/// Two authorized receivers bound to two distinct Host profiles run at the same
-/// time. Each exact session owns its own adapter and encoded socket, so every
-/// frame a receiver decodes must carry its own session identity.
+/// Two token-authenticated receivers run at the same time on the one catalog
+/// default session. Each owns its own media transport, so every frame a receiver
+/// decodes must carry the session it bound and neither may lose frames.
 #[tokio::test]
-async fn two_concurrent_authorized_receivers_keep_distinct_sessions() {
+async fn two_concurrent_receivers_on_one_session_keep_distinct_streams() {
     tokio::time::timeout(Duration::from_secs(240), run_two_session_isolation())
         .await.expect("two-session isolation lifecycle timed out").unwrap();
 }
@@ -178,23 +179,16 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
     let server_key = rcgen::KeyPair::generate()?;
     let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
         .signed_by(&server_key, &ca, &ca_key)?;
-    let client_key = rcgen::KeyPair::generate()?;
-    let mut client_params = rcgen::CertificateParams::new(vec![])?;
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client = client_params.signed_by(&client_key, &ca, &ca_key)?;
     std::fs::write(root.join("server.der"), server.der())?;
     std::fs::write(root.join("server.key"), server_key.serialize_der())?;
     std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(root.join("ca.der"), ca.der())?;
-    std::fs::write(root.join("client.der"), client.der())?;
-    std::fs::write(root.join("client.key"), client_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
-    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"), root.join("profiles"), &client.der().to_vec())?;
+    write_catalog(root.join("profiles"))?;
 
     let host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
-        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .arg("--access-token").arg(TOKEN)
         .stdout(std::fs::File::create(raw_root.join("host.stdout"))?)
         .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
         .kill_on_drop(true).spawn()?;
@@ -221,8 +215,7 @@ async fn exercise(encoder_failure: bool) -> anyhow::Result<()> {
         .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
-        .arg("--client-ca").arg(root.join("ca.der")).arg("--media-bin").arg(&media_bin)
-        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
+        .arg("--media-bin").arg(&media_bin)
         .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
     endpoint_command
         .stdout(std::fs::File::create(raw_root.join("endpoint.stdout"))?)
@@ -375,23 +368,16 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
     let server_key = rcgen::KeyPair::generate()?;
     let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
         .signed_by(&server_key, &ca, &ca_key)?;
-    let client_key = rcgen::KeyPair::generate()?;
-    let mut client_params = rcgen::CertificateParams::new(vec![])?;
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client = client_params.signed_by(&client_key, &ca, &ca_key)?;
     std::fs::write(root.join("server.der"), server.der())?;
     std::fs::write(root.join("server.key"), server_key.serialize_der())?;
     std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(root.join("ca.der"), ca.der())?;
-    std::fs::write(root.join("client.der"), client.der())?;
-    std::fs::write(root.join("client.key"), client_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
-    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"), root.join("profiles"), &client.der().to_vec())?;
+    write_catalog(root.join("profiles"))?;
 
-    let mut host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+    let host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
-        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .arg("--access-token").arg(TOKEN)
         .stdout(std::fs::File::create(raw_root.join("host.stdout"))?)
         .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
         .kill_on_drop(true).spawn()?;
@@ -417,11 +403,9 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
         .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
-        .arg("--client-ca").arg(root.join("ca.der"))
         // The test itself owns the shared-encoded-frame producer on `encoded.sock`;
         // a no-op `--media-bin` leaves the socket to the scripted producer.
         .arg("--media-bin").arg("/usr/bin/true")
-        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
     endpoint_command
         .stdout(std::fs::File::create(raw_root.join("endpoint.stdout"))?)
@@ -432,7 +416,7 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
 
     let mut receiver_command = Command::new(&receiver_bin);
     receiver_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
-        .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
+        .arg("--token").arg(TOKEN)
         .arg("--frames").arg("3").arg("--skip-click")
         .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     let receiver = receiver_command.spawn()?;
@@ -541,23 +525,16 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
     let server_key = rcgen::KeyPair::generate()?;
     let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
         .signed_by(&server_key, &ca, &ca_key)?;
-    let client_key = rcgen::KeyPair::generate()?;
-    let mut client_params = rcgen::CertificateParams::new(vec![])?;
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client = client_params.signed_by(&client_key, &ca, &ca_key)?;
     std::fs::write(root.join("server.der"), server.der())?;
     std::fs::write(root.join("server.key"), server_key.serialize_der())?;
     std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(root.join("ca.der"), ca.der())?;
-    std::fs::write(root.join("client.der"), client.der())?;
-    std::fs::write(root.join("client.key"), client_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
-    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"), root.join("profiles"), &client.der().to_vec())?;
+    write_catalog(root.join("profiles"))?;
 
-    let mut host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+    let host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
-        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .arg("--access-token").arg(TOKEN)
         .stdout(std::fs::File::create(raw_root.join("host.stdout"))?)
         .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
         .kill_on_drop(true).spawn()?;
@@ -583,10 +560,8 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
         .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
-        .arg("--client-ca").arg(root.join("ca.der"))
         // The test owns the shared-encoded-frame producer on `encoded.sock`.
         .arg("--media-bin").arg("/usr/bin/true")
-        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
     endpoint_command
         .stdout(std::fs::File::create(raw_root.join("endpoint.stdout"))?)
@@ -605,7 +580,7 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
     let ready_file = root.join("ready.json");
     let mut receiver_command = Command::new(&receiver_bin);
     receiver_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
-        .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
+        .arg("--token").arg(TOKEN)
         .arg("--frames").arg("3").arg("--skip-click")
         .arg("--terminal-trigger").arg(trigger).arg("--terminal-transport").arg(transport)
         .arg("--ready-file").arg(&ready_file)
@@ -684,7 +659,7 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
         wait_absent(&session_socket, Duration::from_secs(15)).await?;
         let mut fresh_command = Command::new(&receiver_bin);
         fresh_command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
-            .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
+            .arg("--token").arg(TOKEN)
             .arg("--frames").arg("3").arg("--skip-click")
             .stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         let fresh = fresh_command.spawn()?;
@@ -726,9 +701,10 @@ async fn run_terminal_lifecycle(mode: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Drive two concurrent authorized receivers, each paired with a distinct Host
-/// profile. Both exact sessions own their own adapter and encoded socket, so
-/// every frame a receiver decodes must carry its own session identity.
+/// Drive two concurrent token-authenticated receivers on the one catalog default
+/// session, while a second profile session is materialized beside it. Each
+/// receiver owns its own media transport, so every frame a receiver decodes must
+/// carry the session it bound and no receiver may lose frames to the other.
 async fn run_two_session_isolation() -> anyhow::Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let root = PathBuf::from("/tmp").join(format!("ow-two-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
@@ -750,29 +726,16 @@ async fn run_two_session_isolation() -> anyhow::Result<()> {
     let server_key = rcgen::KeyPair::generate()?;
     let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
         .signed_by(&server_key, &ca, &ca_key)?;
-    let client_a_key = rcgen::KeyPair::generate()?;
-    let client_b_key = rcgen::KeyPair::generate()?;
-    let mut client_params = rcgen::CertificateParams::new(vec![])?;
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client_a = client_params.clone().signed_by(&client_a_key, &ca, &ca_key)?;
-    let client_b = client_params.clone().signed_by(&client_b_key, &ca, &ca_key)?;
     std::fs::write(root.join("server.der"), server.der())?;
     std::fs::write(root.join("server.key"), server_key.serialize_der())?;
     std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(root.join("ca.der"), ca.der())?;
-    std::fs::write(root.join("client-a.der"), client_a.der())?;
-    std::fs::write(root.join("client-a.key"), client_a_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client-a.key"), std::fs::Permissions::from_mode(0o600))?;
-    std::fs::write(root.join("client-b.der"), client_b.der())?;
-    std::fs::write(root.join("client-b.key"), client_b_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client-b.key"), std::fs::Permissions::from_mode(0o600))?;
-    write_authorized_two(root.join("registry.json"), root.join("authorized-clients.json"),
-        root.join("profiles"), &client_a.der().to_vec(), &client_b.der().to_vec())?;
+    write_catalog(root.join("profiles"))?;
 
-    let mut host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+    let host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
-        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .arg("--access-token").arg(TOKEN)
         .stdout(std::fs::File::create(raw_root.join("host.stdout"))?)
         .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
         .kill_on_drop(true).spawn()?;
@@ -805,9 +768,7 @@ async fn run_two_session_isolation() -> anyhow::Result<()> {
         .arg("--listen").arg(address.to_string()).arg("--host-dir").arg(root.join("host"))
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der")).arg("--server-key").arg(root.join("server.key"))
-        .arg("--client-ca").arg(root.join("ca.der"))
         .arg("--media-bin").arg(&media_bin)
-        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip);
     endpoint_command
         .stdout(std::fs::File::create(raw_root.join("endpoint.stdout"))?)
@@ -817,15 +778,19 @@ async fn run_two_session_isolation() -> anyhow::Result<()> {
     wait_socket(root.join("endpoint")).await;
 
     let (report_a, report_b) = tokio::try_join!(
-        run_receiver_cert(&receiver_bin, address, &root, &raw_root, "profile-a", "client-a"),
-        run_receiver_cert(&receiver_bin, address, &root, &raw_root, "profile-b", "client-b"),
+        run_receiver_phase(&receiver_bin, address, &root, &raw_root, "receiver-a"),
+        run_receiver_phase(&receiver_bin, address, &root, &raw_root, "receiver-b"),
     )?;
     anyhow::ensure!(report_a["pass"] == true && report_b["pass"] == true,
         "concurrent receivers did not both pass: a={report_a} b={report_b}");
     let session_a = report_a["session_id"].as_str().unwrap_or("");
     let session_b = report_b["session_id"].as_str().unwrap_or("");
-    anyhow::ensure!(!session_a.is_empty() && !session_b.is_empty() && session_a != session_b,
-        "concurrent receivers did not bind distinct sessions: a={session_a} b={session_b}");
+    // Both peers present the one access token, so both bind the catalog default
+    // session; the second profile session is materialized beside it.
+    anyhow::ensure!(session_a == default_session && session_b == default_session,
+        "concurrent receivers did not bind the catalog default session: a={session_a} b={session_b} default={default_session}");
+    anyhow::ensure!(session_a != secondary_session,
+        "a receiver bound the secondary profile session without selecting it: {session_a}");
     for (label, report, expected) in [("a", &report_a, session_a), ("b", &report_b, session_b)] {
         let frames = report["frames"].as_array().ok_or_else(|| anyhow::anyhow!("receiver {label} frame evidence missing: {report}"))?;
         anyhow::ensure!(frames.len() >= 3, "receiver {label} decoded fewer than three frames: {report}");
@@ -876,24 +841,16 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
     let server_key = rcgen::KeyPair::generate()?;
     let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
         .signed_by(&server_key, &ca, &ca_key)?;
-    let client_key = rcgen::KeyPair::generate()?;
-    let mut client_params = rcgen::CertificateParams::new(vec![])?;
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client = client_params.signed_by(&client_key, &ca, &ca_key)?;
     std::fs::write(root.join("server.der"), server.der())?;
     std::fs::write(root.join("server.key"), server_key.serialize_der())?;
     std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(root.join("ca.der"), ca.der())?;
-    std::fs::write(root.join("client.der"), client.der())?;
-    std::fs::write(root.join("client.key"), client_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
-    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"),
-        root.join("profiles"), &client.der().to_vec())?;
+    write_catalog(root.join("profiles"))?;
 
-    let mut host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+    let host = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
-        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .arg("--access-token").arg(TOKEN)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(raw_root.join("host.stderr"))?)
         .kill_on_drop(true).spawn()?;
@@ -997,9 +954,7 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der"))
         .arg("--server-key").arg(root.join("server.key"))
-        .arg("--client-ca").arg(root.join("ca.der"))
         .arg("--media-bin").arg(&adapter)
-        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--enable-webrtc").arg("--webrtc-bind-ip").arg(bind_ip)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(raw_root.join("endpoint.stderr"))?)
@@ -1068,8 +1023,7 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
         let mut prime_command = Command::new(&receiver_bin);
         prime_command.arg("--address").arg(address.to_string())
             .arg("--ca").arg(root.join("ca.der"))
-            .arg("--client-cert").arg(root.join("client.der"))
-            .arg("--client-key").arg(root.join("client.key"))
+            .arg("--token").arg(TOKEN)
             .arg("--bind-ip").arg(&bind_ip)
             .arg("--frames").arg("3").arg("--skip-click")
             .arg("--terminal-trigger").arg("prime-finalize-failed")
@@ -1128,8 +1082,7 @@ async fn run_retained_finalize_failure_data_channel() -> anyhow::Result<()> {
         let mut command = Command::new(&receiver_bin);
         command.arg("--address").arg(address.to_string())
             .arg("--ca").arg(root.join("ca.der"))
-            .arg("--client-cert").arg(root.join("client.der"))
-            .arg("--client-key").arg(root.join("client.key"))
+            .arg("--token").arg(TOKEN)
             .arg("--bind-ip").arg(&bind_ip)
             .arg("--frames").arg("3").arg("--skip-click")
             .arg("--terminal-trigger").arg("rebind-finalize-failed")
@@ -1298,18 +1251,16 @@ async fn assert_recorded_adapter_gone(sink: &PathBuf) {
 }
 
 
-async fn run_receiver_cert(
+async fn run_receiver_phase(
     binary: &PathBuf,
     address: std::net::SocketAddr,
     root: &PathBuf,
     raw_root: &PathBuf,
     phase: &str,
-    client: &str,
 ) -> anyhow::Result<serde_json::Value> {
     let mut command = Command::new(binary);
     command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
-        .arg("--client-cert").arg(root.join(format!("{client}.der")))
-        .arg("--client-key").arg(root.join(format!("{client}.key")))
+        .arg("--token").arg(TOKEN)
         .arg("--frames").arg("3").arg("--skip-click");
     let output = command.output().await?;
     let phase_dir = raw_root.join(phase);
@@ -1381,7 +1332,7 @@ fn pid_exited_or_zombie(pid: i32) -> bool {
 async fn run_receiver(binary: &PathBuf, address: std::net::SocketAddr, root: &PathBuf, raw_root: &PathBuf, phase: &str, skip_click: bool, bad_binding: bool, expect_encoder_error: bool) -> anyhow::Result<std::process::Output> {
     let mut command = Command::new(binary);
     command.arg("--address").arg(address.to_string()).arg("--ca").arg(root.join("ca.der"))
-        .arg("--client-cert").arg(root.join("client.der")).arg("--client-key").arg(root.join("client.key"))
+        .arg("--token").arg(TOKEN)
         .arg("--frames").arg("3");
     if skip_click { command.arg("--skip-click"); }
     if bad_binding { command.arg("--bad-binding"); }
@@ -1401,141 +1352,19 @@ fn identity(state: &serde_json::Value) -> serde_json::Value {
         "viewport_revision":state["viewport_revision"],"document_revision":state["document_revision"]})
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
-fn write_authorized(registry_path: PathBuf, projection_path: PathBuf, profile_root: PathBuf, client_der: &[u8]) -> anyhow::Result<()> {
-    let fingerprint = hex(&Sha256::digest(client_der));
-    let registry = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "host_id": "host-test",
-        "devices": [{
-            "device_id": "test-device",
-            "device_label": "test client",
-            "client_certificate_sha256": fingerprint,
-            "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
-            "initial_profile_grant": {
-                "selection": "default_profile",
-                "authorization_revision": 1
-            },
-            "scope_revision": 1,
-            "status": "active",
-            "not_before_unix": 0,
-            "not_after_unix": 4102444800i64,
-            "created_at_unix": 0,
-            "revoked_at_unix": null
-        }]
-    });
-    std::fs::write(&registry_path, serde_json::to_vec(&registry)?)?;
-    let projection = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "registry_sha256": "00".repeat(32),
-        "clients": [{
-            "device_id": "test-device",
-            "client_certificate_sha256": fingerprint,
-            "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
-            "initial_profile_grant": {
-                "selection": "default_profile",
-                "authorization_revision": 1
-            }
-        }]
-    });
-    std::fs::write(&projection_path, serde_json::to_vec(&projection)?)?;
-    let members = serde_json::json!(["local", "test-device"]);
+/// The catalog the Host serves: the default profile plus the secondary profile
+/// the rebind cases materialize.
+fn write_catalog(profile_root: PathBuf) -> anyhow::Result<()> {
     let catalog = serde_json::json!({
         "catalog_revision": 2,
         "profiles": [{
             "profile_id": "default",
             "display_name": "Default",
-            "default": true,
-            "access": {"owner_device_id": "local", "members": members}
-        }, {
-            "profile_id": "p1",
-            "display_name": "Rebind Target",
-            "default": false,
-            "access": {"owner_device_id": "local", "members": members}
-        }],
-        "default_profile_id": "default",
-        "next_id": 2
-    });
-    std::fs::create_dir_all(&profile_root)?;
-    std::fs::write(profile_root.join("catalog.json"), serde_json::to_string_pretty(&catalog)?)?;
-    Ok(())
-}
-
-/// Registry/projection/catalog for two paired devices, each granted a distinct
-/// initial profile so two remote attachments resolve to two exact sessions.
-fn write_authorized_two(
-    registry_path: PathBuf,
-    projection_path: PathBuf,
-    profile_root: PathBuf,
-    client_a: &[u8],
-    client_b: &[u8],
-) -> anyhow::Result<()> {
-    let scopes = ["observe_human_control", "profile_read", "profile_create", "profile_select"];
-    let fingerprint_a = hex(&Sha256::digest(client_a));
-    let fingerprint_b = hex(&Sha256::digest(client_b));
-    let device = |device_id: &str, label: &str, fingerprint: &str, selection: serde_json::Value| serde_json::json!({
-        "device_id": device_id,
-        "device_label": label,
-        "client_certificate_sha256": fingerprint,
-        "scopes": scopes,
-        "initial_profile_grant": {"selection": selection, "authorization_revision": 1},
-        "scope_revision": 1,
-        "status": "active",
-        "not_before_unix": 0,
-        "not_after_unix": 4102444800i64,
-        "created_at_unix": 0,
-        "revoked_at_unix": null
-    });
-    let registry = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "host_id": "host-test",
-        "devices": [
-            device("device-a", "profile a", &fingerprint_a, serde_json::json!("default_profile")),
-            device("device-b", "profile b", &fingerprint_b, serde_json::json!({"profile_id": "p1"})),
-        ]
-    });
-    std::fs::write(&registry_path, serde_json::to_vec(&registry)?)?;
-    let client = |device_id: &str, fingerprint: &str, selection: serde_json::Value| serde_json::json!({
-        "device_id": device_id,
-        "client_certificate_sha256": fingerprint,
-        "scopes": scopes,
-        "initial_profile_grant": {"selection": selection, "authorization_revision": 1}
-    });
-    let projection = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "registry_sha256": "00".repeat(32),
-        "clients": [
-            client("device-a", &fingerprint_a, serde_json::json!("default_profile")),
-            client("device-b", &fingerprint_b, serde_json::json!({"profile_id": "p1"})),
-        ]
-    });
-    std::fs::write(&projection_path, serde_json::to_vec(&projection)?)?;
-    let members = serde_json::json!(["local", "device-a", "device-b"]);
-    let catalog = serde_json::json!({
-        "catalog_revision": 2,
-        "profiles": [{
-            "profile_id": "default",
-            "display_name": "Default",
-            "default": true,
-            "access": {"owner_device_id": "local", "members": members}
+            "default": true
         }, {
             "profile_id": "p1",
             "display_name": "Secondary",
-            "default": false,
-            "access": {"owner_device_id": "local", "members": members}
+            "default": false
         }],
         "default_profile_id": "default",
         "next_id": 2
@@ -1544,7 +1373,6 @@ fn write_authorized_two(
     std::fs::write(profile_root.join("catalog.json"), serde_json::to_string_pretty(&catalog)?)?;
     Ok(())
 }
-
 fn release_binary(name: &str) -> PathBuf {
     std::env::var_os("OBSCURA_TEST_BINARY_DIR")
         .map(PathBuf::from)
@@ -1590,14 +1418,6 @@ async fn wait_socket_deadline(path: PathBuf, timeout: Duration) -> anyhow::Resul
     }
     tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(())
-}
-
-#[allow(dead_code)]
-fn _tls_client_config(ca: &[u8], cert: &[u8], key: &[u8]) -> anyhow::Result<tokio_rustls::rustls::ClientConfig> {
-    let mut roots = rustls::RootCertStore::empty();
-    roots.add(CertificateDer::from(ca.to_vec()))?;
-    Ok(rustls::ClientConfig::builder().with_root_certificates(roots)
-        .with_client_auth_cert(vec![CertificateDer::from(cert.to_vec())], PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec())))?)
 }
 
 // ===========================================================================

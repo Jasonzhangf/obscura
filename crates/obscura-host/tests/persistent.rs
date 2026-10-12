@@ -901,19 +901,17 @@ struct AdminDaemon {
 }
 
 impl AdminDaemon {
-    /// Start a daemon with a persistent profile root and one registry that
-    /// contains an active grantable device, a revoked device, and a device
-    /// whose initial grant revision is stale.
+    /// Start a daemon with a persistent profile root. The daemon opens the
+    /// default profile in the catalog it owns.
     fn start() -> Self {
         let root = std::path::PathBuf::from("/tmp").join(format!("oha-{}", uuid::Uuid::new_v4()));
         let socket_dir = root.join("host");
         let profile_root = root.join("profiles");
         std::fs::create_dir_all(&root).unwrap();
-        write_admin_registry(&root.join("registry.json"));
         let child = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
             .arg("--socket-dir").arg(&socket_dir)
             .arg("--profile-root").arg(&profile_root)
-            .arg("--authorization-registry").arg(root.join("registry.json"))
+            .arg("--access-token").arg(ADMIN_TOKEN)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -984,34 +982,8 @@ impl AdminClient {
     }
 }
 
-fn write_admin_registry(path: &std::path::Path) {
-    let device = |device_id: &str, status: &str, grant_revision: u64, fingerprint: &str| {
-        json!({
-            "device_id": device_id,
-            "device_label": device_id,
-            "client_certificate_sha256": fingerprint,
-            "scopes": ["observe_human_control", "profile_read", "profile_create", "profile_select"],
-            "initial_profile_grant": {"selection": "default_profile", "authorization_revision": grant_revision},
-            "scope_revision": 1,
-            "status": status,
-            "not_before_unix": 0,
-            "not_after_unix": 4102444800i64,
-            "created_at_unix": 0,
-            "revoked_at_unix": null
-        })
-    };
-    let registry = json!({
-        "schema_version": 2,
-        "authorization_revision": 3,
-        "host_id": "host-admin-test",
-        "devices": [
-            device("device-active", "active", 3, &"22".repeat(32)),
-            device("device-revoked", "revoked", 3, &"33".repeat(32)),
-            device("device-stale", "active", 2, &"44".repeat(32)),
-        ]
-    });
-    std::fs::write(path, serde_json::to_vec_pretty(&registry).unwrap()).unwrap();
-}
+/// The one access token this fixture configures on the Host.
+const ADMIN_TOKEN: &str = "persistent-admin-token";
 
 fn admin_create(id: u64, display_name: &str, make_default: bool, expected: Option<u64>) -> Value {
     let mut request = json!({
@@ -1036,32 +1008,8 @@ fn admin_select(id: u64, profile_id: &str, expected: Option<u64>) -> Value {
     request
 }
 
-fn admin_membership(
-    id: u64,
-    intent: &str,
-    attempt_id: &str,
-    profile_id: &str,
-    device_id: &str,
-    members: &[&str],
-    expected: Option<u64>,
-) -> Value {
-    let mut request = json!({
-        "schema_version": 1,
-        "id": id,
-        "op": "admin.membership.set",
-        "intent": intent,
-        "attempt_id": attempt_id,
-        "profile_id": profile_id,
-        "owner_device_id": "local",
-        "device_id": device_id,
-        "members": members,
-    });
-    if let Some(expected) = expected { request["expected_catalog_revision"] = json!(expected); }
-    request
-}
-
 #[test]
-fn admin_authority_commits_catalog_and_refuses_invalid_membership() {
+fn admin_authority_commits_catalog_and_refuses_invalid_selection() {
     use std::os::unix::fs::PermissionsExt;
     let daemon = AdminDaemon::start();
     let mode = std::fs::metadata(daemon.socket_dir.join("host-admin.sock")).unwrap().permissions().mode() & 0o777;
@@ -1076,7 +1024,7 @@ fn admin_authority_commits_catalog_and_refuses_invalid_membership() {
     let created = admin.ok(admin_create(2, "Work", false, Some(1)));
     assert_eq!(created["catalog_revision"], 2);
     assert_eq!(created["profile"]["profile_id"], "p1");
-    assert_eq!(created["profile"]["owner_device_id"], "local");
+    assert_eq!(created["profile"]["display_name"], "Work");
 
     // Select commits another revision, never creating a profile.
     let selected = admin.ok(admin_select(3, "p1", Some(2)));
@@ -1084,70 +1032,26 @@ fn admin_authority_commits_catalog_and_refuses_invalid_membership() {
     assert_eq!(selected["default_profile_id"], "p1");
     admin.error(admin_select(4, "p404", None), "PROFILE_NOT_FOUND");
 
-    // Grant to an active registered device returns an export-eligible receipt
-    // bound to the committed revision and the exact applied members.
-    let granted = admin.ok(admin_membership(5, "grant", "att-grant", "p1", "device-active", &["local", "device-active"], Some(3)));
-    assert_eq!(granted["catalog_revision"], 4);
-    let receipt = &granted["membership_receipt"];
-    assert_eq!(receipt["receipt_type"], "export_eligible");
-    assert_eq!(receipt["catalog_revision"], 4);
-    assert_eq!(receipt["profile_id"], "p1");
-    assert_eq!(receipt["device_id"], "device-active");
-    assert_eq!(receipt["owner_device_id"], "local");
-    assert_eq!(receipt["members"], json!(["device-active", "local"]));
+    // A stale expected revision is refused before any write.
+    admin.error(admin_create(5, "Stale", false, Some(1)), "CATALOG_REVISION_CONFLICT");
 
-    // Exact replay with a new request id returns the same committed receipt.
-    let replay = admin.ok(admin_membership(6, "grant", "att-grant", "p1", "device-active", &["local", "device-active"], Some(3)));
-    assert_eq!(replay["membership_receipt"], *receipt);
-
-    // Same attempt id with any changed field is not a replay.
-    admin.error(admin_membership(7, "remove", "att-grant", "p1", "device-active", &["local"], Some(3)), "ADMIN_FRAME_MALFORMED");
-
-    // Same attempt id after catalog movement is a revision conflict.
-    admin.ok(admin_create(8, "Later", false, Some(4)));
-    admin.error(admin_membership(9, "grant", "att-grant", "p1", "device-active", &["local", "device-active"], Some(3)), "CATALOG_REVISION_CONFLICT");
-
-    // Revision conflict is refused before any membership write.
-    admin.error(admin_membership(10, "grant", "att-conflict", "p1", "device-active", &["local", "device-active"], Some(2)), "CATALOG_REVISION_CONFLICT");
-
-    // Revoked, absent and stale-grant devices are typed refusals.
-    admin.error(admin_membership(11, "grant", "att-revoked", "p1", "device-revoked", &["local", "device-revoked"], None), "DEVICE_REVOKED");
-    admin.error(admin_membership(12, "grant", "att-absent", "p1", "device-absent", &["local", "device-absent"], None), "DEVICE_NOT_REGISTERED");
-    admin.error(admin_membership(13, "grant", "att-stale", "p1", "device-stale", &["local", "device-stale"], None), "DEVICE_GRANT_STALE");
-
-    // Grant that omits the target is refused before mutation.
-    admin.error(admin_membership(14, "grant", "att-omitted", "p1", "device-active", &["local"], None), "MEMBERSHIP_REQUIRED");
-
-    // Explicit removal refuses while the target is still present.
-    admin.error(admin_membership(15, "remove", "att-remove-bad", "p1", "device-active", &["local", "device-active"], None), "PROFILE_ACCESS_FAILED");
-
-    // Valid removal commits and returns a `removed` receipt that cannot be
-    // consumed as a grant.
-    let removed = admin.ok(admin_membership(16, "remove", "att-remove", "p1", "device-active", &["local"], None));
-    let removed_receipt = &removed["membership_receipt"];
-    assert_eq!(removed_receipt["receipt_type"], "removed");
-    assert_eq!(removed_receipt["device_id"], "device-active");
-    assert_eq!(removed_receipt["members"], json!(["local"]));
-    assert!(
-        !removed_receipt["members"].as_array().unwrap().iter().any(|member| member == "device-active"),
-        "removed receipt must not contain the removed target: {removed_receipt}"
-    );
-
-    // Persisted truth matches the committed receipt.
-    let after = admin.ok(json!({"schema_version":1,"id":17,"op":"admin.catalog.info"}));
-    assert_eq!(after["catalog_revision"], removed["catalog_revision"]);
-    let p1 = after["profiles"].as_array().unwrap().iter().find(|profile| profile["profile_id"] == "p1").unwrap();
-    assert_eq!(p1["members"], json!(["local"]));
+    // Persisted truth matches the committed revision.
+    let after = admin.ok(json!({"schema_version":1,"id":6,"op":"admin.catalog.info"}));
+    assert_eq!(after["catalog_revision"], 3);
+    assert_eq!(after["default_profile_id"], "p1");
+    let ids: Vec<&str> = after["profiles"].as_array().unwrap().iter()
+        .map(|profile| profile["profile_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["default", "p1"]);
 }
 
 #[test]
-fn admin_authority_refuses_malformed_partial_unknown_and_wrong_intent() {
+fn admin_authority_refuses_malformed_partial_and_unknown_ops() {
     let daemon = AdminDaemon::start();
     let mut admin = AdminClient::connect(&daemon.socket_dir);
 
-    // Unknown op and wrong intent are typed malformed refusals.
+    // Unknown op and an incomplete known op are typed malformed refusals.
     admin.error(json!({"schema_version":1,"id":1,"op":"admin.catalog.delete"}), "ADMIN_FRAME_MALFORMED");
-    admin.error(admin_membership(2, "toggle", "att-intent", "p1", "device-active", &["local", "device-active"], None), "ADMIN_FRAME_MALFORMED");
+    admin.error(json!({"schema_version":1,"id":2,"op":"admin.catalog.select"}), "ADMIN_FRAME_MALFORMED");
 
     // Malformed JSON on one frame is refused and the connection stays usable.
     let malformed = admin.raw(b"{not json}\n");

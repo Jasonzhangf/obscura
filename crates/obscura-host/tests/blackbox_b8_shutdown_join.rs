@@ -15,10 +15,9 @@
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio_rustls::rustls::{self, pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, ServerName}};
-use tokio_tungstenite::{client_async, tungstenite::Message};
+use tokio_rustls::rustls::{self, pki_types::ServerName};
+use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}};
 
 #[tokio::test]
 async fn endpoint_shutdown_joins_in_progress_final_release() {
@@ -50,23 +49,16 @@ async fn exercise() -> anyhow::Result<()> {
     let server_key = rcgen::KeyPair::generate()?;
     let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
         .signed_by(&server_key, &ca, &ca_key)?;
-    let client_key = rcgen::KeyPair::generate()?;
-    let mut client_params = rcgen::CertificateParams::new(vec![])?;
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client = client_params.signed_by(&client_key, &ca, &ca_key)?;
     std::fs::write(root.join("server.der"), server.der())?;
     std::fs::write(root.join("server.key"), server_key.serialize_der())?;
     std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(root.join("ca.der"), ca.der())?;
-    std::fs::write(root.join("client.der"), client.der())?;
-    std::fs::write(root.join("client.key"), client_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
-    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"), root.join("profiles"), &client.der().to_vec())?;
+    write_catalog(root.join("profiles"))?;
 
     let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
         .arg("--socket-dir").arg(root.join("host"))
         .arg("--profile-root").arg(root.join("profiles"))
-        .arg("--authorization-registry").arg(root.join("registry.json"))
+        .arg("--access-token").arg(TOKEN)
         .stdout(Stdio::null()).stderr(std::fs::File::create(root.join("host.err"))?).kill_on_drop(true).spawn()?;
     wait_socket(root.join("host/host.sock")).await;
     let mut local = BufReader::new(tokio::net::UnixStream::connect(root.join("host/host.sock")).await?);
@@ -125,8 +117,6 @@ async fn exercise() -> anyhow::Result<()> {
         .arg("--socket-dir").arg(root.join("endpoint"))
         .arg("--server-cert").arg(root.join("server.der"))
         .arg("--server-key").arg(root.join("server.key"))
-        .arg("--client-ca").arg(root.join("ca.der"))
-        .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
         .arg("--media-bin").arg(&media_bin)
         .stdout(Stdio::null())
         .stderr(std::fs::File::create(root.join("endpoint.err"))?)
@@ -138,10 +128,7 @@ async fn exercise() -> anyhow::Result<()> {
     roots.add(ca.der().clone())?;
     let client_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_client_auth_cert(
-            vec![client.der().clone()],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der())),
-        )?;
+        .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
 
     let (mut control, _token) = connect_control(&connector, address).await?;
@@ -212,27 +199,17 @@ async fn exercise_f1() -> anyhow::Result<()> {
     let server_key = rcgen::KeyPair::generate()?;
     let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
         .signed_by(&server_key, &ca, &ca_key)?;
-    let client_key = rcgen::KeyPair::generate()?;
-    let mut client_params = rcgen::CertificateParams::new(vec![])?;
-    client_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
-    let client = client_params.signed_by(&client_key, &ca, &ca_key)?;
     std::fs::write(root.join("server.der"), server.der())?;
     std::fs::write(root.join("server.key"), server_key.serialize_der())?;
     std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
     std::fs::write(root.join("ca.der"), ca.der())?;
-    std::fs::write(root.join("client.der"), client.der())?;
-    std::fs::write(root.join("client.key"), client_key.serialize_der())?;
-    std::fs::set_permissions(root.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
-    write_authorized(root.join("registry.json"), root.join("authorized-clients.json"), root.join("profiles"), &client.der().to_vec())?;
+    write_catalog(root.join("profiles"))?;
 
     let mut roots = rustls::RootCertStore::empty();
     roots.add(ca.der().clone())?;
     let client_config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
-        .with_client_auth_cert(
-            vec![client.der().clone()],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(client_key.serialize_der())),
-        )?;
+        .with_no_client_auth();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
     let html = "data:text/html,<style>body{margin:0;background:white}</style><div style='width:80px;height:80px;background:red'></div>";
 
@@ -277,7 +254,7 @@ async fn exercise_f1() -> anyhow::Result<()> {
         let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
             .arg("--socket-dir").arg(cycle_root.join("host"))
             .arg("--profile-root").arg(root.join("profiles"))
-            .arg("--authorization-registry").arg(root.join("registry.json"))
+            .arg("--access-token").arg(TOKEN)
             .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
         wait_socket(cycle_root.join("host/host.sock")).await;
         let mut local = BufReader::new(tokio::net::UnixStream::connect(cycle_root.join("host/host.sock")).await?);
@@ -299,8 +276,6 @@ async fn exercise_f1() -> anyhow::Result<()> {
             .arg("--socket-dir").arg(cycle_root.join("endpoint"))
             .arg("--server-cert").arg(root.join("server.der"))
             .arg("--server-key").arg(root.join("server.key"))
-            .arg("--client-ca").arg(root.join("ca.der"))
-            .arg("--authorized-clients").arg(root.join("authorized-clients.json"))
             .arg("--media-bin").arg(&media_bin)
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&stderr_path)?)
@@ -347,7 +322,9 @@ async fn connect_control(
     address: std::net::SocketAddr,
 ) -> anyhow::Result<(tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String)> {
     let tls = connector.connect(ServerName::try_from("localhost")?, tokio::net::TcpStream::connect(address).await?).await?;
-    let (control, response) = client_async(format!("wss://localhost:{}/control", address.port()), tls).await?;
+    let mut request = format!("wss://localhost:{}/control", address.port()).into_client_request()?;
+    request.headers_mut().insert("authorization", format!("Bearer {TOKEN}").parse()?);
+    let (control, response) = client_async(request, tls).await?;
     let token = response.headers()["x-obscura-media-token"].to_str()?.to_string();
     Ok((control, token))
 }
@@ -415,63 +392,17 @@ async fn local_request(socket: &mut BufReader<tokio::net::UnixStream>, request: 
     Ok(reply["value"].clone())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
+/// The one access token this test configures on the Host.
+const TOKEN: &str = "b8-access-token";
 
-fn write_authorized(
-    registry_path: PathBuf,
-    projection_path: PathBuf,
-    profile_root: PathBuf,
-    client_der: &[u8],
-) -> anyhow::Result<()> {
-    let fingerprint = hex(&Sha256::digest(client_der));
-    let scopes = ["observe_human_control", "profile_read", "profile_create", "profile_select"];
-    let registry = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "host_id": "host-b8",
-        "devices": [{
-            "device_id": "test-device",
-            "device_label": "b8 client",
-            "client_certificate_sha256": fingerprint,
-            "scopes": scopes,
-            "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 1},
-            "scope_revision": 1,
-            "status": "active",
-            "not_before_unix": 0,
-            "not_after_unix": 4102444800i64,
-            "created_at_unix": 0,
-            "revoked_at_unix": null
-        }]
-    });
-    std::fs::write(&registry_path, serde_json::to_vec(&registry)?)?;
-    let projection = serde_json::json!({
-        "schema_version": 2,
-        "authorization_revision": 1,
-        "registry_sha256": "00".repeat(32),
-        "clients": [{
-            "device_id": "test-device",
-            "client_certificate_sha256": fingerprint,
-            "scopes": scopes,
-            "initial_profile_grant": {"selection": "default_profile", "authorization_revision": 1}
-        }]
-    });
-    std::fs::write(&projection_path, serde_json::to_vec(&projection)?)?;
-    let members = serde_json::json!(["local", "test-device"]);
+/// A minimal persistent catalog. It carries no membership and no access record.
+fn write_catalog(profile_root: PathBuf) -> anyhow::Result<()> {
     let catalog = serde_json::json!({
         "catalog_revision": 1,
         "profiles": [{
             "profile_id": "default",
             "display_name": "Default",
-            "default": true,
-            "access": {"owner_device_id": "local", "members": members}
+            "default": true
         }],
         "default_profile_id": "default",
         "next_id": 1

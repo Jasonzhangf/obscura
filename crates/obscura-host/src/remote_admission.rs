@@ -3,11 +3,9 @@
 //! This module is compiled into both the `obscura-host` and `obscura-endpoint`
 //! binaries. It owns the frozen typed admission messages and the exact
 //! newline-framed reader/writer bounds. It carries no browser wire, no session
-//! state and no profile store. The principal and initial grant are Host-local
-//! control facts: they never travel in a browser `Request`, `Response` or
-//! metadata field.
-use std::collections::BTreeSet;
-
+//! state and no profile store. The token is the only credential: it travels
+//! from the endpoint's `/control` upgrade to the Host, which compares it. No
+//! principal, scope or grant travels here.
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -19,64 +17,13 @@ pub const REMOTE_ADMISSION_RESULT_MAX: usize = 1024 * 1024;
 /// Frozen result-write deadline. There is no admission read deadline.
 pub const REMOTE_ADMISSION_WRITE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// One explicitly paired remote device. The values are derived from the Host
-/// registry and endpoint projection, never from a browser payload.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RemotePrincipalContext {
-    pub device_id: String,
-    pub client_cert_sha256: [u8; 32],
-    pub scopes: BTreeSet<RemoteScope>,
-    pub authorization_revision: u64,
-}
-
-/// The only remote capability values admitted by the first slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RemoteScope {
-    ObserveHumanControl,
-    ProfileRead,
-    ProfileCreate,
-    ProfileSelect,
-}
-
-impl RemoteScope {
-    pub const fn wire_name(self) -> &'static str {
-        match self {
-            Self::ObserveHumanControl => "observe_human_control",
-            Self::ProfileRead => "profile_read",
-            Self::ProfileCreate => "profile_create",
-            Self::ProfileSelect => "profile_select",
-        }
-    }
-}
-
-/// Explicit initial profile selection. `DefaultProfile` is a string on the
-/// wire and `ProfileId` is a single-key object, exactly as frozen by G-1.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InitialProfileSelection {
-    DefaultProfile,
-    ProfileId(String),
-}
-
-/// Host-local initial binding. The wire `initial_profile_grant` object only
-/// carries `selection` and `authorization_revision`; `device_id` is supplied by
-/// the owning registry/projection entry.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct InitialProfileGrant {
-    pub device_id: String,
-    pub authorization_revision: u64,
-    pub selection: InitialProfileSelection,
-}
-
-/// One typed admission request on the Host-owned `remote-admission.sock`.
+/// One typed admission request on the Host-owned `remote-admission.sock`. The
+/// endpoint copies the client's `Authorization: Bearer <token>` value verbatim;
+/// the Host owns the single comparison.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RemoteAdmissionRequest {
-    pub principal: RemotePrincipalContext,
-    pub initial: InitialProfileGrant,
+    pub token: String,
     pub request_id: u64,
 }
 
@@ -95,39 +42,26 @@ impl RemoteAdmissionResult {
     }
 }
 
-/// Frozen Host-local admission error surface. `RemoteAdmissionEof` is retired:
-/// an empty read-side EOF is a transport-owner closure with no result frame.
+/// Frozen Host-local admission error surface. A wrong token and a session that
+/// cannot be opened are the only typed refusals; a malformed frame stays
+/// uncorrelated. `RemoteAdmissionEof` is retired: an empty read-side EOF is a
+/// transport-owner closure with no result frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RemoteAdmissionErrorCode {
-    #[serde(rename = "REMOTE_AUTH_REQUIRED")]
-    RemoteAuthRequired,
-    #[serde(rename = "REMOTE_PRINCIPAL_REVOKED")]
-    RemotePrincipalRevoked,
-    #[serde(rename = "REMOTE_PROFILE_SCOPE_REQUIRED")]
-    RemoteProfileScopeRequired,
-    #[serde(rename = "REMOTE_INITIAL_PROFILE_UNBOUND")]
-    RemoteInitialProfileUnbound,
-    #[serde(rename = "REMOTE_INITIAL_PROFILE_ACCESS_DENIED")]
-    RemoteInitialProfileAccessDenied,
-    #[serde(rename = "PROFILE_ACCESS_MIGRATION_REQUIRED")]
-    ProfileAccessMigrationRequired,
     #[serde(rename = "REMOTE_ADMISSION_MALFORMED")]
     RemoteAdmissionMalformed,
-    #[serde(rename = "REMOTE_ADMISSION_CANCELED")]
-    RemoteAdmissionCanceled,
+    #[serde(rename = "REMOTE_TOKEN_INVALID")]
+    RemoteTokenInvalid,
+    #[serde(rename = "REMOTE_SESSION_UNAVAILABLE")]
+    RemoteSessionUnavailable,
 }
 
 impl RemoteAdmissionErrorCode {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::RemoteAuthRequired => "REMOTE_AUTH_REQUIRED",
-            Self::RemotePrincipalRevoked => "REMOTE_PRINCIPAL_REVOKED",
-            Self::RemoteProfileScopeRequired => "REMOTE_PROFILE_SCOPE_REQUIRED",
-            Self::RemoteInitialProfileUnbound => "REMOTE_INITIAL_PROFILE_UNBOUND",
-            Self::RemoteInitialProfileAccessDenied => "REMOTE_INITIAL_PROFILE_ACCESS_DENIED",
-            Self::ProfileAccessMigrationRequired => "PROFILE_ACCESS_MIGRATION_REQUIRED",
             Self::RemoteAdmissionMalformed => "REMOTE_ADMISSION_MALFORMED",
-            Self::RemoteAdmissionCanceled => "REMOTE_ADMISSION_CANCELED",
+            Self::RemoteTokenInvalid => "REMOTE_TOKEN_INVALID",
+            Self::RemoteSessionUnavailable => "REMOTE_SESSION_UNAVAILABLE",
         }
     }
 }

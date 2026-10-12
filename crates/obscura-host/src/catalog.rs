@@ -1,24 +1,16 @@
 //! Typed persistent profile catalog owned by the Host.
 //!
-//! The catalog persists profile id, display name, the default identity and the
-//! Host-owned `ProfileAccess { owner_device_id, members }` under an explicit
-//! profile root. It is typed configuration, never reconstructed by directory
-//! scanning or log parsing. When no root is configured the Host runs one
-//! in-memory profile and the catalog is not persistent.
+//! The catalog persists profile id, display name and the default identity under
+//! an explicit profile root. It is typed configuration, never reconstructed by
+//! directory scanning or log parsing. When no root is configured the Host runs
+//! one in-memory profile and the catalog is not persistent.
 //!
-//! `ProfileAccess` is the single membership source. The device registry only
-//! answers "what identity/scope does this device hold"; it never grants profile
-//! membership. The browser wire `ProfileRecord` keeps its current fields; the
-//! access structure is a Host-side persisted field only.
-use std::collections::BTreeSet;
+//! The catalog carries no membership and no access record: the single access
+//! token admits every connection, and the browser wire `ProfileRecord` keeps
+//! its current fields.
 use std::path::{Path, PathBuf};
 
 use obscura_host_protocol::{ProfileCatalog, ProfileRecord};
-use serde::{Deserialize, Serialize};
-
-/// Owner recorded for a profile created over the local authenticated
-/// `host.sock`. Remote profiles always record the remote device id.
-pub const LOCAL_DEVICE_ID: &str = "local";
 
 #[derive(Debug)]
 pub struct CatalogError {
@@ -35,40 +27,12 @@ impl CatalogError {
     }
 }
 
-/// Host-side profile membership. `owner_device_id` is non-empty and is always
-/// a member. A private profile is exactly `members == {owner_device_id}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProfileAccess {
-    pub owner_device_id: String,
-    pub members: BTreeSet<String>,
-}
-
-impl ProfileAccess {
-    pub fn owner_only(owner_device_id: &str) -> Result<Self, CatalogError> {
-        if owner_device_id.trim().is_empty() {
-            return Err(CatalogError::new("PROFILE_ACCESS_FAILED", "profile owner must not be empty"));
-        }
-        let mut members = BTreeSet::new();
-        members.insert(owner_device_id.to_string());
-        Ok(Self { owner_device_id: owner_device_id.to_string(), members })
-    }
-
-    pub fn grants(&self, device_id: &str) -> bool {
-        self.members.contains(device_id)
-    }
-}
-
-/// One persisted catalog entry. `access` is `None` only for a legacy catalog
-/// written before Host-side membership existed; such an entry refuses remote
-/// resolution with `PROFILE_ACCESS_MIGRATION_REQUIRED` until a local owner runs
-/// the explicit typed migration action.
+/// One persisted catalog entry.
 #[derive(Debug, Clone)]
 pub struct ProfileEntry {
     pub profile_id: String,
     pub display_name: String,
     pub default: bool,
-    pub access: Option<ProfileAccess>,
 }
 
 impl ProfileEntry {
@@ -79,14 +43,6 @@ impl ProfileEntry {
             default: self.default,
         }
     }
-}
-
-/// Typed receipt for one explicit local membership mutation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MembershipReceipt {
-    pub catalog_revision: u64,
-    pub profile_id: String,
-    pub device_id: String,
 }
 
 pub struct ProfileCatalogStore {
@@ -155,35 +111,13 @@ impl ProfileCatalogStore {
         }
     }
 
-    /// Remote projection: only profiles whose Host-owned access grants this
-    /// device. A legacy entry without access is excluded, not silently granted.
-    pub fn remote_catalog(&self, device_id: &str) -> ProfileCatalog {
-        let profiles: Vec<ProfileRecord> = self.profiles.iter()
-            .filter(|entry| entry.access.as_ref().is_some_and(|access| access.grants(device_id)))
-            .map(ProfileEntry::wire)
-            .collect();
-        let default_profile_id = self.default_profile_id.clone()
-            .filter(|id| profiles.iter().any(|profile| profile.profile_id == *id));
-        ProfileCatalog {
-            profiles,
-            default_profile_id,
-            root_configured: self.root.is_some(),
-        }
-    }
-
     pub fn record(&self, profile_id: &str) -> Option<&ProfileEntry> {
         self.profiles.iter().find(|profile| profile.profile_id == profile_id)
     }
 
-    /// Local admin projection of every loaded profile including the Host-owned
-    /// membership. Unlike `catalog()` it exposes `owner_device_id`/`members`, so
-    /// it is used only by the same-uid `host-admin.sock` owner.
+    /// Local admin projection of every loaded profile.
     pub fn entries(&self) -> &[ProfileEntry] {
         &self.profiles
-    }
-
-    pub fn access_for(&self, profile_id: &str) -> Option<&ProfileAccess> {
-        self.record(profile_id).and_then(|entry| entry.access.as_ref())
     }
 
     pub fn default_id(&self) -> Option<String> {
@@ -196,10 +130,9 @@ impl ProfileCatalogStore {
         self.root.as_ref().map(|root| root.join("profiles").join(profile_id))
     }
 
-    /// Create a new empty profile owned by `owner_device_id` and persist the
-    /// catalog before returning. A persistence failure means the profile was
-    /// not created. The owner is always a member; no implicit default grant.
-    pub fn create(&mut self, display_name: &str, make_default: bool, owner_device_id: &str) -> Result<ProfileRecord, CatalogError> {
+    /// Create a new empty profile and persist the catalog before returning. A
+    /// persistence failure means the profile was not created.
+    pub fn create(&mut self, display_name: &str, make_default: bool) -> Result<ProfileRecord, CatalogError> {
         let name = display_name.trim();
         if name.is_empty() {
             return Err(CatalogError::new("PROFILE_CATALOG_FAILED", "display name must not be empty"));
@@ -207,13 +140,11 @@ impl ProfileCatalogStore {
         if name.chars().count() > 64 {
             return Err(CatalogError::new("PROFILE_CATALOG_FAILED", "display name must be at most 64 characters"));
         }
-        let access = ProfileAccess::owner_only(owner_device_id)?;
         let profile_id = format!("p{}", self.next_id);
         let entry = ProfileEntry {
             profile_id: profile_id.clone(),
             display_name: name.to_string(),
             default: make_default,
-            access: Some(access),
         };
         let previous_profiles = self.profiles.clone();
         let previous_default = self.default_profile_id.clone();
@@ -234,41 +165,6 @@ impl ProfileCatalogStore {
             return Err(error);
         }
         Ok(self.profiles.last().expect("created profile exists").wire())
-    }
-
-    /// Explicit local membership authority. This is the single typed write path
-    /// for `ProfileAccess`; the Host service consumer owns calling it with an
-    /// owner-authorized action. It also completes a legacy migration because it
-    /// writes the full owner/member set under a new catalog revision.
-    pub fn assign_access(
-        &mut self,
-        profile_id: &str,
-        owner_device_id: &str,
-        members: BTreeSet<String>,
-    ) -> Result<MembershipReceipt, CatalogError> {
-        if owner_device_id.trim().is_empty() {
-            return Err(CatalogError::new("PROFILE_ACCESS_FAILED", "profile owner must not be empty"));
-        }
-        if !members.contains(owner_device_id) {
-            return Err(CatalogError::new("PROFILE_ACCESS_FAILED", "profile owner must be a member"));
-        }
-        let previous_profiles = self.profiles.clone();
-        let previous_revision = self.catalog_revision;
-        let Some(entry) = self.profiles.iter_mut().find(|entry| entry.profile_id == profile_id) else {
-            return Err(CatalogError::new("PROFILE_NOT_FOUND", "Unknown profile id"));
-        };
-        entry.access = Some(ProfileAccess { owner_device_id: owner_device_id.to_string(), members });
-        self.catalog_revision = self.catalog_revision.saturating_add(1);
-        if let Err(error) = self.persist() {
-            self.profiles = previous_profiles;
-            self.catalog_revision = previous_revision;
-            return Err(error);
-        }
-        Ok(MembershipReceipt {
-            catalog_revision: self.catalog_revision,
-            profile_id: profile_id.to_string(),
-            device_id: owner_device_id.to_string(),
-        })
     }
 
     /// Select one existing profile as the default. This is the typed local
@@ -297,15 +193,11 @@ impl ProfileCatalogStore {
         let Some(root) = &self.root else { return Ok(()); };
         std::fs::create_dir_all(root).map_err(|error| CatalogError::io("create profile root", error))?;
         let profiles: Vec<serde_json::Value> = self.profiles.iter().map(|profile| {
-            let mut value = serde_json::json!({
+            serde_json::json!({
                 "profile_id": profile.profile_id,
                 "display_name": profile.display_name,
                 "default": profile.default,
-            });
-            if let Some(access) = &profile.access {
-                value["access"] = serde_json::to_value(access).unwrap_or(serde_json::Value::Null);
-            }
-            value
+            })
         }).collect();
         let json = serde_json::to_string_pretty(&serde_json::json!({
             "catalog_revision": self.catalog_revision,
@@ -326,7 +218,6 @@ fn fresh_default_entry() -> ProfileEntry {
         profile_id: "default".to_string(),
         display_name: "Default".to_string(),
         default: true,
-        access: ProfileAccess::owner_only(LOCAL_DEVICE_ID).ok(),
     }
 }
 
@@ -361,26 +252,11 @@ fn parse_catalog_file(data: &str) -> Result<CatalogFile, CatalogError> {
         let is_default = entry.get("default").and_then(serde_json::Value::as_bool).ok_or_else(|| {
             CatalogError::new("PROFILE_CATALOG_FAILED", "profile catalog default must be a boolean")
         })?;
-        let access = match entry.get("access") {
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => {
-                let access: ProfileAccess = serde_json::from_value(value.clone()).map_err(|error| {
-                    CatalogError::new("PROFILE_CATALOG_FAILED", format!("profile catalog access is invalid: {error}"))
-                })?;
-                if access.owner_device_id.trim().is_empty() {
-                    return Err(CatalogError::new("PROFILE_CATALOG_FAILED", "profile catalog access owner must not be empty"));
-                }
-                if !access.members.contains(&access.owner_device_id) {
-                    return Err(CatalogError::new("PROFILE_CATALOG_FAILED", "profile catalog access owner must be a member"));
-                }
-                Some(access)
-            }
-        };
+        // A legacy `access` field is ignored: no reader exists.
         profiles.push(ProfileEntry {
             profile_id: profile_id.to_string(),
             display_name: display_name.to_string(),
             default: is_default,
-            access,
         });
     }
     let default_profile_id = match object.get("default_profile_id") {
