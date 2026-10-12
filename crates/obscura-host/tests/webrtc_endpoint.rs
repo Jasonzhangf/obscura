@@ -437,29 +437,65 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
     } else {
         tokio::time::sleep(Duration::from_millis(1500)).await;
     }
-    let mut released = false;
-    for sequence in 1..=12u64 {
-        if scenario == "foreign-then-a" {
-            let foreign = scripted_access_unit(&foreign_session, sequence, bytes.len() as u64);
-            if send_video_packet(&mut producer, &foreign, &bytes).await.is_err() { released = true; break; }
-            tokio::time::sleep(Duration::from_millis(150)).await;
+    // Run the scripted producer as a task racing the real receiver, instead of
+    // writing a fixed number of packets from the test body. The session release
+    // is driven by the receiver's own exit, so the producer must stay live
+    // across it: a fixed packet count is long enough on an idle host but too
+    // short when the receiver's WebRTC attach is delayed. A blocking write is
+    // also not a usable release signal, because no test-side code is waiting on
+    // it, so it would only ever be seen as a timeout rather than an error.
+    let task_scenario = scenario.to_owned();
+    let task_session_id = session_id.clone();
+    let task_foreign_session = foreign_session.clone();
+    let producer_task = tokio::spawn(async move {
+        let scenario = task_scenario.as_str();
+        let session_id = task_session_id.as_str();
+        let foreign_session = task_foreign_session.as_str();
+        let mut sequence = 0u64;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+        let mut released = false;
+        while tokio::time::Instant::now() < deadline {
+            sequence += 1;
+            if scenario == "foreign-then-a" {
+                let foreign = scripted_access_unit(&foreign_session, sequence, bytes.len() as u64);
+                if send_video_packet(&mut producer, &foreign, &bytes).await.is_err() {
+                    released = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            let packet = scripted_access_unit(&session_id, sequence, bytes.len() as u64);
+            if send_video_packet(&mut producer, &packet, &bytes).await.is_err() {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(350)).await;
         }
-        let packet = scripted_access_unit(&session_id, sequence, bytes.len() as u64);
-        if send_video_packet(&mut producer, &packet, &bytes).await.is_err() { released = true; break; }
-        tokio::time::sleep(Duration::from_millis(350)).await;
-    }
-
+        producer.shutdown().await.ok();
+        (sequence, released)
+    });
+    let mut producer_task = producer_task;
     let output = receiver.wait_with_output().await?;
+    // The receiver has exited, so the endpoint is releasing the exact session.
+    // Bound the wait: a producer still blocked in a write at this point has not
+    // observed the release, and that is the failure this assertion reports.
+    let (sequence, released) = match tokio::time::timeout(Duration::from_secs(45), &mut producer_task).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(_)) => (0, false),
+        Err(_) => { producer_task.abort(); (0, false) }
+    };
     let phase_dir = raw_root.join("scripted");
     std::fs::create_dir_all(&phase_dir)?;
     std::fs::write(phase_dir.join("producer-release.txt"), format!(
-        "observed={released}\nsession_socket_exists={}\n",
+        "observed={released}\npublished_sequences={sequence}\nsession_socket_exists={}\n",
         session_socket.exists()
     ))?;
-    anyhow::ensure!(released, "scripted producer never observed the designed session release");
+    // Persist receiver evidence before the release assertion: otherwise a
+    // missed release leaves no record of whether the receiver produced frames.
     std::fs::write(phase_dir.join("stdout.txt"), &output.stdout)?;
     std::fs::write(phase_dir.join("stderr.txt"), &output.stderr)?;
     std::fs::write(phase_dir.join("exit.txt"), format!("EXIT={:?}\n", output.status.code()))?;
+    anyhow::ensure!(released, "scripted producer never observed the designed session release");
     anyhow::ensure!(output.status.success(), "scripted receiver failed at {}: {}", raw_root.display(), String::from_utf8_lossy(&output.stderr));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout)?;
     anyhow::ensure!(report["pass"] == true && report["browser_path"] == "webrtc_data_channel", "scripted WebRTC path missing: {report}");
@@ -475,7 +511,6 @@ async fn run_scripted_lifecycle(scenario: &str) -> anyhow::Result<()> {
     let sequences: Vec<u64> = frames.iter().map(|frame| frame["sequence"].as_u64().unwrap_or(0)).collect();
     anyhow::ensure!(sequences.windows(2).all(|pair| pair[1] > pair[0]), "scripted sequence did not increase: {report}");
 
-    drop(producer);
     let mut endpoint = endpoint;
     let _ = endpoint.kill().await;
     let _ = endpoint.wait().await;
