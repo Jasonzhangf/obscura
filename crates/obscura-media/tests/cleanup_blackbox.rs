@@ -8,7 +8,10 @@
 //! public entrypoint can be used again against the same consumer directory.
 
 use std::{
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
+    os::unix::{
+        fs::{DirBuilderExt, PermissionsExt},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     process::Stdio,
     time::Duration,
@@ -329,45 +332,65 @@ async fn standalone_adapter_retires_group_authority_before_reaping_empty_encoder
         "G4: the encoder leader identity must still be pinned when the group is signalled, not reaped first");
 }
 
-/// G5: the standalone adapter must honour SIGTERM while it is idle, waiting on a
-/// raw frame header. Before the fix SIGTERM was queued until the next encode, so
-/// the process ignored it indefinitely and retained its control socket. The
-/// adapter must exit within a bounded window and remove the socket path.
+/// G5: the standalone adapter must honour SIGTERM the moment it publishes its
+/// control socket. Before the fix SIGTERM was queued until the next encode, so
+/// the process ignored it indefinitely and retained its control socket.
+///
+/// A second window remains after that fix: `main.rs` binds the
+/// `encoder-control.sock` path before it installs the SIGTERM handler. A signal
+/// delivered inside that window is handled with the default disposition, so the
+/// process dies without running `Drop`, the socket path survives, and the next
+/// invocation against the same consumer directory fails to bind with
+/// `EADDRINUSE`.
+///
+/// The window is sub-millisecond and opens at the instant the path becomes
+/// observable, so a single sample catches it only some of the time. Each cycle
+/// below signals as soon as the path exists, and every cycle must exit through
+/// the handler (never by a signal) and must leave no path behind.
 #[tokio::test]
 async fn standalone_adapter_exits_on_sigterm_while_waiting_for_frames() {
-    let dir = Directory::new();
-    let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
-    let video = UnixListener::bind(dir.0.join("video")).unwrap();
-    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
-    command.arg("--frames-socket").arg(dir.0.join("raw"))
-        .arg("--video-socket").arg(dir.0.join("video"));
-    let mut child = command.stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
-    let (_source, _) = raw.accept().await.unwrap();
-    let (_receiver, _) = video.accept().await.unwrap();
-    // The standalone adapter binds its own control socket in the consumer
-    // directory; wait until it exists before signalling.
-    let control = dir.0.join("encoder-control.sock");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !control.exists() {
-        assert!(tokio::time::Instant::now() < deadline, "standalone control socket was never bound");
-        tokio::time::sleep(Duration::from_millis(20)).await;
+    const CYCLES: usize = 10;
+    for cycle in 0..CYCLES {
+        let dir = Directory::new();
+        let raw = UnixListener::bind(dir.0.join("raw")).unwrap();
+        let video = UnixListener::bind(dir.0.join("video")).unwrap();
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-media"));
+        command.arg("--frames-socket").arg(dir.0.join("raw"))
+            .arg("--video-socket").arg(dir.0.join("video"));
+        let mut child = command.stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn().unwrap();
+        let (_source, _) = raw.accept().await.unwrap();
+        let (_receiver, _) = video.accept().await.unwrap();
+        // The standalone adapter binds its own control socket in the consumer
+        // directory. Poll without sleeping: the signal must land as close to the
+        // bind as the product allows, because that is the window under test.
+        let control = dir.0.join("encoder-control.sock");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !control.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "standalone control socket was never bound");
+            tokio::task::yield_now().await;
+        }
+        let pid = child.id().expect("standalone adapter pid") as i32;
+        // Safety: signaling the one adapter process this test spawned.
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "SIGTERM the standalone adapter");
+        // The raw source stays idle: no frame is ever sent. The adapter must still
+        // observe the lifetime signal and exit within its bounded window.
+        let exited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        let status = match exited {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => panic!("G5 cycle {cycle}: waiting for the standalone adapter failed: {error}"),
+            Err(_) => {
+                // Keep a pre-fix run from leaking the still-running fixture adapter.
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                panic!("G5 cycle {cycle}: the idle standalone adapter ignored SIGTERM and did not exit within its bounded window");
+            }
+        };
+        assert_eq!(status.signal(), None,
+            "G5 cycle {cycle}: the standalone adapter was killed by a signal instead of handling SIGTERM, \
+             so it never removed its encoder-control socket path");
+        assert!(!control.exists(),
+            "G5 cycle {cycle}: the interrupted standalone adapter must remove its encoder-control socket path");
     }
-    let pid = child.id().expect("standalone adapter pid") as i32;
-    // Safety: signaling the one adapter process this test spawned.
-    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0, "SIGTERM the standalone adapter");
-    // The raw source stays idle: no frame is ever sent. The adapter must still
-    // observe the lifetime signal and exit within its bounded window.
-    let exited = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-    if exited.is_err() {
-        // Keep a pre-fix run from leaking the still-running fixture adapter.
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-    }
-    assert!(exited.is_ok(),
-        "G5: the idle standalone adapter ignored SIGTERM and did not exit within its bounded window");
-    let socket_removed = !control.exists();
-    assert!(socket_removed,
-        "G5: the interrupted standalone adapter must remove its encoder-control socket path");
 }
 
 /// Write a wrapper encoder whose leader exits on its own while a same-group

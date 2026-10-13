@@ -38,6 +38,17 @@ struct Args {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let args = Args::parse();
+    // Install the lifetime signal receivers before this invocation publishes any
+    // observable resource. The standalone control socket below is the marker a
+    // consumer waits for before it signals. A handler installed after that bind
+    // leaves a window in which SIGTERM keeps its default disposition: the process
+    // dies without running `Drop`, the socket path survives, and the next
+    // invocation against the same consumer directory cannot bind it.
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // One receiver pair is shared for the whole lifetime: each raced operation
+    // re-borrows it so a signal that arrives during any await is observed, not
+    // queued until the next encode.
+    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     let socket = tokio::net::UnixStream::connect(&args.frames_socket).await.context("Connect Host frame socket")?;
     let mut reader = BufReader::new(socket);
     let mut output = tokio::net::UnixStream::connect(&args.video_socket).await.context("Connect encoded media consumer")?;
@@ -68,11 +79,6 @@ async fn main() -> Result<()> {
                 .context("Open standalone encoder control")?
         }
     };
-    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    // One receiver pair is shared for the whole lifetime: each raced operation
-    // re-borrows it so a signal that arrives during any await is observed, not
-    // queued until the next encode.
-    let mut ctrl_c = Box::pin(tokio::signal::ctrl_c());
     let encoder_id = uuid::Uuid::new_v4().to_string();
     let start = Instant::now();
     let mut session = None;
