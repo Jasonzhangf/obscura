@@ -22,7 +22,10 @@ All CDP sessions read and write to the same directory. Run separate `obscura ser
 Inside `./obscura-data`:
 
 - `cookies.json`: cookie jar in a stable format with `same_site`, `expires`, `http_only`, `secure`.
-- `localStorage/<origin>.json`: one file per origin.
+- `localStorage/<origin-key>.json`: one file per origin. Tuple origins use the
+  hex encoding of the ASCII origin serialization; opaque origins (for example
+  `data:`) use a SHA-256 digest of the document URL so the name stays bounded
+  and two distinct opaque documents never collide.
 
 The format is stable. Inspect with `jq`:
 

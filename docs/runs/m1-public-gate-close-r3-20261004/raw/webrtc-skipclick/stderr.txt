@@ -1,0 +1,411 @@
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:136:22
+    |
+136 |     pub fn as_family(&self) -> Family {
+    |                      ^^^^^     ^^^^^^ the same lifetime is hidden here
+    |                      |
+    |                      the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+136 |     pub fn as_family(&self) -> Family<'_> {
+    |                                      ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:611:21
+    |
+611 |     pub fn as_attrs(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+611 |     pub fn as_attrs(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:651:21
+    |
+651 |     pub fn defaults(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+651 |     pub fn defaults(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:683:21
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs {
+    |                     ^^^^^                   ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs<'_> {
+    |                                                  ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/buffer.rs:868:24
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter {
+    |                        ^^^^^     ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                        |
+    |                        the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter<'_> {
+    |                                               ++++
+
+warning: `cosmic-text` (lib) generated 5 warnings (run `cargo fix --lib -p cosmic-text` to apply 5 suggestions)
+warning: unused variable: `document_sheet`
+    --> crates/obscura-render/src/dom.rs:2569:5
+     |
+2569 |     document_sheet: &crate::css::Stylesheet,
+     |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_document_sheet`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `obscura-render` (lib) generated 1 warning (run `cargo fix --lib -p obscura-render` to apply 1 suggestion)
+warning: constant `K_CF_NUMBER_INT_TYPE` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:34:7
+   |
+34 | const K_CF_NUMBER_INT_TYPE: i32 = 9;
+   |       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `K_CF_STRING_ENCODING_UTF8` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:35:7
+   |
+35 | const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `profile_level` is never used
+   --> crates/obscura-media/src/videotoolbox.rs:706:12
+    |
+458 | impl VtSession {
+    | -------------- method in this implementation
+...
+706 |     pub fn profile_level(&self) -> Option<String> {
+    |            ^^^^^^^^^^^^^
+
+warning: function `CFStringGetCString` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:81:8
+   |
+81 |     fn CFStringGetCString(
+   |        ^^^^^^^^^^^^^^^^^^
+
+warning: `obscura-media` (lib) generated 4 warnings
+warning: variable does not need to be mutable
+   --> crates/obscura-host/src/catalog.rs:131:25
+    |
+131 |                     let mut store = Self {
+    |                         ----^^^^^
+    |                         |
+    |                         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `editor_context` is never read
+   --> crates/obscura-host/src/worker.rs:388:9
+    |
+388 |         editor_context = None;
+    |         ^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `MembershipReceipt` is never constructed
+  --> crates/obscura-host/src/catalog.rs:86:12
+   |
+86 | pub struct MembershipReceipt {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `root_configured`, `catalog_revision`, `access_for`, and `assign_access` are never used
+   --> crates/obscura-host/src/catalog.rs:145:12
+    |
+100 | impl ProfileCatalogStore {
+    | ------------------------ methods in this implementation
+...
+145 |     pub fn root_configured(&self) -> bool { self.root.is_some() }
+    |            ^^^^^^^^^^^^^^^
+146 |
+147 |     pub fn catalog_revision(&self) -> u64 { self.catalog_revision }
+    |            ^^^^^^^^^^^^^^^^
+...
+178 |     pub fn access_for(&self, profile_id: &str) -> Option<&ProfileAccess> {
+    |            ^^^^^^^^^^
+...
+236 |     pub fn assign_access(
+    |            ^^^^^^^^^^^^^
+
+warning: variant `Release` is never constructed
+  --> crates/obscura-host/src/daemon.rs:31:5
+   |
+21 | enum Event {
+   |      ----- variant in this enum
+...
+31 |     Release { connection: u64, reply: oneshot::Sender<Result<(), &'static str>> },
+   |     ^^^^^^^
+
+warning: field `profile` is never read
+   --> crates/obscura-host/src/daemon.rs:152:5
+    |
+129 | struct Session {
+    |        ------- field in this struct
+...
+152 |     profile: ProfileBinding,
+    |     ^^^^^^^
+
+warning: fields `session_id` and `reservation_id` are never read
+   --> crates/obscura-host/src/daemon.rs:827:5
+    |
+825 | struct Route {
+    |        ----- fields in this struct
+826 |     profile_id: String,
+827 |     session_id: String,
+    |     ^^^^^^^^^^
+828 |     reservation_id: String,
+    |     ^^^^^^^^^^^^^^
+
+warning: function `write_remote_admission_request` is never used
+   --> crates/obscura-host/src/remote_admission.rs:233:14
+    |
+233 | pub async fn write_remote_admission_request(
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `read_remote_admission_result` is never used
+   --> crates/obscura-host/src/remote_admission.rs:250:14
+    |
+250 | pub async fn read_remote_admission_result(
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProjectionClient` is never constructed
+   --> crates/obscura-host/src/remote_authorization.rs:185:12
+    |
+185 | pub struct ProjectionClient {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: struct `ProjectionFile` is never constructed
+   --> crates/obscura-host/src/remote_authorization.rs:194:12
+    |
+194 | pub struct ProjectionFile {
+    |            ^^^^^^^^^^^^^^
+
+warning: struct `LoadedProjection` is never constructed
+   --> crates/obscura-host/src/remote_authorization.rs:203:12
+    |
+203 | pub struct LoadedProjection {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: associated items `load`, `principal_for_cert`, `registry_sha256`, and `authorization_revision` are never used
+   --> crates/obscura-host/src/remote_authorization.rs:209:12
+    |
+208 | impl LoadedProjection {
+    | --------------------- associated items in this implementation
+209 |     pub fn load(path: &Path) -> Result<Self> {
+    |            ^^^^
+...
+243 |     pub fn principal_for_cert(&self, cert_sha256: &[u8; 32]) -> Option<(RemotePrincipalContext, InitialProfileGrant)> {
+    |            ^^^^^^^^^^^^^^^^^^
+...
+263 |     pub fn registry_sha256(&self) -> &str {
+    |            ^^^^^^^^^^^^^^^
+...
+267 |     pub fn authorization_revision(&self) -> u64 {
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `EndpointStatusReceipt` is never constructed
+   --> crates/obscura-host/src/remote_authorization.rs:275:12
+    |
+275 | pub struct EndpointStatusReceipt {
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `ready` is never used
+   --> crates/obscura-host/src/remote_authorization.rs:284:12
+    |
+283 | impl EndpointStatusReceipt {
+    | -------------------------- associated function in this implementation
+284 |     pub fn ready(projection: &LoadedProjection, endpoint_pid: u32) -> Self {
+    |            ^^^^^
+
+warning: function `sha256` is never used
+   --> crates/obscura-host/src/remote_authorization.rs:295:8
+    |
+295 | pub fn sha256(data: &[u8]) -> [u8; 32] {
+    |        ^^^^^^
+
+warning: function `encode_hex` is never used
+   --> crates/obscura-host/src/remote_authorization.rs:304:8
+    |
+304 | pub fn encode_hex(bytes: &[u8]) -> String {
+    |        ^^^^^^^^^^
+
+warning: `obscura-host` (bin "obscura-host") generated 17 warnings (run `cargo fix --bin "obscura-host" -p obscura-host` to apply 1 suggestion)
+   Compiling obscura-host v0.1.0 (/Volumes/Intel/playground/obscura/m1-public-gate-close-r3-20261004/crates/obscura-host)
+warning: method `wire_name` is never used
+  --> crates/obscura-host/src/endpoint/../remote_admission.rs:44:18
+   |
+43 | impl RemoteScope {
+   | ---------------- method in this implementation
+44 |     pub const fn wire_name(self) -> &'static str {
+   |                  ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `denial` is never used
+  --> crates/obscura-host/src/endpoint/../remote_admission.rs:93:12
+   |
+92 | impl RemoteAdmissionResult {
+   | -------------------------- associated function in this implementation
+93 |     pub fn denial(request_id: u64, code: RemoteAdmissionErrorCode, message: impl Into<String>) -> Self {
+   |            ^^^^^^
+
+warning: enum `AdmissionReadError` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:138:10
+    |
+138 | pub enum AdmissionReadError {
+    |          ^^^^^^^^^^^^^^^^^^
+
+warning: method `message` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:145:18
+    |
+144 | impl AdmissionReadError {
+    | ----------------------- method in this implementation
+145 |     pub const fn message(self) -> &'static str {
+    |                  ^^^^^^^
+
+warning: enum `AdmissionRead` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:155:10
+    |
+155 | pub enum AdmissionRead {
+    |          ^^^^^^^^^^^^^
+
+warning: struct `RemoteConnectionIo` is never constructed
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:163:12
+    |
+163 | pub struct RemoteConnectionIo {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_stream` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:169:12
+    |
+168 | impl RemoteConnectionIo {
+    | ----------------------- associated function in this implementation
+169 |     pub fn from_stream(stream: tokio::net::UnixStream) -> Self {
+    |            ^^^^^^^^^^^
+
+warning: function `read_remote_admission` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:178:14
+    |
+178 | pub async fn read_remote_admission(
+    |              ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `admission_error_result` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:209:8
+    |
+209 | pub fn admission_error_result(failure: AdmissionReadError) -> RemoteAdmissionResult {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_remote_admission_result` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:218:14
+    |
+218 | pub async fn write_remote_admission_result(
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `AuthFailure` is never constructed
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:26:12
+   |
+26 | pub struct AuthFailure {
+   |            ^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:32:12
+   |
+31 | impl AuthFailure {
+   | ---------------- associated function in this implementation
+32 |     pub fn new(code: RemoteAdmissionErrorCode, message: impl Into<String>) -> Self {
+   |            ^^^
+
+warning: enum `DeviceStatus` is never used
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:48:10
+   |
+48 | pub enum DeviceStatus {
+   |          ^^^^^^^^^^^^
+
+warning: struct `RegistryDevice` is never constructed
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:57:12
+   |
+57 | pub struct RegistryDevice {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `RegistryFile` is never constructed
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:73:12
+   |
+73 | pub struct RegistryFile {
+   |            ^^^^^^^^^^^^
+
+warning: associated items `parse`, `load`, and `authorize` are never used
+   --> crates/obscura-host/src/endpoint/../remote_authorization.rs:83:12
+    |
+ 80 | impl RegistryFile {
+    | ----------------- associated items in this implementation
+...
+ 83 |     pub fn parse(bytes: &[u8]) -> Result<Self> {
+    |            ^^^^^
+...
+110 |     pub fn load(path: &Path) -> Result<Self> {
+    |            ^^^^
+...
+117 |     pub fn authorize(&self, principal: &RemotePrincipalContext) -> Result<InitialProfileGrant, AuthFailure> {
+    |            ^^^^^^^^^
+
+warning: function `unix_now` is never used
+   --> crates/obscura-host/src/endpoint/../remote_authorization.rs:339:4
+    |
+339 | fn unix_now() -> i64 {
+    |    ^^^^^^^^
+
+warning: `obscura-host` (bin "obscura-endpoint") generated 17 warnings
+    Finished `release` profile [optimized] target(s) in 5.78s
+────────────
+ Nextest run ID 995f5cfc-48ef-4cd3-9452-7072fa8f65fe with nextest profile: default
+    Starting 1 test across 1 binary (1 test skipped)
+        FAIL [   5.156s] (1/1) obscura-host::webrtc_endpoint real_receiver_gets_continuous_host_media_and_rejects_stale_binding
+  stdout ───
+
+    running 1 test
+    test real_receiver_gets_continuous_host_media_and_rejects_stale_binding ... FAILED
+
+    failures:
+
+    failures:
+        real_receiver_gets_continuous_host_media_and_rejects_stale_binding
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 5.15s
+
+  stderr ───
+
+    thread 'real_receiver_gets_continuous_host_media_and_rejects_stale_binding' (799954629) panicked at crates/obscura-host/tests/webrtc_endpoint.rs:11:123:
+    called `Result::unwrap()` on an `Err` value: Host click did not produce a different WebRTC frame: {"attachment_id":2,"browser_path":"webrtc_data_channel","frames":[{"access_unit_bytes":1222,"changed":false,"checksum":6256772619932058814,"codec":"h264_annex_b","coded_height":120,"coded_width":160,"document_revision":1,"encoder_id":"e98588c4-0ed8-4206-9f11-857fb4c7a08d","height":120,"keyframe":true,"pts_us":336675,"rtp_packets":3,"rtp_timestamp":3066071676,"sequence":2,"session_id":"0c2f1596-4791-4ce4-9289-b2e566293f38","source_byte_length":76800,"stride":640,"viewport_revision":1,"width":160},{"access_unit_bytes":1222,"changed":false,"checksum":6256772619932058814,"codec":"h264_annex_b","coded_height":120,"coded_width":160,"document_revision":1,"encoder_id":"e98588c4-0ed8-4206-9f11-857fb4c7a08d","height":120,"keyframe":true,"pts_us":538018,"rtp_packets":3,"rtp_timestamp":3066101646,"sequence":3,"session_id":"0c2f1596-4791-4ce4-9289-b2e566293f38","source_byte_length":76800,"stride":640,"viewport_revision":1,"width":160},{"access_unit_bytes":1222,"changed":false,"checksum":6256772619932058814,"codec":"h264_annex_b","coded_height":120,"coded_width":160,"document_revision":1,"encoder_id":"e98588c4-0ed8-4206-9f11-857fb4c7a08d","height":120,"keyframe":true,"pts_us":870927,"rtp_packets":3,"rtp_timestamp":3066131616,"sequence":4,"session_id":"0c2f1596-4791-4ce4-9289-b2e566293f38","source_byte_length":76800,"stride":640,"viewport_revision":1,"width":160}],"ice":{"local_candidate":{"address":"127.0.0.1","candidate_type":"host","port":51939,"protocol":"udp"},"remote_candidate":{"address":"127.0.0.1","candidate_type":"host","port":59442,"protocol":"udp"},"transport":"udp"},"pass":true,"session_id":"0c2f1596-4791-4ce4-9289-b2e566293f38"}
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   5.160s] 1 test run: 0 passed, 1 failed, 1 skipped
+        FAIL [   5.156s] (1/1) obscura-host::webrtc_endpoint real_receiver_gets_continuous_host_media_and_rejects_stale_binding
+error: test run failed

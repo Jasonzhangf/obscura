@@ -1,0 +1,297 @@
+# task-47 before-state raw lines (HEAD 35b58be, tree 2 dirty paths)
+
+## daemon.rs:867 verify_current_authorization + :885 remote_request_gate (per-command fence, scope check :912, REMOTE_COMMAND_FORBIDDEN :900)
+   864	/// Re-read the current committed registry and verify the presented principal.
+   865	/// This is the per-command authorization truth; a stale or revoked revision is
+   866	/// refused with no fallback to a cached projection.
+   867	fn verify_current_authorization(
+   868	    registry_path: Option<&std::path::Path>,
+   869	    principal: &RemotePrincipalContext,
+   870	) -> Result<(), AuthFailure> {
+   871	    let Some(path) = registry_path else {
+   872	        return Err(AuthFailure::new(
+   873	            RemoteAdmissionErrorCode::RemoteAuthRequired,
+   874	            "Host has no authorization registry configured",
+   875	        ));
+   876	    };
+   877	    let registry = remote_authorization::RegistryFile::load(path).map_err(|cause| {
+   878	        AuthFailure::new(RemoteAdmissionErrorCode::RemoteAuthRequired, format!("Authorization registry unavailable: {cause}"))
+   879	    })?;
+   880	    registry.authorize(principal).map(|_| ())
+   881	}
+   882	
+   883	/// Per-command remote gate. Scope and registry revision are re-checked for
+   884	/// every request; a bare endpoint allowlist never substitutes for this.
+   885	fn remote_request_gate(
+   886	    id: u64,
+   887	    request: &Request,
+   888	    principal: &RemotePrincipalContext,
+   889	    registry_path: Option<&std::path::Path>,
+   890	) -> Option<Response> {
+   891	    let local_only = matches!(
+   892	        request.command,
+   893	        Command::FlushProfiles {}
+   894	            | Command::CloseSession {}
+   895	            | Command::Evaluate { .. }
+   896	            | Command::Resize { .. }
+   897	            | Command::ResumeAgent { .. }
+   898	    ) || matches!(request.command, Command::Attach { mode: Mode::Agent, .. });
+   899	    if local_only {
+   900	        return Some(error(id, "REMOTE_COMMAND_FORBIDDEN", "Remote access permits observation and human browser operations only"));
+   901	    }
+   902	    if let Err(failure) = verify_current_authorization(registry_path, principal) {
+   903	        return Some(error(id, failure.code.as_str(), failure.message));
+   904	    }
+   905	    let required = match &request.command {
+   906	        Command::ProfileCatalog {} => RemoteScope::ProfileRead,
+   907	        Command::ProfileCreate { .. } => RemoteScope::ProfileCreate,
+   908	        Command::ProfileSelect { .. } => RemoteScope::ProfileSelect,
+   909	        _ => RemoteScope::ObserveHumanControl,
+   910	    };
+   911	    if !principal.scopes.contains(&required) {
+   912	        return Some(error(id, "REMOTE_PROFILE_SCOPE_REQUIRED", format!("Remote principal lacks {} scope", required.wire_name())));
+   913	    }
+   914	    None
+   915	}
+   916	
+
+## daemon.rs:920 resolve_remote_admission (registry load :937, authorize :941, grant equality :945, device match :948, scope :951, default binding :954-968)
+   917	/// Resolve one completely decoded admission request against the current
+   918	/// registry and Host catalog, then reserve the route on the same accepted
+   919	/// stream. Every denial is returned as a correlated `RemoteAdmissionResult`.
+   920	async fn resolve_remote_admission(
+   921	    registry_path: Option<&std::path::Path>,
+   922	    catalog: &ProfileCatalogStore,
+   923	    sessions: &mut HashMap<String, SessionRuntime>,
+   924	    conn_route: &mut HashMap<u64, Route>,
+   925	    conn_principal: &mut HashMap<u64, RemotePrincipalContext>,
+   926	    socket_dir: &std::path::Path,
+   927	    connection: u64,
+   928	    request: RemoteAdmissionRequest,
+   929	    allow_private_network: bool,
+   930	    fault_tx: &mpsc::Sender<(String, worker::PageUpdate)>,
+   931	) -> RemoteAdmissionResult {
+   932	    let request_id = request.request_id;
+   933	    let deny = |code: RemoteAdmissionErrorCode, message: String| RemoteAdmissionResult::denial(request_id, code, message);
+   934	    let Some(path) = registry_path else {
+   935	        return deny(RemoteAdmissionErrorCode::RemoteAuthRequired, "Host has no authorization registry configured".into());
+   936	    };
+   937	    let registry = match remote_authorization::RegistryFile::load(path) {
+   938	        Ok(registry) => registry,
+   939	        Err(cause) => return deny(RemoteAdmissionErrorCode::RemoteAuthRequired, format!("Authorization registry unavailable: {cause}")),
+   940	    };
+   941	    let grant = match registry.authorize(&request.principal) {
+   942	        Ok(grant) => grant,
+   943	        Err(failure) => return deny(failure.code, failure.message),
+   944	    };
+   945	    if request.initial != grant {
+   946	        return deny(RemoteAdmissionErrorCode::RemotePrincipalRevoked, "Initial profile grant does not match the current registry".into());
+   947	    }
+   948	    if request.principal.device_id != request.initial.device_id {
+   949	        return deny(RemoteAdmissionErrorCode::RemoteAuthRequired, "Admission principal and initial grant belong to different devices".into());
+   950	    }
+   951	    if !request.principal.scopes.contains(&RemoteScope::ObserveHumanControl) {
+   952	        return deny(RemoteAdmissionErrorCode::RemoteProfileScopeRequired, "Remote principal lacks observe_human_control".into());
+   953	    }
+   954	    let profile_id = match grant.selection {
+   955	        remote_admission::InitialProfileSelection::DefaultProfile => match catalog.default_id() {
+   956	            Some(id) => id,
+   957	            None => return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, "Catalog has no default profile".into()),
+   958	        },
+   959	        remote_admission::InitialProfileSelection::ProfileId(id) => id,
+   960	    };
+   961	    let Some(entry) = catalog.record(&profile_id) else {
+   962	        return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Profile {profile_id} does not exist"));
+   963	    };
+   964	    let Some(access) = entry.access.as_ref() else {
+   965	        return deny(RemoteAdmissionErrorCode::ProfileAccessMigrationRequired, format!("Profile {profile_id} has no Host-side access record"));
+   966	    };
+   967	    if !access.grants(&request.principal.device_id) {
+   968	        return deny(RemoteAdmissionErrorCode::RemoteInitialProfileAccessDenied, format!("Profile {profile_id} does not grant this device"));
+   969	    }
+   970	    let profile_dir = catalog.profile_dir(&profile_id);
+   971	    if !sessions.contains_key(&profile_id) {
+   972	        match spawn_session(profile_id.clone(), profile_dir, allow_private_network, fault_tx.clone(), socket_dir).await {
+   973	            Ok(runtime) => { sessions.insert(profile_id.clone(), runtime); }
+   974	            Err(cause) => return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Session unavailable: {cause}")),
+   975	        }
+   976	    }
+   977	    let Some(runtime) = sessions.get(&profile_id) else {
+   978	        return deny(RemoteAdmissionErrorCode::RemoteInitialProfileUnbound, format!("Session {profile_id} unavailable"));
+   979	    };
+   980	    let session_id = runtime.session.id.clone();
+   981	    let reservation_id = uuid::Uuid::new_v4().to_string();
+   982	    conn_route.insert(connection, Route { profile_id, session_id: session_id.clone(), reservation_id: reservation_id.clone() });
+   983	    conn_principal.insert(connection, request.principal.clone());
+   984	    RemoteAdmissionResult::Ok { request_id, reservation_id, session_id }
+   985	}
+
+## daemon.rs:1576 admission handler + :1598 per-command gate call site + :1656/:1719 access denials
+  1598	                Event::Request { connection, request, reply } => {
+  1599	                    let id = request.id;
+  1600	                    let remote_principal = conn_principal.get(&connection).cloned();
+  1601	                    if let Some(principal) = &remote_principal {
+  1602	                        if let Some(response) = remote_request_gate(id, &request, principal, authorization_registry.as_deref()) {
+  1603	                            let _ = reply.send(response);
+  1604	                            continue;
+  1605	                        }
+  1606	                    }
+  1607	                    let request_target = if remote_principal.is_some() {
+  1608	                        conn_session.get(&connection).cloned().or_else(|| conn_route.get(&connection).map(|route| route.profile_id.clone()))
+  1609	                    } else {
+  1610	                        conn_session.get(&connection).cloned().or_else(|| Some(presented.clone()))
+  1611	                    };
+  1612	                    if let Some(target) = &request_target {
+  1656	                            if let Some(principal) = &remote_principal {
+  1657	                                match &target_entry.access {
+  1658	                                    Some(access) if access.grants(&principal.device_id) => {}
+  1659	                                    Some(_) => {
+  1660	                                        let _ = reply.send(error(id, "REMOTE_INITIAL_PROFILE_ACCESS_DENIED", "Profile does not grant this remote device"));
+  1661	                                        continue;
+  1662	                                    }
+  1663	                                    None => {
+  1664	                                        let _ = reply.send(error(id, "PROFILE_ACCESS_MIGRATION_REQUIRED", "Profile has no Host-side access record"));
+  1665	                                        continue;
+  1666	                                    }
+  1667	                                }
+  1668	                            }
+  1719	                    if let Some(principal) = &remote_principal {
+  1720	                        match catalog.record(&target).and_then(|entry| entry.access.as_ref()) {
+  1721	                            Some(access) if access.grants(&principal.device_id) => {}
+  1722	                            Some(_) => {
+  1723	                                let _ = reply.send(error(id, "REMOTE_INITIAL_PROFILE_ACCESS_DENIED", "Profile does not grant this remote device"));
+  1724	                                continue;
+  1725	                            }
+  1726	                            None if catalog.record(&target).is_some() => {
+  1727	                                let _ = reply.send(error(id, "PROFILE_ACCESS_MIGRATION_REQUIRED", "Profile has no Host-side access record"));
+  1728	                                continue;
+  1729	                            }
+  1730	                            None => {
+  1731	                                let _ = reply.send(error(id, "SESSION_UNAVAILABLE", "Authorized profile is unavailable"));
+  1732	                                continue;
+  1733	                            }
+  1734	                        }
+  1735	                    }
+
+## remote_authorization.rs:26 AuthFailure + :117 RegistryFile::authorize
+    23	/// A typed authorization failure. It always carries the frozen admission code
+    24	/// so the Host admission owner writes one correlated refusal.
+    25	#[derive(Debug, Clone, PartialEq, Eq)]
+    26	pub struct AuthFailure {
+    27	    pub code: RemoteAdmissionErrorCode,
+    28	    pub message: String,
+    29	}
+    30	
+    31	impl AuthFailure {
+    32	    pub fn new(code: RemoteAdmissionErrorCode, message: impl Into<String>) -> Self {
+    33	        Self { code, message: message.into() }
+    34	    }
+    35	}
+   115	    /// Independently verify a presented principal against the current committed
+   116	    /// registry material and return the registry-owned initial grant.
+   117	    pub fn authorize(&self, principal: &RemotePrincipalContext) -> Result<InitialProfileGrant, AuthFailure> {
+   118	        if principal.device_id.trim().is_empty() {
+   119	            return Err(AuthFailure::new(
+   120	                RemoteAdmissionErrorCode::RemoteAuthRequired,
+   121	                "Remote principal has no device identity",
+   122	            ));
+   123	        }
+   124	        if principal.authorization_revision != self.authorization_revision {
+   125	            return Err(AuthFailure::new(
+   126	                RemoteAdmissionErrorCode::RemotePrincipalRevoked,
+   127	                "Remote principal was derived from a stale authorization revision",
+   128	            ));
+   129	        }
+   130	        let device = self
+   131	            .devices
+   132	            .iter()
+   133	            .find(|device| device.device_id == principal.device_id)
+   134	            .ok_or_else(|| AuthFailure::new(
+   135	                RemoteAdmissionErrorCode::RemoteAuthRequired,
+   136	                "Remote device is not registered",
+   137	            ))?;
+   138	        if device.status != DeviceStatus::Active {
+   139	            return Err(AuthFailure::new(
+   140	                RemoteAdmissionErrorCode::RemotePrincipalRevoked,
+   141	                "Remote device is revoked",
+   142	            ));
+   143	        }
+   144	        let now = unix_now();
+   145	        if now < device.not_before_unix || now > device.not_after_unix {
+   146	            return Err(AuthFailure::new(
+   147	                RemoteAdmissionErrorCode::RemotePrincipalRevoked,
+   148	                "Remote device certificate is outside its authorization window",
+   149	            ));
+   150	        }
+   151	        let fingerprint = decode_hex(&device.client_certificate_sha256).ok_or_else(|| AuthFailure::new(
+   152	            RemoteAdmissionErrorCode::RemoteAuthRequired,
+   153	            "Registry certificate fingerprint is malformed",
+   154	        ))?;
+   155	        if fingerprint.as_slice() != principal.client_cert_sha256.as_slice() {
+   156	            return Err(AuthFailure::new(
+   157	                RemoteAdmissionErrorCode::RemoteAuthRequired,
+   158	                "Remote principal certificate does not match the registry",
+   159	            ));
+   160	        }
+   161	        let scopes: BTreeSet<RemoteScope> = device.scopes.iter().copied().collect();
+   162	        if scopes != principal.scopes {
+   163	            return Err(AuthFailure::new(
+   164	                RemoteAdmissionErrorCode::RemoteAuthRequired,
+   165	                "Remote principal scope set does not match the registry",
+   166	            ));
+   167	        }
+   168	        if device.initial_profile_grant.authorization_revision != self.authorization_revision {
+   169	            return Err(AuthFailure::new(
+   170	                RemoteAdmissionErrorCode::RemotePrincipalRevoked,
+   171	                "Registry initial profile grant is stale",
+   172	            ));
+   173	        }
+   174	        Ok(InitialProfileGrant {
+   175	            device_id: device.device_id.clone(),
+   176	            authorization_revision: device.initial_profile_grant.authorization_revision,
+   177	            selection: device.initial_profile_grant.selection.clone(),
+   178	        })
+   179	    }
+   180	}
+
+## endpoint/channels.rs:418 forward_remote_request + :432 remote_command_error + :516 is_terminal_authorization_denial + :590 terminal_response
+   418	/// Forward a raw browser request over the already-admitted stream. The endpoint
+   419	/// no longer substitutes a bare command allowlist for Host scope/access
+   420	/// checks; only the local-only maintenance drain stays endpoint-refused.
+   421	async fn forward_remote_request(
+   422	    write: &mut tokio::net::unix::OwnedWriteHalf,
+   423	    reader: &mut BufReader<tokio::net::unix::OwnedReadHalf>,
+   424	    request: Request,
+   425	) -> Result<Response> {
+   426	    if matches!(request.command, Command::FlushProfiles {}) {
+   427	        return Ok(remote_command_error(request.id));
+   428	    }
+   429	    host_request(write, reader, request).await
+   430	}
+   431	
+   432	fn remote_command_error(id: u64) -> Response {
+   433	    Response::Error {
+   434	        id,
+   435	        code: "REMOTE_COMMAND_FORBIDDEN".into(),
+   436	        message: "FlushProfiles is a Host-local maintenance command".into(),
+   437	    }
+   438	}
+   516	/// True only for the frozen typed resident authorization denials. Other
+   517	/// errors, navigation results and log text never trigger the transition.
+   518	fn is_terminal_authorization_denial(response: &Response, request_id: u64) -> bool {
+   519	    matches!(
+   520	        response,
+   521	        Response::Error { id, code, .. }
+   522	            if *id == request_id
+   523	                && (code == RemoteAdmissionErrorCode::RemoteAuthRequired.as_str()
+   524	                    || code == RemoteAdmissionErrorCode::RemotePrincipalRevoked.as_str())
+   525	    )
+   526	}
+   585	/// The single terminal-response decision shared by the WSS and DataChannel
+   586	/// browser-request paths. A response is terminal for this attachment when the
+   587	/// Host either denied the resident principal (`REMOTE_AUTH_REQUIRED` /
+   588	/// `REMOTE_PRINCIPAL_REVOKED`) or reported that the attachment ended, detached
+   589	/// or moved to a different session.
+   590	fn terminal_response(admitted: &MediaState, result: &Response, request_id: u64) -> bool {
+   591	    is_terminal_authorization_denial(result, request_id) || response_ends_media(admitted, result)
+   592	}

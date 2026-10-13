@@ -1062,6 +1062,19 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().cookie_jar = Some(jar);
     }
 
+    /// Install the shared localStorage backend and the origin this runtime's
+    /// `localStorage` is partitioned by. Without it `localStorage` stays
+    /// in-memory, matching the CLI/CDP behavior.
+    pub fn set_local_storage(
+        &self,
+        origin: &str,
+        backend: std::sync::Arc<dyn crate::ops::LocalStorageBackend>,
+    ) {
+        let mut state = self.state.borrow_mut();
+        state.local_storage_origin = origin.to_string();
+        state.local_storage = Some(backend);
+    }
+
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
         self.state.borrow_mut().http_client = Some(client);
     }

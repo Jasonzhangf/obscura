@@ -1,12 +1,12 @@
 #![cfg(unix)]
 
-use std::{collections::BTreeMap, net::{IpAddr, SocketAddr}, path::PathBuf, sync::Arc, time::{Duration, Instant}};
+use std::{collections::BTreeMap, net::{IpAddr, SocketAddr}, path::PathBuf, sync::{Arc, Mutex}, time::{Duration, Instant}};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use obscura_host_protocol::{Command, ControlPhase, InputState, Mode, Operation, PixelFormat,
-    Request, Response, ResultValue, SessionStatus, WebRtcCapability, WebRtcControlMessage,
+use obscura_host_protocol::{Command, ControlPhase, EditingState, InputBinding, InputEnvelope, InputEvent, InputState, Mode, Operation, PixelFormat,
+    PresentedFrameIdentity, Request, Response, ResultValue, SelectionDirection, SessionStatus, WebRtcCapability, WebRtcControlMessage,
     WebRtcSignal, WebRtcVideoCodec, WebRtcVideoFrame, WebRtcTransport,
     WEBRTC_CONTROL_LABEL, WEBRTC_PROTOCOL_VERSION};
 use rtc::{media::io::sample_builder::SampleBuilder, rtp::codec::h264::H264Packet,
@@ -14,11 +14,11 @@ use rtc::{media::io::sample_builder::SampleBuilder, rtp::codec::h264::H264Packet
     rtp_transceiver::rtp_sender::RtpCodecKind};
 use tokio::{net::TcpStream, process::Command as ProcessCommand,
     sync::{mpsc, Notify}, time::timeout};
-use tokio_rustls::{TlsConnector, rustls::{self, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName}}};
+use tokio_rustls::{TlsConnector, rustls::{self, pki_types::{CertificateDer, ServerName}}};
 use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}, WebSocketStream};
 use webrtc_rs::{data_channel::{DataChannel, DataChannelEvent}, media_stream::track_remote::{TrackRemote, TrackRemoteEvent},
     peer_connection::{PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfiguration,
-        RTCIceGatheringState, RTCSessionDescription}};
+        RTCIceGatheringState, RTCPeerConnectionState, RTCSessionDescription}};
 
 use obscura_media::webrtc::h264_media_engine;
 
@@ -26,6 +26,8 @@ const DEADLINE: Duration = Duration::from_secs(20);
 const H264_CLOCK_RATE: u32 = 90_000;
 const MAX_CONTROL_MESSAGE: usize = 64 * 1024;
 const MAX_ASSOCIATIONS: usize = 64;
+/// Correlated request id for the one fence the receiver triggers in terminal mode.
+const TRIGGER_REQUEST_ID: u64 = 200;
 const INPUT_FIXTURE: &str = "data:text/html,<style>body{margin:0}button{position:absolute;left:10px;top:10px;width:120px;height:50px;background:red}input{position:absolute;left:10px;top:80px;width:130px;height:30px}.space{height:3000px;margin-top:150px}</style><button id='target' onclick=\"window.clicks=(window.clicks||0)+1;this.style.background='lime'\">target</button><input id='text'><div class='space'></div>";
 
 #[derive(Parser)]
@@ -33,8 +35,8 @@ const INPUT_FIXTURE: &str = "data:text/html,<style>body{margin:0}button{position
 struct Args {
     #[arg(long)] address: SocketAddr,
     #[arg(long)] ca: PathBuf,
-    #[arg(long)] client_cert: PathBuf,
-    #[arg(long)] client_key: PathBuf,
+    /// The one access token the Host and endpoint share.
+    #[arg(long)] token: String,
     #[arg(long, default_value = "localhost")] server_name: String,
     #[arg(long, default_value = "127.0.0.1")] bind_ip: IpAddr,
     #[arg(long, default_value_t = 3)] frames: usize,
@@ -43,6 +45,20 @@ struct Args {
     #[arg(long, default_value_t = false)] skip_click: bool,
     #[arg(long, default_value_t = false)] bad_binding: bool,
     #[arg(long, default_value_t = false)] expect_encoder_error: bool,
+    /// Keep the authenticated attachment active and observe a terminal instead
+    /// of exiting after `frames`. `off` preserves the historical behavior.
+    /// `none` waits for the producer/source to close; `detach` and `rebind`
+    /// trigger a typed Host fence after the first decoded frame.
+    #[arg(long, default_value = "off")] terminal_trigger: String,
+    /// Transport that carries a self-triggered `detach`/`rebind` fence.
+    /// `data-channel` is the declared browser-operation path; `wss` keeps the
+    /// separate WSS control-socket coverage.
+    #[arg(long, default_value = "data-channel")] terminal_transport: String,
+    /// Written once the first frame is decoded, so an external producer can
+    /// close the source at a known active point.
+    #[arg(long)] ready_file: Option<PathBuf>,
+    /// Finite seconds to wait for the terminal after the trigger.
+    #[arg(long)] terminal_timeout: Option<f64>,
 }
 
 type Socket = WebSocketStream<tokio_rustls::client::TlsStream<TcpStream>>;
@@ -75,11 +91,16 @@ async fn main() -> Result<()> {
     };
     let gather = Arc::new(Notify::new());
     let (track_tx, mut track_rx) = mpsc::channel(1);
+    let terminal = Arc::new(Notify::new());
+    let terminal_state = Arc::new(Mutex::new(None::<String>));
     let peer: Arc<dyn PeerConnection> = Arc::new(
         PeerConnectionBuilder::new()
             .with_configuration(RTCConfiguration::default())
             .with_media_engine(h264_media_engine()?)
-            .with_handler(Arc::new(ReceiverHandler { gather: Arc::clone(&gather), track_tx }))
+            .with_handler(Arc::new(ReceiverHandler {
+                gather: Arc::clone(&gather), track_tx,
+                terminal: Arc::clone(&terminal), terminal_state: Arc::clone(&terminal_state),
+            }))
             .with_udp_addrs(vec![SocketAddr::new(args.bind_ip, 0)])
             .build()
             .await
@@ -148,6 +169,10 @@ async fn main() -> Result<()> {
     wait_for_pong(&mut control_rx, &mut media, &session_id, 3).await?;
     let track = timeout(DEADLINE, track_rx.recv()).await.context("timed out waiting for Host H.264 track")?
         .context("Host WebRTC track ended before media")?;
+    if args.terminal_trigger != "off" {
+        return run_terminal_mode(&args, &data_channel, &mut control, &mut control_rx, &track, &mut media,
+            &session_id, attachment_id, &attached, terminal, terminal_state).await;
+    }
     let mut evidence = Vec::new();
     let mut browser_path_done = args.skip_click;
     let mut status = attached;
@@ -169,9 +194,40 @@ async fn main() -> Result<()> {
         if !browser_path_done && evidence.len() >= 1 && evidence.last().is_some_and(|frame|
             frame.descriptor.source.width == 160 && frame.descriptor.source.height == 120) {
             let initial_epoch = status.control.epoch;
-            let forbidden = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
-                Request { id: 100, command: Command::Evaluate { expression: "window.location.href".into() }, operation: None }).await?;
-            expect_error(forbidden, "REMOTE_COMMAND_FORBIDDEN")?;
+            // Remote evaluation is no longer fenced by a remote-command list.
+            // A mutation still needs an operation identity, and this attachment
+            // is an observer, so the surviving refusal is the agent-only gate.
+            let evaluate = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 100, command: Command::Evaluate { expression: "window.location.href".into() },
+                    operation: Some(operation_for(&status)?) }).await?;
+            expect_error(evaluate, "AGENT_REQUIRED")?;
+            let forbidden_input = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 118, command: Command::Input {
+                    envelope: InputEnvelope {
+                        event_sequence: 0,
+                        frame: PresentedFrameIdentity {
+                            session_id: session_id.clone(),
+                            tab_id: status.active_tab_id.clone(),
+                            presentation_revision: status.presentation_revision,
+                            frame_sequence: 0,
+                            document_revision: status.document_revision,
+                            viewport_revision: status.viewport_revision,
+                        },
+                        binding: InputBinding::Gesture { gesture_session_id: "unauthorized".into() },
+                        event: InputEvent::PointerDown {
+                            pointer_id: 1, x: 10.0, y: 10.0, button: "left".into(), buttons: 1, modifiers: 0,
+                        },
+                    },
+                }, operation: Some(Operation {
+                    operation_id: "unauthorized-input".into(),
+                    session_id: session_id.clone(),
+                    attachment_id,
+                    sequence: status.next_sequence,
+                    control_epoch: status.control.epoch,
+                    viewport_revision: status.viewport_revision,
+                    document_revision: status.document_revision,
+                }) }).await?;
+            expect_error(forbidden_input, "CONTROL_REQUIRED")?;
 
             let takeover = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
                 Request { id: 101, command: Command::RequestTakeover { epoch: initial_epoch }, operation: None }).await?;
@@ -221,6 +277,66 @@ async fn main() -> Result<()> {
             status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
                 Request { id: 112, command: Command::Status {}, operation: None }).await?)?;
 
+            let context = status.editor_context.as_ref().context("Host did not publish EditorContext after focus")?;
+            let mut input_operation = operation_for(&status)?;
+            input_operation.operation_id = "receiver-editor-1".into();
+            let edit = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 116, operation: Some(input_operation.clone()), command: Command::Input {
+                    envelope: InputEnvelope {
+                        event_sequence: 0,
+                        frame: PresentedFrameIdentity {
+                            session_id: status.session_id.clone(),
+                            tab_id: status.active_tab_id.clone(),
+                            presentation_revision: status.presentation_revision,
+                            frame_sequence: 0,
+                            document_revision: status.document_revision,
+                            viewport_revision: status.viewport_revision,
+                        },
+                        binding: InputBinding::Editor {
+                            edit_session_id: "receiver-edit".into(),
+                            target_id: context.target_id.clone(),
+                            focus_revision: context.focus_revision,
+                            editor_revision: context.editor_revision,
+                        },
+                        event: InputEvent::SetSelection { start: 0, end: 7, direction: SelectionDirection::Forward },
+                    },
+                } }).await?;
+            match edit {
+                Response::Result { value: ResultValue::Editing { editing }, .. } => {
+                    ensure!(matches!(editing.state, EditingState::Applied), "Host editing receipt was not applied: {editing:?}");
+                }
+                other => bail!("expected applied WebRTC editing receipt, got {other:?}"),
+            }
+            let replay = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 117, operation: Some(input_operation), command: Command::Input {
+                    envelope: InputEnvelope {
+                        event_sequence: 0,
+                        frame: PresentedFrameIdentity {
+                            session_id: status.session_id.clone(),
+                            tab_id: status.active_tab_id.clone(),
+                            presentation_revision: status.presentation_revision,
+                            frame_sequence: 0,
+                            document_revision: status.document_revision,
+                            viewport_revision: status.viewport_revision,
+                        },
+                        binding: InputBinding::Editor {
+                            edit_session_id: "receiver-edit".into(),
+                            target_id: context.target_id.clone(),
+                            focus_revision: context.focus_revision,
+                            editor_revision: context.editor_revision,
+                        },
+                        event: InputEvent::SetSelection { start: 0, end: 7, direction: SelectionDirection::Forward },
+                    },
+                } }).await?;
+            match replay {
+                Response::Result { value: ResultValue::Editing { editing }, .. } => {
+                    ensure!(matches!(editing.state, EditingState::Applied), "replayed editing receipt changed: {editing:?}");
+                }
+                other => bail!("expected replayed WebRTC editing receipt, got {other:?}"),
+            }
+
+            status = status_from_response(request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
+                Request { id: 119, command: Command::Status {}, operation: None }).await?)?;
             let scroll = request_dc(&data_channel, &mut control_rx, &track, &mut media, &session_id,
                 Request { id: 113, command: Command::Scroll { x: 30.0, y: 100.0, delta_x: 0.0, delta_y: 400.0 }, operation: Some(operation_for(&status)?) }).await?;
             expect_input(scroll)?;
@@ -262,31 +378,218 @@ async fn main() -> Result<()> {
         },
         "session_id": session_id,
         "attachment_id": attachment_id,
-        "frames": evidence.iter().map(|frame| serde_json::json!({
-            "sequence": frame.descriptor.source.sequence,
-            "document_revision": frame.descriptor.source.document_revision,
-            "viewport_revision": frame.descriptor.source.viewport_revision,
-            "session_id": frame.descriptor.source.session_id,
-            "width": frame.descriptor.source.width,
-            "height": frame.descriptor.source.height,
-            "stride": frame.descriptor.source.stride,
-            "source_byte_length": frame.descriptor.source.byte_length,
-            "encoder_id": frame.descriptor.encoder_id,
-            "rtp_timestamp": frame.descriptor.rtp_timestamp,
-            "codec": frame.descriptor.codec,
-            "keyframe": frame.descriptor.keyframe,
-            "access_unit_bytes": frame.descriptor.access_unit_bytes,
-            "coded_width": frame.descriptor.coded_width,
-            "coded_height": frame.descriptor.coded_height,
-            "pts_us": frame.descriptor.pts_us,
-            "checksum": frame.checksum,
-            "rtp_packets": frame.rtp_packets,
-            "changed": frame.changed,
-        })).collect::<Vec<_>>(),
+        "frames": evidence.iter().map(frame_json).collect::<Vec<_>>(),
     }));
     control_reader.abort();
     let _ = control_reader.await;
     let _ = peer.close().await;
+    Ok(())
+}
+
+fn frame_json(frame: &FrameEvidence) -> serde_json::Value {
+    serde_json::json!({
+        "sequence": frame.descriptor.source.sequence,
+        "document_revision": frame.descriptor.source.document_revision,
+        "viewport_revision": frame.descriptor.source.viewport_revision,
+        "session_id": frame.descriptor.source.session_id,
+        "width": frame.descriptor.source.width,
+        "height": frame.descriptor.source.height,
+        "stride": frame.descriptor.source.stride,
+        "source_byte_length": frame.descriptor.source.byte_length,
+        "encoder_id": frame.descriptor.encoder_id,
+        "rtp_timestamp": frame.descriptor.rtp_timestamp,
+        "codec": frame.descriptor.codec,
+        "keyframe": frame.descriptor.keyframe,
+        "access_unit_bytes": frame.descriptor.access_unit_bytes,
+        "coded_width": frame.descriptor.coded_width,
+        "coded_height": frame.descriptor.coded_height,
+        "pts_us": frame.descriptor.pts_us,
+        "checksum": frame.checksum,
+        "rtp_packets": frame.rtp_packets,
+        "changed": frame.changed,
+    })
+}
+
+/// Observed end of an authenticated WebRTC stream. Recorded as public evidence
+/// instead of being treated as a transport error.
+enum Terminal {
+    ControlError { code: String, message: String },
+    DataChannelClosed { detail: String },
+    TrackEnded,
+    PeerState(String),
+}
+
+impl Terminal {
+    fn json(&self) -> serde_json::Value {
+        match self {
+            Terminal::ControlError { code, message } => serde_json::json!({"kind": "control_error", "code": code, "message": message}),
+            Terminal::DataChannelClosed { detail } => serde_json::json!({"kind": "data_channel_closed", "detail": detail}),
+            Terminal::TrackEnded => serde_json::json!({"kind": "track_ended"}),
+            Terminal::PeerState(state) => serde_json::json!({"kind": "peer_state", "state": state}),
+        }
+    }
+}
+
+/// Stay authenticated and active while a typed Host fence or the encoded
+/// producer closes. The receiver triggers the fence itself (detach/rebind) only
+/// after the first decoded frame, or waits for the external producer to close
+/// (`none`), then reports the terminal it actually observed. Every decoded
+/// frame must belong to the admitted session, so a replacement binding cannot
+/// leak into the old stream. A self-triggered fence is issued over the
+/// authenticated DataChannel by default; `--terminal-transport wss` keeps the
+/// separate WSS control-socket coverage. On the DataChannel path the caller
+/// must observe the correlated BrowserResponse at the trigger request id
+/// before the terminal is reported.
+async fn run_terminal_mode(
+    args: &Args,
+    data_channel: &Arc<dyn DataChannel>,
+    control: &mut Socket,
+    control_rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
+    track: &Arc<dyn TrackRemote>,
+    media: &mut MediaAssociations,
+    session_id: &str,
+    attachment_id: u64,
+    status: &SessionStatus,
+    terminal: Arc<Notify>,
+    terminal_state: Arc<Mutex<Option<String>>>,
+) -> Result<()> {
+    let trigger = args.terminal_trigger.as_str();
+    let transport = args.terminal_transport.as_str();
+    ensure!(matches!(transport, "data-channel" | "wss"), "unknown terminal transport {transport:?}");
+    let wait_secs = args.terminal_timeout.unwrap_or(DEADLINE.as_secs_f64()).max(1.0);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(wait_secs);
+    let mut evidence: Vec<FrameEvidence> = Vec::new();
+    let mut last_sequence = None;
+    let mut last_pts = None;
+    let mut last_encoder_id = None;
+    let mut last_dimensions = None;
+    let mut last_checksum = None;
+    let mut triggered = false;
+    let mut frames_at_trigger = 0usize;
+    let mut trigger_receipt: Option<serde_json::Value> = None;
+    let observed = loop {
+        while let Some((rtp_timestamp, descriptor, sample)) = media.take_matching() {
+            validate_video_frame(&descriptor, &sample, rtp_timestamp, session_id, &mut last_sequence, &mut last_pts,
+                &mut last_encoder_id, &mut last_dimensions)?;
+            let decoded = decode_sample(&sample.data, descriptor.coded_width, descriptor.coded_height).await?;
+            let changed = last_checksum.is_some_and(|checksum| checksum != decoded.checksum);
+            last_checksum = Some(decoded.checksum);
+            evidence.push(FrameEvidence { descriptor, checksum: decoded.checksum, rtp_packets: sample.packet_count, changed });
+        }
+        if !triggered && !evidence.is_empty() {
+            triggered = true;
+            frames_at_trigger = evidence.len();
+            if let Some(path) = &args.ready_file {
+                std::fs::write(path, serde_json::to_vec(&serde_json::json!({
+                    "ready": true, "session_id": session_id, "attachment_id": attachment_id, "frames": evidence.len(),
+                }))?)?;
+            }
+            match trigger {
+                "none" => {}
+                "detach" => {
+                    let request = Request { id: TRIGGER_REQUEST_ID, command: Command::Detach {}, operation: None };
+                    let response = fence(data_channel, control, control_rx, track, media, session_id, transport, request, deadline).await?;
+                    trigger_receipt = Some(serde_json::to_value(response)?);
+                }
+                "rebind" | "rebind-finalize-failed" => {
+                    let request = Request {
+                        id: TRIGGER_REQUEST_ID,
+                        command: Command::ProfileSelect { profile_id: "p1".into() },
+                        operation: Some(operation_for(status)?),
+                    };
+                    let response = fence(data_channel, control, control_rx, track, media, session_id, transport, request, deadline).await?;
+                    trigger_receipt = Some(serde_json::to_value(response.clone())?);
+                    if trigger == "rebind-finalize-failed" {
+                        expect_error(response, "SESSION_MEDIA_FINALIZE_FAILED")?;
+                    }
+                }
+                "prime-finalize-failed" => {
+                    let request = Request {
+                        id: TRIGGER_REQUEST_ID,
+                        command: Command::ProfileSelect { profile_id: "p1".into() },
+                        operation: Some(operation_for(status)?),
+                    };
+                    let response = fence(data_channel, control, control_rx, track, media, session_id, transport, request, deadline).await?;
+                    trigger_receipt = Some(serde_json::to_value(response.clone())?);
+                    println!("{}", serde_json::json!({
+                        "pass": true,
+                        "browser_path": "webrtc_data_channel",
+                        "session_id": session_id,
+                        "attachment_id": attachment_id,
+                        "trigger": trigger,
+                        "trigger_receipt": trigger_receipt,
+                    }));
+                    // Keep the peer alive briefly after the prime response. The
+                    // pre-fix control path dispatches the response before it
+                    // acquires the rebound binding, so this lets that path
+                    // reach the same retained-finalization state as the fix.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    return Ok(());
+                }
+                "detach-backpressure" => {
+                    send_control(data_channel, &WebRtcControlMessage::BrowserRequest {
+                        request: Request { id: TRIGGER_REQUEST_ID, command: Command::Detach {}, operation: None },
+                    }).await?;
+                    for offset in 1..=17 {
+                        send_control(data_channel, &WebRtcControlMessage::BrowserRequest {
+                            request: Request { id: 300 + offset as u64, command: Command::Status {}, operation: None },
+                        }).await?;
+                    }
+                    let response = wait_for_correlated_response(control_rx, track, media, session_id, TRIGGER_REQUEST_ID).await?;
+                    anyhow::ensure!(response_id(&response) == Some(TRIGGER_REQUEST_ID), "no correlated fence receipt under backpressure");
+                    trigger_receipt = Some(serde_json::to_value(response)?);
+                }
+                other => bail!("unknown terminal trigger {other:?}"),
+            }
+        }
+        if let Some(state) = terminal_state.lock().expect("terminal state").clone() {
+            break Terminal::PeerState(state);
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                bail!("terminal not observed before deadline (trigger={trigger}, triggered={triggered}, frames={}, samples={})",
+                    evidence.len(), media.samples.len());
+            }
+            _ = terminal.notified() => {
+                if let Some(state) = terminal_state.lock().expect("terminal state").clone() {
+                    break Terminal::PeerState(state);
+                }
+            }
+            message = control_rx.recv() => match message {
+                None => break Terminal::DataChannelClosed { detail: "WebRTC DataChannel reader ended".into() },
+                Some(Err(error)) => break Terminal::DataChannelClosed { detail: error.to_string() },
+                Some(Ok(WebRtcControlMessage::VideoFrame { descriptor })) => media.accept_descriptor(descriptor, session_id)?,
+                Some(Ok(WebRtcControlMessage::Pong { .. })) => {},
+                Some(Ok(WebRtcControlMessage::BrowserResponse { .. })) => bail!(
+                    "unsolicited WebRTC browser response after the fence receipt"),
+                Some(Ok(WebRtcControlMessage::Error { code, message })) => break Terminal::ControlError { code, message },
+                Some(Ok(other)) => bail!("unexpected Host WebRTC control message while observing terminal: {other:?}"),
+            },
+            event = track.poll() => match event {
+                Some(TrackRemoteEvent::OnRtpPacket(packet)) => media.accept_track_event(TrackRemoteEvent::OnRtpPacket(packet))?,
+                Some(TrackRemoteEvent::OnError) | Some(TrackRemoteEvent::OnEnded) => break Terminal::TrackEnded,
+                Some(other) => media.accept_track_event(other)?,
+                None => break Terminal::TrackEnded,
+            },
+        }
+    };
+    let leaked: Vec<String> = evidence.iter()
+        .filter(|frame| frame.descriptor.source.session_id != session_id)
+        .map(|frame| frame.descriptor.source.session_id.clone())
+        .collect();
+    ensure!(leaked.is_empty(), "replacement binding frame leaked to the old authenticated stream: {leaked:?}");
+    println!("{}", serde_json::json!({
+        "pass": true,
+        "browser_path": "webrtc_data_channel",
+        "session_id": session_id,
+        "attachment_id": attachment_id,
+        "trigger": trigger,
+        "frames_at_trigger": frames_at_trigger,
+        "frames_after_trigger": evidence.len().saturating_sub(frames_at_trigger),
+        "terminal": observed.json(),
+        "trigger_receipt": trigger_receipt,
+        "frames": evidence.iter().map(frame_json).collect::<Vec<_>>(),
+    }));
     Ok(())
 }
 
@@ -496,6 +799,19 @@ async fn request_dc(
 ) -> Result<Response> {
     let request_id = request.id;
     send_control(channel, &WebRtcControlMessage::BrowserRequest { request }).await?;
+    wait_for_correlated_response(rx, track, media, session_id, request_id).await
+}
+
+/// Wait for a response to a request that was already sent. This is used for
+/// the backpressure regression so the harness does not issue another request
+/// while it is waiting for the fenced operation's matched receipt.
+async fn wait_for_correlated_response(
+    rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
+    track: &Arc<dyn TrackRemote>,
+    media: &mut MediaAssociations,
+    session_id: &str,
+    request_id: u64,
+) -> Result<Response> {
     timeout(DEADLINE, async {
         loop {
             tokio::select! {
@@ -515,11 +831,54 @@ async fn request_dc(
     }).await.context("timed out waiting for WebRTC browser response")?
 }
 
+/// Issue a self-triggered terminal fence on the transport under test and return
+/// its correlated Host result. The `data-channel` path is the declared
+/// browser-operation boundary; `wss` is retained as separate control-socket
+/// coverage.
+#[allow(clippy::too_many_arguments)]
+async fn fence(
+    data_channel: &Arc<dyn DataChannel>,
+    control: &mut Socket,
+    control_rx: &mut mpsc::Receiver<Result<WebRtcControlMessage>>,
+    track: &Arc<dyn TrackRemote>,
+    media: &mut MediaAssociations,
+    session_id: &str,
+    transport: &str,
+    request: Request,
+    deadline: tokio::time::Instant,
+) -> Result<Response> {
+    match transport {
+        "data-channel" => request_dc(data_channel, control_rx, track, media, session_id, request).await,
+        "wss" => {
+            let request_id = request.id;
+            send_json(control, &request).await?;
+            read_control_response(control, request_id, deadline).await
+        }
+        other => bail!("unknown terminal transport {other:?}"),
+    }
+}
+
+/// Read the correlated Host result for a fence request sent on the WSS control
+/// socket. The control socket is independent of the WebRTC peer, so a
+/// detach/rebind receipt is delivered even when the fence tears the old media
+/// stream down.
+async fn read_control_response(socket: &mut Socket, request_id: u64, deadline: tokio::time::Instant) -> Result<Response> {
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        ensure!(!remaining.is_zero(), "control response for request {request_id} not observed before deadline");
+        let response = timeout(remaining, next_response(socket)).await
+            .context("timed out waiting for correlated control response")??;
+        if response_id(&response) == Some(request_id) { return Ok(response); }
+    }
+}
+
 fn operation_for(status: &SessionStatus) -> Result<Operation> {
+    let sequence = status.next_sequence;
     Ok(Operation {
+        operation_id: format!("receiver-operation-{sequence}"),
         session_id: status.session_id.clone(),
         attachment_id: status.attachment_id.context("Host status has no WebRTC attachment")?,
-        sequence: status.next_sequence,
+        sequence,
         control_epoch: status.control.epoch,
         viewport_revision: status.viewport_revision,
         document_revision: status.document_revision,
@@ -559,13 +918,12 @@ fn next_matching_timestamp(
 async fn connect_control(args: &Args) -> Result<(Socket, Response)> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(CertificateDer::from(std::fs::read(&args.ca)?))?;
-    let config = rustls::ClientConfig::builder().with_root_certificates(roots)
-        .with_client_auth_cert(vec![CertificateDer::from(std::fs::read(&args.client_cert)?)],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(std::fs::read(&args.client_key)?)))?;
+    let config = rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(config));
     let name = ServerName::try_from(args.server_name.clone()).context("invalid TLS server name")?;
     let tls = connector.connect(name, TcpStream::connect(args.address).await?).await?;
-    let request = format!("wss://{}/control", args.address).into_client_request()?;
+    let mut request = format!("wss://{}/control", args.address).into_client_request()?;
+    request.headers_mut().insert("authorization", format!("Bearer {}", args.token).parse()?);
     let (mut socket, _) = client_async(request, tls).await?;
     let ready = next_response(&mut socket).await?;
     Ok((socket, ready))
@@ -584,6 +942,10 @@ async fn next_response(socket: &mut Socket) -> Result<Response> {
     }
 }
 
+/// Read the correlated Host result for a fence request sent on the WSS control
+/// socket. The control socket is independent of the WebRTC peer, so a
+/// detach/rebind receipt is delivered even when the fence tears the old media
+/// stream down.
 async fn next_signal(socket: &mut Socket) -> Result<WebRtcSignal> {
     loop {
         match socket.next().await.context("signaling socket ended")?? {
@@ -654,12 +1016,28 @@ async fn decode_sample(data: &[u8], width: u32, height: u32) -> Result<Decoded> 
     Ok(Decoded { checksum })
 }
 
-struct ReceiverHandler { gather: Arc<Notify>, track_tx: mpsc::Sender<Arc<dyn TrackRemote>> }
+struct ReceiverHandler {
+    gather: Arc<Notify>,
+    track_tx: mpsc::Sender<Arc<dyn TrackRemote>>,
+    terminal: Arc<Notify>,
+    terminal_state: Arc<Mutex<Option<String>>>,
+}
 
 #[async_trait::async_trait]
 impl PeerConnectionEventHandler for ReceiverHandler {
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
         if state == RTCIceGatheringState::Complete { self.gather.notify_one(); }
+    }
+
+    async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
+        let name = match state {
+            RTCPeerConnectionState::Failed => "failed",
+            RTCPeerConnectionState::Closed => "closed",
+            RTCPeerConnectionState::Disconnected => "disconnected",
+            _ => return,
+        };
+        *self.terminal_state.lock().expect("terminal state") = Some(name.to_string());
+        self.terminal.notify_one();
     }
 
     async fn on_track(&self, track: Arc<dyn TrackRemote>) {
@@ -674,7 +1052,8 @@ mod association_tests {
     fn descriptor(rtp_timestamp: u32, sequence: u64) -> WebRtcVideoFrame {
         WebRtcVideoFrame {
             source: obscura_host_protocol::FrameInfo {
-                session_id: "session".into(), sequence, document_revision: 0, viewport_revision: 0,
+                session_id: "session".into(), tab_id: "tab".into(), sequence,
+                presentation_revision: 0, document_revision: 0, viewport_revision: 0,
                 width: 160, height: 120, stride: 640, byte_length: 160 * 120 * 4,
                 pixel_format: PixelFormat::PremultipliedRgba8,
             },

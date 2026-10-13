@@ -1,0 +1,10 @@
+
+running 5 tests
+test fixture_listener_is_reaped_on_drop ... ok
+test obey_robots_is_global_and_blocks_fetch_before_target_request ... ok
+test fetch_without_obey_robots_keeps_existing_navigation_behavior ... ok
+test obey_robots_fetches_an_allowed_target_after_loading_policy ... ok
+test obey_robots_reaches_scrape_worker_and_blocks_target_request ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+

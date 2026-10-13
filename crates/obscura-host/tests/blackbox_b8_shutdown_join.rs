@@ -1,0 +1,413 @@
+#![cfg(unix)]
+//! B8 black-box regression (F1): endpoint shutdown must join an in-progress
+//! final-reference release before it drops the socket directory and returns.
+//!
+//! The test drives real mTLS control against a real `obscura-endpoint` and a
+//! real `--media-bin` adapter. It closes the control attachment so the
+//! final-reference release begins (the endpoint SIGTERMs the adapter), waits
+//! until that release is observably in progress, then SIGTERMs the endpoint
+//! during the release. Pre-fix the endpoint skips the finalizing entry and
+//! exits almost immediately, abandoning the still-running cleanup. Post-fix it
+//! awaits that finalizer, so shutdown is bounded by the adapter's cooperative
+//! grace. The measured shutdown duration and the adapter's observed death are
+//! external observations; no endpoint-private state is asserted.
+
+use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+
+use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio_rustls::rustls::{self, pki_types::ServerName};
+use tokio_tungstenite::{client_async, tungstenite::{client::IntoClientRequest, Message}};
+
+#[tokio::test]
+async fn endpoint_shutdown_joins_in_progress_final_release() {
+    tokio::time::timeout(Duration::from_secs(120), exercise())
+        .await
+        .expect("B8 public shutdown-join case timed out")
+        .expect("B8 public shutdown-join case failed");
+}
+
+#[tokio::test]
+async fn endpoint_shutdown_with_active_attachment_completes_without_deadlock() {
+    tokio::time::timeout(Duration::from_secs(240), exercise_f1())
+        .await
+        .expect("F1 public shutdown-overlap case timed out")
+        .expect("F1 public shutdown-overlap case failed");
+}
+
+async fn exercise() -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let root = PathBuf::from("/tmp").join(format!("ob8-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let bind_ip = "127.0.0.1";
+
+    let ca_key = rcgen::KeyPair::generate()?;
+    let mut ca_params = rcgen::CertificateParams::new(vec![])?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Obscura b8 CA");
+    let ca = ca_params.self_signed(&ca_key)?;
+    let server_key = rcgen::KeyPair::generate()?;
+    let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
+        .signed_by(&server_key, &ca, &ca_key)?;
+    std::fs::write(root.join("server.der"), server.der())?;
+    std::fs::write(root.join("server.key"), server_key.serialize_der())?;
+    std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(root.join("ca.der"), ca.der())?;
+    write_catalog(root.join("profiles"))?;
+
+    let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+        .arg("--socket-dir").arg(root.join("host"))
+        .arg("--profile-root").arg(root.join("profiles"))
+        .arg("--access-token").arg(TOKEN)
+        .stdout(Stdio::null()).stderr(std::fs::File::create(root.join("host.err"))?).kill_on_drop(true).spawn()?;
+    wait_socket(root.join("host/host.sock")).await;
+    let mut local = BufReader::new(tokio::net::UnixStream::connect(root.join("host/host.sock")).await?);
+    let mut line = String::new();
+    local.read_line(&mut line).await?;
+    let html = "data:text/html,<style>body{margin:0;background:white}</style><div style='width:80px;height:80px;background:red'></div>";
+    let mut state = local_request(&mut local, serde_json::json!({"id":1,"command":{"type":"attach","mode":"agent"}})).await?;
+    state = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state),"command":{"type":"resize","width":160,"height":120}})).await?;
+    let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state),"command":{"type":"navigate","url":html}})).await?;
+    drop(local);
+
+    let reservation = std::net::TcpListener::bind((bind_ip, 0))?;
+    let address = reservation.local_addr()?;
+    drop(reservation);
+
+    // A real adapter that connects to the exact-session video socket, records
+    // its pid, and installs a SIGTERM handler that records the signal but keeps
+    // the process alive. The endpoint's cooperative grace therefore expires and
+    // only the adapter's own reap (post-fix, joined by shutdown) ends it.
+    let pid_file = root.join("adapter.pid");
+    let marker = root.join("adapter-signalled");
+    let media_bin = root.join("adapter.py");
+    let script = [
+        "#!/usr/bin/env python3",
+        "import os, signal, socket, sys, time",
+        "args = sys.argv[1:]",
+        "video = args[args.index('--video-socket') + 1]",
+        &format!("pid_file = {pid:?}", pid = pid_file.display().to_string()),
+        &format!("marker = {mark:?}", mark = marker.display().to_string()),
+        "def on_term(signum, frame):",
+        "    with open(pid_file, 'w') as handle:",
+        "        handle.write(str(os.getpid()))",
+        "    open(marker, 'w').close()",
+        "signal.signal(signal.SIGTERM, on_term)",
+        "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+        "deadline = time.time() + 10",
+        "while True:",
+        "    try:",
+        "        sock.connect(video)",
+        "        break",
+        "    except OSError:",
+        "        if time.time() > deadline:",
+        "            raise",
+        "        time.sleep(0.05)",
+        "open(video + '.ready', 'w').close()",
+        "while True:",
+        "    time.sleep(0.2)",
+        "",
+    ].join("\n");
+    std::fs::write(&media_bin, script)?;
+    std::fs::set_permissions(&media_bin, std::fs::Permissions::from_mode(0o755))?;
+
+    let mut endpoint = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"))
+        .arg("--listen").arg(address.to_string())
+        .arg("--host-dir").arg(root.join("host"))
+        .arg("--socket-dir").arg(root.join("endpoint"))
+        .arg("--server-cert").arg(root.join("server.der"))
+        .arg("--server-key").arg(root.join("server.key"))
+        .arg("--media-bin").arg(&media_bin)
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(root.join("endpoint.err"))?)
+        .kill_on_drop(true)
+        .spawn()?;
+    wait_socket(root.join("endpoint")).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone())?;
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+    let (mut control, _token) = connect_control(&connector, address).await?;
+    let ready = next_json(&mut control).await?;
+    let session_id = ready["session_id"].as_str().expect("Endpoint Ready session identity missing").to_string();
+    control.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
+    let attached = next_json(&mut control).await?;
+    anyhow::ensure!(attached["type"] == "result", "attach failed: {attached}");
+
+    let session_dir = root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12]));
+    anyhow::ensure!(wait_dir(&session_dir, Duration::from_secs(15)).await, "session directory was never bound");
+    wait_file(&session_dir.join("encoded.sock.ready"), Duration::from_secs(15)).await?;
+
+    // Close the control attachment. This is the final reference, so the endpoint
+    // begins the exact-session finalizer and SIGTERMs the adapter.
+    drop(control);
+    wait_file(&marker, Duration::from_secs(15)).await?;
+    let pid: i32 = std::fs::read_to_string(&pid_file)?.trim().parse()?;
+    anyhow::ensure!(process_alive(pid), "adapter was not alive when the release began (pid {pid})");
+
+    // SIGTERM the endpoint while the final-reference release is in progress.
+    let started = tokio::time::Instant::now();
+    if let Some(pid) = endpoint.id() {
+        // Safety: signaling the one endpoint process this test spawned.
+        let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+    }
+    let status = tokio::time::timeout(Duration::from_secs(30), endpoint.wait()).await
+        .map_err(|_| anyhow::anyhow!("endpoint did not exit after SIGTERM"))??;
+    let elapsed = started.elapsed();
+    eprintln!("B8: endpoint shutdown took {elapsed:?} (status {status})");
+    anyhow::ensure!(elapsed >= Duration::from_millis(2000),
+        "endpoint shutdown returned before the in-progress final-reference release finished ({elapsed:?}); it did not join the finalizer");
+
+    // By the time shutdown returns, the joined finalizer has reaped the adapter.
+    let reaped = wait_pid_gone(pid, Duration::from_secs(5)).await;
+    anyhow::ensure!(reaped, "endpoint shutdown did not reap its adapter before returning (pid {pid})");
+
+    let _ = host.kill().await;
+    let _ = host.wait().await;
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+/// F1: a control attachment is still live when the endpoint receives SIGTERM.
+/// The endpoint aborts that connection and then finalizes every session, while
+/// the aborted connection's surviving binding guard has just spawned an
+/// asynchronous release for the same session entry. That release can enter the
+/// already-finalizing branch and await the finalizer's completion. The finalizer
+/// publishes its result only after it removes the entry under the same mutex, so
+/// a release that keeps that guard live across the await can never let the
+/// finalizer publish: shutdown hangs and no new connection can be served.
+///
+/// The cycle repeats because the two owners race. The deterministic deadlock is
+/// also covered in-crate; here the real endpoint, host and adapter are the
+/// subject, and the only assertion is that every shutdown completes and every
+/// session directory is removed.
+async fn exercise_f1() -> anyhow::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let root = PathBuf::from("/tmp").join(format!("ob8f1-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]));
+    std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+    let bind_ip = "127.0.0.1";
+
+    let ca_key = rcgen::KeyPair::generate()?;
+    let mut ca_params = rcgen::CertificateParams::new(vec![])?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.distinguished_name.push(rcgen::DnType::CommonName, "Obscura b8f1 CA");
+    let ca = ca_params.self_signed(&ca_key)?;
+    let server_key = rcgen::KeyPair::generate()?;
+    let server = rcgen::CertificateParams::new(vec!["localhost".into(), bind_ip.into()])?
+        .signed_by(&server_key, &ca, &ca_key)?;
+    std::fs::write(root.join("server.der"), server.der())?;
+    std::fs::write(root.join("server.key"), server_key.serialize_der())?;
+    std::fs::set_permissions(root.join("server.key"), std::fs::Permissions::from_mode(0o600))?;
+    std::fs::write(root.join("ca.der"), ca.der())?;
+    write_catalog(root.join("profiles"))?;
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca.der().clone())?;
+    let client_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+    let html = "data:text/html,<style>body{margin:0;background:white}</style><div style='width:80px;height:80px;background:red'></div>";
+
+    for cycle in 0..8u32 {
+        let cycle_root = root.join(format!("cycle-{cycle}"));
+        std::fs::create_dir_all(&cycle_root)?;
+        let pid_file = cycle_root.join("adapter.pid");
+        let marker = cycle_root.join("adapter-signalled");
+        let media_bin = cycle_root.join("adapter.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import os, signal, socket, sys, time",
+            "args = sys.argv[1:]",
+            "video = args[args.index('--video-socket') + 1]",
+            &format!("pid_file = {pid:?}", pid = pid_file.display().to_string()),
+            &format!("marker = {mark:?}", mark = marker.display().to_string()),
+            "def on_term(signum, frame):",
+            "    with open(pid_file, 'w') as handle:",
+            "        handle.write(str(os.getpid()))",
+            "    open(marker, 'w').close()",
+            "    time.sleep(3)",
+            "    sys.exit(0)",
+            "signal.signal(signal.SIGTERM, on_term)",
+            "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)",
+            "deadline = time.time() + 10",
+            "while True:",
+            "    try:",
+            "        sock.connect(video)",
+            "        break",
+            "    except OSError:",
+            "        if time.time() > deadline:",
+            "            raise",
+            "        time.sleep(0.05)",
+            "open(video + '.ready', 'w').close()",
+            "while True:",
+            "    time.sleep(0.2)",
+            "",
+        ].join("\n");
+        std::fs::write(&media_bin, script)?;
+        std::fs::set_permissions(&media_bin, std::fs::Permissions::from_mode(0o755))?;
+
+        let mut host = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+            .arg("--socket-dir").arg(cycle_root.join("host"))
+            .arg("--profile-root").arg(root.join("profiles"))
+            .arg("--access-token").arg(TOKEN)
+            .stdout(Stdio::null()).stderr(Stdio::null()).kill_on_drop(true).spawn()?;
+        wait_socket(cycle_root.join("host/host.sock")).await;
+        let mut local = BufReader::new(tokio::net::UnixStream::connect(cycle_root.join("host/host.sock")).await?);
+        let mut line = String::new();
+        local.read_line(&mut line).await?;
+        let mut state = local_request(&mut local, serde_json::json!({"id":1,"command":{"type":"attach","mode":"agent"}})).await?;
+        state = local_request(&mut local, serde_json::json!({"id":2,"operation":identity(&state),"command":{"type":"resize","width":160,"height":120}})).await?;
+        let _ = local_request(&mut local, serde_json::json!({"id":3,"operation":identity(&state),"command":{"type":"navigate","url":html}})).await?;
+        drop(local);
+
+        let reservation = std::net::TcpListener::bind((bind_ip, 0))?;
+        let address = reservation.local_addr()?;
+        drop(reservation);
+
+        let stderr_path = cycle_root.join("endpoint.err");
+        let mut endpoint = tokio::process::Command::new(env!("CARGO_BIN_EXE_obscura-endpoint"))
+            .arg("--listen").arg(address.to_string())
+            .arg("--host-dir").arg(cycle_root.join("host"))
+            .arg("--socket-dir").arg(cycle_root.join("endpoint"))
+            .arg("--server-cert").arg(root.join("server.der"))
+            .arg("--server-key").arg(root.join("server.key"))
+            .arg("--media-bin").arg(&media_bin)
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path)?)
+            .kill_on_drop(true)
+            .spawn()?;
+        wait_socket(cycle_root.join("endpoint")).await;
+
+        let (mut control, _token) = connect_control(&connector, address).await?;
+        let ready = next_json(&mut control).await?;
+        let session_id = ready["session_id"].as_str().expect("Endpoint Ready session identity missing").to_string();
+        control.send(Message::text(r#"{"id":1,"command":{"type":"attach","mode":"observe"}}"#)).await?;
+        let attached = next_json(&mut control).await?;
+        anyhow::ensure!(attached["type"] == "result", "F1: cycle {cycle} attach failed: {attached}");
+
+        let session_dir = cycle_root.join(format!("endpoint/m-{}", &session_id.replace("-", "")[..12]));
+        anyhow::ensure!(wait_dir(&session_dir, Duration::from_secs(15)).await, "F1: cycle {cycle} session directory was never bound");
+        wait_file(&session_dir.join("encoded.sock.ready"), Duration::from_secs(15)).await?;
+
+        // SIGTERM the endpoint while the control attachment is still live. The
+        // aborted connection's release and the endpoint's finalizer then race
+        // for the same session entry.
+        if let Some(pid) = endpoint.id() {
+            // Safety: signaling the one endpoint process this test spawned.
+            let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        }
+        let status = tokio::time::timeout(Duration::from_secs(30), endpoint.wait()).await
+            .map_err(|_| anyhow::anyhow!(
+                "F1: cycle {cycle} endpoint shutdown deadlocked while an active attachment's release overlapped finalization"))??;
+        anyhow::ensure!(status.success(),
+            "F1: cycle {cycle} endpoint shutdown failed while finalizing the active attachment: {status}");
+        anyhow::ensure!(!session_dir.exists(),
+            "F1: cycle {cycle} endpoint shutdown returned before the session resources were removed");
+
+        let _ = host.kill().await;
+        let _ = host.wait().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let _ = std::fs::remove_dir_all(&root);
+    Ok(())
+}
+
+async fn connect_control(
+    connector: &tokio_rustls::TlsConnector,
+    address: std::net::SocketAddr,
+) -> anyhow::Result<(tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>, String)> {
+    let tls = connector.connect(ServerName::try_from("localhost")?, tokio::net::TcpStream::connect(address).await?).await?;
+    let mut request = format!("wss://localhost:{}/control", address.port()).into_client_request()?;
+    request.headers_mut().insert("authorization", format!("Bearer {TOKEN}").parse()?);
+    let (control, response) = client_async(request, tls).await?;
+    let token = response.headers()["x-obscura-media-token"].to_str()?.to_string();
+    Ok((control, token))
+}
+
+async fn next_json(
+    control: &mut tokio_tungstenite::WebSocketStream<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+) -> anyhow::Result<serde_json::Value> {
+    let message = control.next().await.ok_or_else(|| anyhow::anyhow!("control socket closed"))??;
+    Ok(serde_json::from_str(&message.into_text()?)?)
+}
+
+async fn wait_socket(path: PathBuf) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !path.exists() {
+        assert!(tokio::time::Instant::now() < deadline, "listener did not initialize: {}", path.display());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+}
+
+async fn wait_dir(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !path.is_dir() {
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    true
+}
+
+async fn wait_file(path: &std::path::Path, timeout: Duration) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while !path.exists() {
+        anyhow::ensure!(tokio::time::Instant::now() < deadline, "file never appeared: {}", path.display());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
+async fn wait_pid_gone(pid: i32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while process_alive(pid) {
+        if tokio::time::Instant::now() >= deadline { return false; }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
+}
+
+fn process_alive(pid: i32) -> bool {
+    // Safety: signal 0 performs an existence/permission check only.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn identity(state: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"session_id":state["session_id"],"attachment_id":state["attachment_id"],
+        "sequence":state["next_sequence"],"control_epoch":state["control"]["epoch"],
+        "viewport_revision":state["viewport_revision"],"document_revision":state["document_revision"]})
+}
+
+async fn local_request(socket: &mut BufReader<tokio::net::UnixStream>, request: serde_json::Value) -> anyhow::Result<serde_json::Value> {
+    socket.get_mut().write_all(format!("{request}\n").as_bytes()).await?;
+    let mut line = String::new();
+    socket.read_line(&mut line).await?;
+    let reply: serde_json::Value = serde_json::from_str(&line)?;
+    anyhow::ensure!(reply["type"] == "result", "Host request failed: {reply}");
+    Ok(reply["value"].clone())
+}
+
+/// The one access token this test configures on the Host.
+const TOKEN: &str = "b8-access-token";
+
+/// A minimal persistent catalog. It carries no membership and no access record.
+fn write_catalog(profile_root: PathBuf) -> anyhow::Result<()> {
+    let catalog = serde_json::json!({
+        "catalog_revision": 1,
+        "profiles": [{
+            "profile_id": "default",
+            "display_name": "Default",
+            "default": true
+        }],
+        "default_profile_id": "default",
+        "next_id": 1
+    });
+    std::fs::create_dir_all(&profile_root)?;
+    std::fs::write(profile_root.join("catalog.json"), serde_json::to_string_pretty(&catalog)?)?;
+    Ok(())
+}

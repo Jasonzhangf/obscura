@@ -2064,6 +2064,9 @@ class Node {
   }
   get textContent() { return _domParse("text_content", this._nid) ?? ""; }
   set textContent(v) {
+    const editorOwner = _obscura_editor_mutation_owner(this);
+    const previousValue = editorOwner
+      ? _obscura_editor_value(editorOwner.target, editorOwner.kind) : undefined;
     const oldChildren = _domParse("child_nodes", this._nid) || [];
     for (const c of oldChildren) {
       const child = _wrap(c);
@@ -2082,6 +2085,9 @@ class Node {
     if (globalThis.__mutationObservers?.length) {
       globalThis.__notifyMutation('childList', this._nid, added, oldChildren);
     }
+    // A page write to a contenteditable (or textarea) text node invalidates
+    // the focused editor binding just like a value write does.
+    if (editorOwner) _obscura_editor_note_page_mutation(editorOwner.target, previousValue);
   }
   get nodeValue() {
     const t = this.nodeType;
@@ -2090,7 +2096,13 @@ class Node {
   }
   set nodeValue(v) {
     const t = this.nodeType;
-    if (t === 3 || t === 8) _dom("set_text_content", this._nid, String(v ?? ""));
+    if (t === 3 || t === 8) {
+      const editorOwner = _obscura_editor_mutation_owner(this);
+      const previousValue = editorOwner
+        ? _obscura_editor_value(editorOwner.target, editorOwner.kind) : undefined;
+      _dom("set_text_content", this._nid, String(v ?? ""));
+      if (editorOwner) _obscura_editor_note_page_mutation(editorOwner.target, previousValue);
+    }
   }
   get parentNode() {
     if (this._shadowParent) return this._shadowParent;
@@ -2388,11 +2400,15 @@ class CharacterData extends Node {
     return _domParse("text_content", this._nid) ?? "";
   }
   set data(v) {
+    const editorOwner = _obscura_editor_mutation_owner(this);
+    const previousValue = editorOwner
+      ? _obscura_editor_value(editorOwner.target, editorOwner.kind) : undefined;
     const oldValue = _domParse("text_content", this._nid) ?? "";
     _dom("set_text_content", this._nid, String(v ?? ""));
     if (globalThis.__mutationObservers?.length) {
       globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
     }
+    if (editorOwner) _obscura_editor_note_page_mutation(editorOwner.target, previousValue);
   }
   get length() { return this.data.length; }
   substringData(offset, count) {
@@ -3315,6 +3331,9 @@ class Element extends Node {
       this.content.innerHTML = v;
       return;
     }
+    const editorOwner = _obscura_editor_mutation_owner(this);
+    const previousValue = editorOwner
+      ? _obscura_editor_value(editorOwner.target, editorOwner.kind) : undefined;
     // Capture the children that are about to be replaced so we can deliver
     // them as `removedNodes` in the MutationObserver record. Without this,
     // libraries that mutate via `innerHTML =` (jQuery's `.html(s)`, React
@@ -3341,6 +3360,8 @@ class Element extends Node {
       newChildren = _domParse("child_nodes", this._nid) || [];
       globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
     }
+    // A page write to a contenteditable's innerHTML changes its edited value.
+    if (editorOwner) _obscura_editor_note_page_mutation(editorOwner.target, previousValue);
   }
   get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
   get innerText() { return this.textContent; }
@@ -3807,7 +3828,30 @@ class Element extends Node {
       }
     }
   }
-  focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
+  focus() {
+    // A focus change invalidates the previous target's remote edit context.
+    // End any uncommitted composition on the old target and restore its
+    // snapshot so a stale composition can never leak into the new field.
+    if (globalThis.__obscura_focused !== this) {
+      const previous = globalThis.__obscura_focused;
+      if (previous && _obscura_composition && _obscura_composition.target === previous) {
+        const previousKind = _obscura_editor_kind(previous);
+        const composition = _obscura_composition;
+        if (previousKind) {
+          _obscura_editor_set_value(previous, previousKind, composition.snapshotValue);
+          _obscura_editor_set_selection(
+            previous, previousKind,
+            composition.snapshotStart, composition.snapshotEnd, composition.snapshotDirection
+          );
+          _obscura_editor_bump(previous);
+        }
+        _obscura_composition = null;
+      }
+      _obscura_focus_revision += 1;
+    }
+    globalThis.__obscura_focused = this;
+    globalThis.__obscura_click_target = this;
+  }
   blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
 
   // --- Popover API (HTML "popover") ---------------------------------------
@@ -4027,13 +4071,22 @@ class Element extends Node {
       return;
     }
     if (tag === 'input') {
-      _dom('set_input_value', this._nid, String(v));
+      const next = String(v);
+      const previous = this === globalThis.__obscura_focused ? this.value : undefined;
+      _dom('set_input_value', this._nid, next);
+      if (previous !== undefined) _obscura_editor_note_page_mutation(this, previous);
+      return;
+    }
+    if (tag === 'textarea') {
+      const previous = this === globalThis.__obscura_focused ? this.value : undefined;
+      _formValues[this._nid] = String(v);
+      const guard = _obscura_editor_internal_write;
+      _obscura_editor_internal_write = true;
+      try { this.textContent = String(v); } finally { _obscura_editor_internal_write = guard; }
+      if (previous !== undefined) _obscura_editor_note_page_mutation(this, previous);
       return;
     }
     _formValues[this._nid] = String(v);
-    if (tag === 'textarea') {
-      this.textContent = String(v);
-    }
   }
   get min() { return this.getAttribute('min') || ''; }
   set min(v) { this.setAttribute('min', v); }
@@ -9805,6 +9858,412 @@ globalThis.__obscura_setFieldValue = function(el, field, value) {
   el[field] = value;
 };
 
+// --- Remote editing owner (Host10/WebRTC9) ---------------------------------
+// Engine-confirmed EditorContext plus typed edit application. The wire types
+// live in protocol/browser/src/lib.rs; this is the only place that writes a
+// page value/selection for remote editing and fires the real
+// beforeinput/input/composition events. Ranges are UTF-16 code units.
+const _obscura_editor_revisions = new WeakMap();
+const _obscura_ce_selection = new WeakMap();
+var _obscura_focus_revision = 0;
+var _obscura_composition = null;
+
+function _obscura_editor_revision_of(t) { return _obscura_editor_revisions.get(t) || 0; }
+function _obscura_editor_bump(t) {
+  const next = _obscura_editor_revision_of(t) + 1;
+  _obscura_editor_revisions.set(t, next);
+  return next;
+}
+// The Engine owns one editor revision per target. Editor-owned writes (the
+// apply path and the focus-time snapshot restore) set this guard so the
+// value/selection setters do not also count them as a page mutation; any
+// other write to the focused editable target advances the revision exactly
+// once here, so a binding captured before the page mutated the value is stale.
+var _obscura_editor_internal_write = false;
+function _obscura_editor_mutation_owner(node) {
+  if (!node || _obscura_editor_internal_write) return null;
+  const focused = globalThis.__obscura_focused;
+  if (!focused) return null;
+  const kind = _obscura_editor_kind(focused);
+  if (!kind) return null;
+  if (node === focused) return { target: focused, kind: kind };
+  if (kind !== 'content_editable' && kind !== 'textarea') return null;
+  let parent = node.parentElement;
+  while (parent && parent.nodeType === 1) {
+    if (parent === focused) return { target: focused, kind: kind };
+    parent = parent.parentElement;
+  }
+  return null;
+}
+function _obscura_editor_note_page_mutation(t, previousValue) {
+  if (_obscura_editor_internal_write) return;
+  if (!t || t.nodeType !== 1) return;
+  if (t !== globalThis.__obscura_focused) return;
+  const kind = _obscura_editor_kind(t);
+  if (!kind) return;
+  // A write that leaves the edited value unchanged is not a page mutation and
+  // must not invalidate an in-flight binding. `previousValue === undefined`
+  // marks a selection change, which has no value to compare against.
+  if (previousValue !== undefined && previousValue === _obscura_editor_value(t, kind)) return;
+  _obscura_editor_bump(t);
+}
+function _obscura_content_editable(t) {
+  let el = t;
+  while (el && el.nodeType === 1) {
+    let raw = null;
+    try { raw = el.getAttribute('contenteditable'); } catch (_e) { raw = null; }
+    if (raw !== null && raw !== undefined) {
+      const s = String(raw).toLowerCase();
+      if (s === 'false') return false;
+      if (s === '' || s === 'true' || s === 'plaintext-only') return true;
+    }
+    el = el.parentElement;
+  }
+  return false;
+}
+function _obscura_editor_kind(t) {
+  if (!t || t.nodeType !== 1) return null;
+  const name = t.localName;
+  if (name === 'input') return 'input';
+  if (name === 'textarea') return 'textarea';
+  if (_obscura_content_editable(t)) return 'content_editable';
+  return null;
+}
+function _obscura_editor_read_only(t, kind) {
+  if (kind === 'content_editable') return false;
+  if (t.disabled) return true;
+  if (t.readOnly) return true;
+  try { if (t.hasAttribute && t.hasAttribute('readonly')) return true; } catch (_e) {}
+  return false;
+}
+function _obscura_editor_value(t, kind) {
+  if (kind === 'content_editable') return t.textContent == null ? '' : String(t.textContent);
+  return t.value == null ? '' : String(t.value);
+}
+function _obscura_editor_set_value(t, kind, value) {
+  const previous = _obscura_editor_internal_write;
+  _obscura_editor_internal_write = true;
+  try {
+    if (kind === 'content_editable') { t.textContent = value; return; }
+    globalThis.__obscura_setFieldValue(t, 'value', value);
+  } finally { _obscura_editor_internal_write = previous; }
+}
+function _obscura_editor_selection(t, kind, length) {
+  if (kind === 'content_editable') {
+    const sel = _obscura_ce_selection.get(t);
+    if (!sel) return { start: length, end: length, direction: 'none' };
+    return {
+      start: Math.max(0, Math.min(sel.start, length)),
+      end: Math.max(0, Math.min(sel.end, length)),
+      direction: sel.direction || 'none'
+    };
+  }
+  let start = t.selectionStart;
+  let end = t.selectionEnd;
+  if (start == null) start = 0;
+  if (end == null) end = start;
+  start = Math.max(0, Math.min(Number(start) || 0, length));
+  end = Math.max(0, Math.min(Number(end) || 0, length));
+  const dir = t.selectionDirection === 'forward' || t.selectionDirection === 'backward'
+    ? t.selectionDirection : 'none';
+  return { start: start, end: end, direction: dir };
+}
+function _obscura_editor_set_selection(t, kind, start, end, direction) {
+  const previous = _obscura_editor_internal_write;
+  _obscura_editor_internal_write = true;
+  try {
+    if (kind === 'content_editable') {
+      _obscura_ce_selection.set(t, { start: start, end: end, direction: direction || 'none' });
+      return;
+    }
+    if (typeof t.setSelectionRange === 'function') t.setSelectionRange(start, end, direction || 'none');
+    else { t.selectionStart = start; t.selectionEnd = end; }
+  } finally { _obscura_editor_internal_write = previous; }
+}
+function _obscura_utf16_valid(value, start, end) {
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return false;
+  if (start < 0 || end < start || end > value.length) return false;
+  const splits = (i) => i > 0 && i < value.length
+    && value.charCodeAt(i - 1) >= 0xD800 && value.charCodeAt(i - 1) <= 0xDBFF
+    && value.charCodeAt(i) >= 0xDC00 && value.charCodeAt(i) <= 0xDFFF;
+  return !splits(start) && !splits(end);
+}
+function _obscura_dispatch_editor_event(t, event) {
+  try { return t.dispatchEvent(globalThis.__obscura_markTrusted(event)); }
+  catch (_e) { return true; }
+}
+function _obscura_dispatch_input(t, type, data, input_type) {
+  return _obscura_dispatch_editor_event(t, new InputEvent(type, {
+    bubbles: true, cancelable: type === 'beforeinput', data: data, inputType: input_type || ''
+  }));
+}
+function _obscura_dispatch_composition(t, type, data) {
+  return _obscura_dispatch_editor_event(t, new CompositionEvent(type, { bubbles: true, data: data || '' }));
+}
+
+globalThis.__obscura_editor_context = function() {
+  const t = globalThis.__obscura_focused;
+  const kind = _obscura_editor_kind(t);
+  if (!kind) return null;
+  const value = _obscura_editor_value(t, kind);
+  const selection = _obscura_editor_selection(t, kind, value.length);
+  const readOnly = _obscura_editor_read_only(t, kind);
+  const type = kind === 'input' ? String(t.type || 'text').toLowerCase() : null;
+  const password = type === 'password';
+  const attr = (name) => {
+    try { return t.getAttribute ? (t.getAttribute(name) || null) : null; } catch (_e) { return null; }
+  };
+  const composition = (_obscura_composition && _obscura_composition.target === t)
+    ? { data: _obscura_composition.data, start: _obscura_composition.start, end: _obscura_composition.end }
+    : null;
+  const context = {
+    target_id: 'node-' + t._nid,
+    kind: kind,
+    editable: !readOnly,
+    read_only: readOnly,
+    input_type: type,
+    input_mode: kind === 'input' ? attr('inputmode') : null,
+    enter_key_hint: kind === 'input' ? attr('enterkeyhint') : null,
+    multiline: kind !== 'input',
+    password: password,
+    focus_revision: _obscura_focus_revision,
+    editor_revision: _obscura_editor_revision_of(t),
+    selection: selection,
+    composition: composition,
+    caret: null,
+    surrounding: null
+  };
+  if (!password) {
+    const lo = Math.max(0, selection.start - 64);
+    const hi = Math.min(value.length, selection.end + 64);
+    context.surrounding = {
+      text: value.slice(lo, hi),
+      offset: lo,
+      before_length: selection.start - lo,
+      after_length: hi - selection.end
+    };
+  }
+  return context;
+};
+
+globalThis.__obscura_editor_apply = function(event) {
+  const t = globalThis.__obscura_focused;
+  const kind = _obscura_editor_kind(t);
+  if (!kind) return { ok: false, code: 'NO_EDITOR_CONTEXT', message: 'No editable target is focused' };
+  const readOnly = _obscura_editor_read_only(t, kind);
+  if (readOnly) return { ok: false, code: 'NOT_EDITABLE', message: 'Target is read-only or disabled' };
+  const type = String((event && event.type) || '');
+  const receipt = (state) => {
+    const value = _obscura_editor_value(t, kind);
+    const composition = (_obscura_composition && _obscura_composition.target === t)
+      ? { data: _obscura_composition.data, start: _obscura_composition.start, end: _obscura_composition.end }
+      : null;
+    return {
+      ok: true,
+      state: state,
+      editor_revision: _obscura_editor_revision_of(t),
+      selection: _obscura_editor_selection(t, kind, value.length),
+      composition: composition,
+      context: globalThis.__obscura_editor_context()
+    };
+  };
+  const invalidRange = { ok: false, code: 'INVALID_UTF16_RANGE', message: 'Range splits a surrogate pair or is out of bounds' };
+  const applyReplacement = (lo, hi, text, inputType) => {
+    const value = _obscura_editor_value(t, kind);
+    if (!_obscura_dispatch_input(t, 'beforeinput', text, inputType)) return receipt('cancelled');
+    const next = value.slice(0, lo) + text + value.slice(hi);
+    _obscura_editor_set_value(t, kind, next);
+    const caret = lo + text.length;
+    _obscura_editor_set_selection(t, kind, caret, caret, 'none');
+    _obscura_editor_bump(t);
+    _obscura_dispatch_input(t, 'input', text, inputType);
+    return receipt('applied');
+  };
+
+  if (type === 'replace_text') {
+    const value = _obscura_editor_value(t, kind);
+    const sel = _obscura_editor_selection(t, kind, value.length);
+    const text = String(event.text == null ? '' : event.text);
+    return applyReplacement(
+      Math.min(sel.start, sel.end), Math.max(sel.start, sel.end), text,
+      event.input_type || 'insertText'
+    );
+  }
+  if (type === 'delete_range') {
+    const value = _obscura_editor_value(t, kind);
+    const start = Number(event.start);
+    const end = Number(event.end);
+    if (!_obscura_utf16_valid(value, start, end)) return invalidRange;
+    return applyReplacement(start, end, '', 'deleteContentBackward');
+  }
+  if (type === 'delete_surrounding') {
+    const value = _obscura_editor_value(t, kind);
+    const sel = _obscura_editor_selection(t, kind, value.length);
+    const before = Math.max(0, Number(event.before) || 0);
+    const after = Math.max(0, Number(event.after) || 0);
+    const lo = Math.max(0, Math.min(sel.start, sel.end) - before);
+    const hi = Math.min(value.length, Math.max(sel.start, sel.end) + after);
+    if (!_obscura_utf16_valid(value, lo, hi)) return invalidRange;
+    return applyReplacement(lo, hi, '', 'deleteContentBackward');
+  }
+  if (type === 'set_selection') {
+    const value = _obscura_editor_value(t, kind);
+    const start = Number(event.start);
+    const end = Number(event.end);
+    if (!_obscura_utf16_valid(value, start, end)) return invalidRange;
+    const direction = event.direction === 'forward' || event.direction === 'backward' ? event.direction : 'none';
+    _obscura_editor_set_selection(t, kind, start, end, direction);
+    return receipt('applied');
+  }
+  if (type === 'composition_begin') {
+    if (_obscura_composition && _obscura_composition.target === t) {
+      return { ok: false, code: 'COMPOSITION_ALREADY_ACTIVE', message: 'Composition is already active on this target' };
+    }
+    const value = _obscura_editor_value(t, kind);
+    const sel = _obscura_editor_selection(t, kind, value.length);
+    const lo = Math.min(sel.start, sel.end);
+    const hi = Math.max(sel.start, sel.end);
+    const data = String(event.data == null ? '' : event.data);
+    // The real, cancelable beforeinput gates the composition start: a page
+    // that prevents it must not get the composition text inserted and must not
+    // open a composition lease.
+    if (!_obscura_dispatch_input(t, 'beforeinput', data, 'insertCompositionText')) return receipt('cancelled');
+    _obscura_editor_set_value(t, kind, value.slice(0, lo) + data + value.slice(hi));
+    const caret = lo + data.length;
+    _obscura_editor_set_selection(t, kind, caret, caret, 'none');
+    _obscura_composition = {
+      target: t, data: data, start: lo, end: caret,
+      snapshotValue: value, snapshotStart: sel.start, snapshotEnd: sel.end,
+      snapshotDirection: sel.direction
+    };
+    _obscura_dispatch_composition(t, 'compositionstart', data);
+    _obscura_dispatch_input(t, 'input', data, 'insertCompositionText');
+    return receipt('pending');
+  }
+  if (type === 'composition_update' || type === 'composition_commit') {
+    const comp = _obscura_composition;
+    if (!comp || comp.target !== t) {
+      return { ok: false, code: 'NO_ACTIVE_COMPOSITION', message: 'No composition lease is active on this target' };
+    }
+    const value = _obscura_editor_value(t, kind);
+    const data = String(event.data == null ? '' : event.data);
+    if (!_obscura_dispatch_input(t, 'beforeinput', data, 'insertCompositionText')) {
+      // A prevented beforeinput neither mutates the value nor commits. A
+      // commit still ends the open composition so the Host lease release and
+      // the Engine composition state cannot diverge.
+      if (type === 'composition_commit') {
+        _obscura_composition = null;
+        _obscura_dispatch_composition(t, 'compositionend', data);
+      }
+      return receipt('cancelled');
+    }
+    _obscura_editor_set_value(t, kind, value.slice(0, comp.start) + data + value.slice(comp.end));
+    const caret = comp.start + data.length;
+    _obscura_editor_set_selection(t, kind, caret, caret, 'none');
+    comp.data = data;
+    comp.end = caret;
+    if (type === 'composition_update') {
+      _obscura_dispatch_composition(t, 'compositionupdate', data);
+      _obscura_dispatch_input(t, 'input', data, 'insertCompositionText');
+      return receipt('pending');
+    }
+    _obscura_dispatch_composition(t, 'compositionend', data);
+    _obscura_dispatch_input(t, 'input', data, 'insertCompositionText');
+    _obscura_composition = null;
+    _obscura_editor_bump(t);
+    return receipt('applied');
+  }
+  if (type === 'composition_cancel') {
+    const comp = _obscura_composition;
+    if (!comp || comp.target !== t) {
+      return { ok: false, code: 'NO_ACTIVE_COMPOSITION', message: 'No composition lease is active on this target' };
+    }
+    // Cancel is the explicit terminal the Host waits on before it releases the
+    // lease, so the composition always ends here even if a page prevents the
+    // beforeinput; a prevented event only suppresses the snapshot restore.
+    if (_obscura_dispatch_input(t, 'beforeinput', '', 'deleteCompositionText')) {
+      _obscura_editor_set_value(t, kind, comp.snapshotValue);
+      _obscura_editor_set_selection(t, kind, comp.snapshotStart, comp.snapshotEnd, comp.snapshotDirection);
+    }
+    _obscura_composition = null;
+    _obscura_dispatch_composition(t, 'compositionend', '');
+    _obscura_editor_bump(t);
+    return receipt('cancelled');
+  }
+  if (type === 'editor_action') {
+    const action = String(event.action || '');
+    const value = _obscura_editor_value(t, kind);
+    const sel = _obscura_editor_selection(t, kind, value.length);
+    const lo = Math.min(sel.start, sel.end);
+    const hi = Math.max(sel.start, sel.end);
+    if (action === 'delete_backward' || action === 'delete_forward') {
+      if (lo !== hi) return applyReplacement(lo, hi, '', 'deleteContentBackward');
+      const at = action === 'delete_backward' ? sel.start : sel.end;
+      if (action === 'delete_backward' && at <= 0) return receipt('applied');
+      if (action === 'delete_forward' && at >= value.length) return receipt('applied');
+      let start = at;
+      let end = at;
+      if (action === 'delete_backward') {
+        start = at - 1;
+        if (start > 0 && value.charCodeAt(start) >= 0xDC00 && value.charCodeAt(start) <= 0xDFFF
+            && value.charCodeAt(start - 1) >= 0xD800 && value.charCodeAt(start - 1) <= 0xDBFF) start -= 1;
+      } else {
+        end = at + 1;
+        if (end < value.length && value.charCodeAt(at) >= 0xD800 && value.charCodeAt(at) <= 0xDBFF
+            && value.charCodeAt(end) >= 0xDC00 && value.charCodeAt(end) <= 0xDFFF) end += 1;
+      }
+      return applyReplacement(start, end, '', action === 'delete_backward' ? 'deleteContentBackward' : 'deleteContentForward');
+    }
+    if (action === 'insert_paragraph') {
+      if (!_obscura_editor_kind(t) || kind === 'input') {
+        return { ok: false, code: 'INVALID_EDITOR_ACTION', message: 'insert_paragraph requires a multiline target' };
+      }
+      return applyReplacement(lo, hi, '\n', 'insertParagraph');
+    }
+    return { ok: false, code: 'INVALID_EDITOR_ACTION', message: 'Unsupported editor action' };
+  }
+  if (type === 'key_down') {
+    const key = String(event.key || '');
+    const code = String(event.code || '');
+    const down = _obscura_dispatch_editor_event(t, new KeyboardEvent('keydown', {
+      bubbles: true, cancelable: true, key: key, code: code
+    }));
+    if (!down) return receipt('cancelled');
+    if (key === 'Backspace') {
+      const value = _obscura_editor_value(t, kind);
+      const sel = _obscura_editor_selection(t, kind, value.length);
+      const lo = Math.min(sel.start, sel.end);
+      const hi = Math.max(sel.start, sel.end);
+      if (lo !== hi) return applyReplacement(lo, hi, '', 'deleteContentBackward');
+      if (sel.start <= 0) return receipt('applied');
+      let start = sel.start - 1;
+      if (start > 0 && value.charCodeAt(start) >= 0xDC00 && value.charCodeAt(start) <= 0xDFFF
+          && value.charCodeAt(start - 1) >= 0xD800 && value.charCodeAt(start - 1) <= 0xDBFF) start -= 1;
+      return applyReplacement(start, sel.start, '', 'deleteContentBackward');
+    }
+    if (key === 'Enter') {
+      if (kind === 'input') return receipt('applied');
+      const value = _obscura_editor_value(t, kind);
+      const sel = _obscura_editor_selection(t, kind, value.length);
+      return applyReplacement(Math.min(sel.start, sel.end), Math.max(sel.start, sel.end), '\n', 'insertLineBreak');
+    }
+    const text = event.text == null ? '' : String(event.text);
+    if (text) {
+      const value = _obscura_editor_value(t, kind);
+      const sel = _obscura_editor_selection(t, kind, value.length);
+      return applyReplacement(Math.min(sel.start, sel.end), Math.max(sel.start, sel.end), text, 'insertText');
+    }
+    return receipt('applied');
+  }
+  if (type === 'key_up') {
+    _obscura_dispatch_editor_event(t, new KeyboardEvent('keyup', {
+      bubbles: true, cancelable: true, key: String(event.key || ''), code: String(event.code || '')
+    }));
+    return receipt('applied');
+  }
+  return { ok: false, code: 'INVALID_EDITOR_EVENT', message: 'Unsupported editing event' };
+};
+
 // Build a FileList-like object: an array with the DOM's `item(i)` accessor.
 function _makeFileList(files) {
   const list = files.slice();
@@ -10807,25 +11266,58 @@ Storage.prototype.clear = function() { const d = this._data; for (const k in d) 
 Storage.prototype.key = function(i) { const ks = Object.keys(this._data); i = i >>> 0; return i < ks.length ? ks[i] : null; };
 Object.defineProperty(Storage.prototype, 'length', { get: function() { return Object.keys(this._data).length; }, configurable: true });
 
-const _mkStore = () => {
+const _mkStore = (persistent) => {
   const target = Object.create(Storage.prototype);
-  Object.defineProperty(target, '_data', { value: Object.create(null), writable: true, enumerable: false, configurable: true });
+  const data = Object.create(null);
+  // Ops are bound into the live `Deno.core.ops` table only after the startup
+  // snapshot is restored, so a store created by the snapshot must resolve the
+  // backend lazily on every call instead of capturing a null at boot time.
+  const op = () => {
+    try { return persistent ? Deno.core.ops.op_local_storage : null; } catch (_) { return null; }
+  };
+  // localStorage is a live view over the profile's shared owner, so reads and
+  // enumerations refresh the local mirror from the owner before use. The Rust
+  // side sets the active origin before page scripts run.
+  const sync = () => {
+    const fn = op();
+    if (!fn) return;
+    try {
+      const raw = fn("load", "", "");
+      // The backend reports presence explicitly: a null load means no profile
+      // store is configured, so this runtime keeps its standalone in-memory
+      // mirror. A present snapshot (including the valid empty "{}") is
+      // authoritative and replaces the mirror.
+      if (raw === null || raw === undefined) return;
+      const parsed = JSON.parse(raw);
+      for (const k in data) delete data[k];
+      for (const k of Object.keys(parsed)) data[k] = String(parsed[k]);
+    } catch (_) {}
+  };
+  Object.defineProperty(target, '_data', { value: data, writable: true, enumerable: false, configurable: true });
+  if (persistent) {
+    // Own methods take precedence over Storage.prototype so property writes and
+    // method calls both write through to the shared profile owner.
+    target.setItem = function(k, v) { const fn = op(); k = String(k); v = String(v); data[k] = v; try { fn("set", k, v); } catch (_) {} };
+    target.removeItem = function(k) { const fn = op(); k = String(k); delete data[k]; try { fn("remove", k, ""); } catch (_) {} };
+    target.clear = function() { const fn = op(); for (const k in data) delete data[k]; try { fn("clear", "", ""); } catch (_) {} };
+  }
   const isReal = (p) => p === '_data' || p === 'constructor' || (p in Storage.prototype);
   return new Proxy(target, {
-    get(t, p, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
-    set(t, p, v, recv) { if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
-    has(t, p) { if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
+    get(t, p, recv) { if (persistent) sync(); if (typeof p === 'symbol' || isReal(p)) return Reflect.get(t, p, recv); const v = t.getItem(p); return v === null ? undefined : v; },
+    set(t, p, v, recv) { if (persistent) sync(); if (typeof p === 'symbol' || isReal(p)) return Reflect.set(t, p, v, recv); t.setItem(p, v); return true; },
+    has(t, p) { if (persistent) sync(); if (typeof p === 'symbol' || isReal(p)) return true; return Object.prototype.hasOwnProperty.call(t._data, p); },
     deleteProperty(t, p) { if (typeof p === 'symbol' || isReal(p)) return Reflect.deleteProperty(t, p); t.removeItem(p); return true; },
-    ownKeys(t) { return Object.keys(t._data); },
+    ownKeys(t) { if (persistent) sync(); return Object.keys(t._data); },
     getOwnPropertyDescriptor(t, p) {
+      if (persistent) sync();
       if (typeof p !== 'symbol' && Object.prototype.hasOwnProperty.call(t._data, p))
         return { value: t._data[p], writable: true, enumerable: true, configurable: true };
       return Reflect.getOwnPropertyDescriptor(t, p);
     },
   });
 };
-globalThis.localStorage = _mkStore();
-globalThis.sessionStorage = _mkStore();
+globalThis.localStorage = _mkStore(true);
+globalThis.sessionStorage = _mkStore(false);
 
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
@@ -15632,6 +16124,7 @@ if (!Element.prototype.selectionStart) {
     },
     set: function(v) {
       _ns_selectionStart.set(this, v == null ? null : Math.max(0, parseInt(v, 10) || 0));
+      _obscura_editor_note_page_mutation(this);
     },
     enumerable: true,
     configurable: true
@@ -15646,6 +16139,7 @@ if (!Element.prototype.selectionEnd) {
     },
     set: function(v) {
       _ns_selectionEnd.set(this, v == null ? null : Math.max(0, parseInt(v, 10) || 0));
+      _obscura_editor_note_page_mutation(this);
     },
     enumerable: true,
     configurable: true
@@ -15660,6 +16154,7 @@ if (!Element.prototype.selectionDirection) {
     },
     set: function(v) {
       _ns_selectionDir.set(this, v === 'forward' || v === 'backward' ? v : 'none');
+      _obscura_editor_note_page_mutation(this);
     },
     enumerable: true,
     configurable: true
@@ -15675,6 +16170,7 @@ if (!Element.prototype.setSelectionRange) {
     _ns_selectionStart.set(this, start);
     _ns_selectionEnd.set(this, end);
     _ns_selectionDir.set(this, direction);
+    _obscura_editor_note_page_mutation(this);
   };
   _markNative(Element.prototype.setSelectionRange);
 }

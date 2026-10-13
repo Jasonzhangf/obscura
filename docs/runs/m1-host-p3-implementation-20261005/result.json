@@ -1,0 +1,132 @@
+{
+  "task": "m1-host-p3-implementation-r10-20261005",
+  "worker": "gcm-host-p3-r10",
+  "role": "fresh GCM standalone author (not controller or reviewer)",
+  "status": "COMPLETE",
+  "reason": "Closed the five r3 implementation-review P1 findings G1-G5 with public-surface discriminating before/after pairs and preserved the earlier r7/r8/r9 regressions. No commit, merge, install, restart, OTA, device, or runtime operation was performed.",
+  "branch": "codex/m1-host-p3-implementation-20261005",
+  "start_head": "9be2f0826b6d90ad44838420cd27f4b3864fe6f4",
+  "start_tree": "bcd4b99f4627f8257b4dae0a18af0439bab04e54",
+  "end_head": "9be2f0826b6d90ad44838420cd27f4b3864fe6f4",
+  "end_tree": "5d09df94a0c5428d230b3d5945e2a8234ed36fc7",
+  "end_tree_product_source": "8456479543ebb3308efc42d06b58137610c86428",
+  "end_tree_note": "working tree applied over HEAD, computed with a temporary GIT_INDEX_FILE; the real index was not touched. end_tree covers crates/**, Cargo.toml, Cargo.lock and the run docs; end_tree_product_source covers crates/**, Cargo.toml, Cargo.lock only.",
+  "task_base": "9d02931f24631e3680b3038601f4e3efe288c0ab",
+  "previous_terminal": {
+    "task": "m1-host-p3-implementation-r9-20261005",
+    "worker": "gcm-host-p3-r9",
+    "committed_candidate": "9be2f0826b6d90ad44838420cd27f4b3864fe6f4",
+    "review_task": "m1-host-p3-implementation-20261005-r3",
+    "review_result": "FAIL: 5 P1, 0 P0"
+  },
+  "target_dir": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target",
+  "env": {
+    "CARGO_INCREMENTAL": "0",
+    "CARGO_BUILD_JOBS": "2",
+    "CARGO_TARGET_DIR": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target",
+    "OBSCURA_TEST_BINARY_DIR": "/Volumes/Intel/playground/obscura/m1-engine-reconcile-20261002/target/debug",
+    "OBSCURA_WEBRTC_RAW_DIR": "/Volumes/Intel/playground/obscura/.worker-runs/m1-host-p3-implementation-r10-20261005/gcm-host-p3-r10/raw/webrtc"
+  },
+  "changed_files_local": [
+    "crates/obscura-host/src/endpoint/server.rs",
+    "crates/obscura-host/src/endpoint/channels.rs",
+    "crates/obscura-host/tests/blackbox_b9_unsettled_permit.rs",
+    "crates/obscura-media/src/encoder_owner.rs",
+    "crates/obscura-media/src/main.rs",
+    "crates/obscura-media/tests/cleanup_blackbox.rs",
+    "crates/obscura-media/tests/encoder.rs",
+    "crates/obscura-media/tests/registration_blackbox.rs",
+    "docs/runs/m1-host-p3-implementation-20261005/notes.md",
+    "docs/runs/m1-host-p3-implementation-20261005/report.md",
+    "docs/runs/m1-host-p3-implementation-20261005/result.json"
+  ],
+  "protocol_version_unchanged": true,
+  "host_protocol_version": 11,
+  "delta_sha256": {
+    "crates/obscura-host/src/endpoint/server.rs": "9ca032c0d87df83d2b8ead12e322f5359820edf5008a7296cb4da3da406859e0",
+    "crates/obscura-host/src/endpoint/channels.rs": "2b5ac717aacbd3f490c852d997bccc620f67c6369f09bfb4c59de3dc6590ca40",
+    "crates/obscura-host/tests/blackbox_b9_unsettled_permit.rs": "a7501428ffb954cfe1e72b0c2e2e4a825114635649850b2b0695d5e5b5f2f5ff",
+    "crates/obscura-media/src/encoder_owner.rs": "6b425e5d086138bd2d52a5b35bed91b5813a3e441bf776bbc7ea5936f5bc9f9f",
+    "crates/obscura-media/src/main.rs": "216213861b0a7ebf50940ffc9460ffcf7847f2fd8c255a0d76dcd298e50dc1a0",
+    "crates/obscura-media/tests/cleanup_blackbox.rs": "3183165d444a34b07cd1c8de3b2e7f3e907c58bc15e8b5726016c30204bf5ed1",
+    "crates/obscura-media/tests/encoder.rs": "a41d79f96175f86eda152ff3b87cae8c170c713c7da5598ba4d5d58420637fc9",
+    "crates/obscura-media/tests/registration_blackbox.rs": "c4d16e655578943e7fbde3c5ef5b7b9db6395aa5c356964c283c40efffc5dc4f"
+  },
+  "findings": [
+    {
+      "id": "G1",
+      "title": "unsettled encoder permit must retain resource owner and failure result through release and shutdown",
+      "owner": "crates/obscura-host/src/endpoint/server.rs (+ crates/obscura-host/src/endpoint/channels.rs)",
+      "public_test": "obscura-host::blackbox_b9_unsettled_permit::unsettled_encoder_permit_is_an_explicit_terminal",
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
+    },
+    {
+      "id": "G2",
+      "title": "cancellation during registration must not equate an unread acknowledgment with an unregistered encoder group",
+      "owner": "crates/obscura-media/src/encoder_owner.rs",
+      "public_test": "obscura-media::registration_blackbox::standalone_adapter_resolves_pending_registration_before_reaping",
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
+    },
+    {
+      "id": "G3",
+      "title": "the adapter must receive a successful revoke acknowledgment before reaping a registered leader",
+      "owner": "crates/obscura-media/src/encoder_owner.rs",
+      "public_test": "obscura-media::registration_blackbox::standalone_adapter_requires_revoke_ack_before_reaping_registered_leader",
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
+    },
+    {
+      "id": "G4",
+      "title": "terminal encode cleanup must not signal an encoder identity after its leader has already been reaped",
+      "owner": "crates/obscura-media/src/encoder_owner.rs",
+      "public_test": [
+        "obscura-media::cleanup_blackbox::standalone_adapter_retires_group_authority_before_reaping_nonzero_encoder",
+        "obscura-media::cleanup_blackbox::standalone_adapter_retires_group_authority_before_reaping_empty_encoder_output"
+      ],
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
+    },
+    {
+      "id": "G5",
+      "title": "the adapter cancellation endpoint must remain reachable while waiting for frames",
+      "owner": "crates/obscura-media/src/main.rs",
+      "public_test": "obscura-media::cleanup_blackbox::standalone_adapter_exits_on_sigterm_while_waiting_for_frames",
+      "before_exit": 100,
+      "after_exit": 0,
+      "verdict": "CLOSED"
+    }
+  ],
+  "gates": {
+    "host_focused": {"command": "cargo nextest run -p obscura-host --features render -j 4 --no-fail-fast", "result": "122 passed, 0 skipped", "exit": 0},
+    "media_focused": {"command": "cargo nextest run -p obscura-media --features webrtc -j 4 --no-fail-fast", "result": "29 passed, 0 skipped", "exit": 0},
+    "build_media": {"command": "cargo build --release -p obscura-media --features webrtc", "exit": 0},
+    "build_host": {"command": "cargo build --release -p obscura-host --bins", "exit": 0},
+    "build_cli": {"command": "cargo build --release -p obscura-cli --bins --features render", "exit": 0},
+    "full_gate_1": {"command": "cargo nextest run --workspace --features render -j 4 --no-fail-fast", "result": "1822 passed, 4 skipped", "exit": 0},
+    "full_gate_2": {"command": "cargo nextest run --workspace --features render -j 4 --no-fail-fast", "result": "1822 passed, 4 skipped", "exit": 0},
+    "cli_tree": {"command": "cargo tree -p obscura-cli --features render --locked", "host_edges": 0, "media_edges": 0, "exit": 0},
+    "diff_check": {"command": "git diff --check", "exit": 0}
+  },
+  "red_runs_retained": [
+    {
+      "log": "raw/a7-full-gate-1-red-continuous-timeout.log",
+      "exit": 100,
+      "reason": "obscura-host::webrtc_endpoint::real_receiver_gets_continuous_host_media_and_rejects_stale_binding hit its hard 180s fixture timeout under host load",
+      "disposition": "load-induced fixture timeout; passes isolated in 15.5s and in both green gates"
+    }
+  ],
+  "disclosures": [
+    "The webrtc_endpoint integration fixture defaults its raw output root into the protected untracked docs/runs/m1-frame-forwarding-impl-r1-20261005/ tree. This task's first host focused run and first full gate wrote 37 UUID fixture directories there before OBSCURA_WEBRTC_RAW_DIR was set. Only those task-owned directories were removed, restoring the tree to its 70-entry pre-task state; no pre-existing entry was removed.",
+    "This task's five /tmp/ob9-* fixture roots and one /tmp/ow-* root were removed with exact-path find -delete; no other owner's resources were touched."
+  ],
+  "controller_next": [
+    "Re-run the independent implementation review on the r10 working tree at end tree 5d09df94a0c5428d230b3d5945e2a8234ed36fc7 (product-source tree 8456479543ebb3308efc42d06b58137610c86428).",
+    "On PASS, commit, merge to clean main, push to origin/main, and verify the remote receipt."
+  ]
+}

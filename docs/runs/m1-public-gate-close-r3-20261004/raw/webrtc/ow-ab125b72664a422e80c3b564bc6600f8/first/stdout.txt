@@ -1,0 +1,1 @@
+{"pass":true,"error_code":"ENCODER_UNAVAILABLE","error_message":"Encoder for session 65b7f18f-a414-4f58-8026-5501de5c55a0 is unavailable: Start configured FFmpeg H.264 encoder","session_id":"65b7f18f-a414-4f58-8026-5501de5c55a0"}

@@ -1,0 +1,9 @@
+absent remove: ok {"get":null,"len":0}
+absent clear: ok {"get":null,"len":0}
+ABSENT_PHASE=FAIL
+  absent set/get: expected {"get":"v","len":1}, got {"get":null,"len":0}
+valid-empty set/get: ok {"get":"v","len":1}
+valid-empty remove: ok {"get":null,"len":0}
+valid-empty clear: ok {"get":null,"len":0}
+VALID_EMPTY_PHASE=PASS
+SUMMARY=FAIL

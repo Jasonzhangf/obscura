@@ -1,0 +1,125 @@
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:136:22
+    |
+136 |     pub fn as_family(&self) -> Family {
+    |                      ^^^^^     ^^^^^^ the same lifetime is hidden here
+    |                      |
+    |                      the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+136 |     pub fn as_family(&self) -> Family<'_> {
+    |                                      ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:611:21
+    |
+611 |     pub fn as_attrs(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+611 |     pub fn as_attrs(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:651:21
+    |
+651 |     pub fn defaults(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+651 |     pub fn defaults(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:683:21
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs {
+    |                     ^^^^^                   ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs<'_> {
+    |                                                  ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/buffer.rs:868:24
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter {
+    |                        ^^^^^     ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                        |
+    |                        the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter<'_> {
+    |                                               ++++
+
+warning: `cosmic-text` (lib) generated 5 warnings (run `cargo fix --lib -p cosmic-text` to apply 5 suggestions)
+warning: unused variable: `document_sheet`
+    --> crates/obscura-render/src/dom.rs:2569:5
+     |
+2569 |     document_sheet: &crate::css::Stylesheet,
+     |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_document_sheet`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `obscura-render` (lib) generated 1 warning (run `cargo fix --lib -p obscura-render` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 12.78s
+────────────
+ Nextest run ID 8cec5bda-20f6-4613-8c82-d9a63243b4c5 with nextest profile: default
+    Starting 5 tests across 1 binary
+        PASS [   0.107s] (1/5) obscura-cli::obey_robots fixture_listener_is_reaped_on_drop
+        PASS [   7.497s] (2/5) obscura-cli::obey_robots obey_robots_is_global_and_blocks_fetch_before_target_request
+        PASS [   7.508s] (3/5) obscura-cli::obey_robots obey_robots_fetches_an_allowed_target_after_loading_policy
+        PASS [   7.511s] (4/5) obscura-cli::obey_robots fetch_without_obey_robots_keeps_existing_navigation_behavior
+        FAIL [  12.496s] (5/5) obscura-cli::obey_robots obey_robots_reaches_scrape_worker_and_blocks_target_request
+  stdout ───
+
+    running 1 test
+    test obey_robots_reaches_scrape_worker_and_blocks_target_request ... FAILED
+
+    failures:
+
+    failures:
+        obey_robots_reaches_scrape_worker_and_blocks_target_request
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 4 filtered out; finished in 12.46s
+
+  stderr ───
+
+    thread 'obey_robots_reaches_scrape_worker_and_blocks_target_request' (772061076) panicked at crates/obscura-cli/tests/obey_robots.rs:141:5:
+    stdout: {
+      "total_urls": 1,
+      "concurrency": 10,
+      "total_time_ms": 5003,
+      "avg_time_ms": 5003.0,
+      "results": [
+        {
+          "url": "http://127.0.0.1:50801/private/page",
+          "error": "timeout",
+          "time_ms": 5003
+        }
+      ]
+    }
+
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [  12.504s] 5 tests run: 4 passed, 1 failed, 0 skipped
+        FAIL [  12.496s] (5/5) obscura-cli::obey_robots obey_robots_reaches_scrape_worker_and_blocks_target_request
+error: test run failed

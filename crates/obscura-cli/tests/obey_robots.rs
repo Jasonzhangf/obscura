@@ -1,13 +1,16 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 struct RobotsServer {
     address: String,
     paths: Arc<Mutex<Vec<String>>>,
+    shutdown: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl RobotsServer {
@@ -19,9 +22,10 @@ impl RobotsServer {
         let address = listener.local_addr().expect("fixture address").to_string();
         let paths = Arc::new(Mutex::new(Vec::new()));
         let server_paths = Arc::clone(&paths);
-        thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while Instant::now() < deadline {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let server_shutdown = Arc::clone(&shutdown);
+        let thread = thread::spawn(move || {
+            while !server_shutdown.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok((stream, _)) => serve(stream, &server_paths),
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -31,7 +35,12 @@ impl RobotsServer {
                 }
             }
         });
-        Self { address, paths }
+        Self {
+            address,
+            paths,
+            shutdown,
+            thread: Some(thread),
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -40,6 +49,16 @@ impl RobotsServer {
 
     fn paths(&self) -> Vec<String> {
         self.paths.lock().expect("fixture paths").clone()
+    }
+}
+
+impl Drop for RobotsServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+        let _ = TcpStream::connect(&self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -107,13 +126,12 @@ fn obey_robots_is_global_and_blocks_fetch_before_target_request() {
 fn obey_robots_reaches_scrape_worker_and_blocks_target_request() {
     let server = RobotsServer::spawn();
     let url = server.url("/private/page");
+    // Worker startup is not part of the robots assertion; use the CLI default budget.
     let output = obscura(&[
         "--obey-robots",
         "--allow-private-network",
         "scrape",
         "--quiet",
-        "--timeout",
-        "5",
         &url,
     ]);
 
@@ -142,6 +160,19 @@ fn fetch_without_obey_robots_keeps_existing_navigation_behavior() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(server.paths(), vec!["/private/page"]);
+}
+
+#[test]
+fn fixture_listener_is_reaped_on_drop() {
+    let server = RobotsServer::spawn();
+    let address = server.address.parse().expect("fixture socket address");
+
+    drop(server);
+
+    assert!(
+        TcpStream::connect_timeout(&address, Duration::from_millis(500)).is_err(),
+        "fixture listener still accepted connections after drop"
+    );
 }
 
 #[test]

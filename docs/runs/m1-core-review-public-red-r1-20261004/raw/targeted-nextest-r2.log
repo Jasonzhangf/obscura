@@ -1,0 +1,232 @@
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:136:22
+    |
+136 |     pub fn as_family(&self) -> Family {
+    |                      ^^^^^     ^^^^^^ the same lifetime is hidden here
+    |                      |
+    |                      the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+136 |     pub fn as_family(&self) -> Family<'_> {
+    |                                      ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:611:21
+    |
+611 |     pub fn as_attrs(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+611 |     pub fn as_attrs(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:651:21
+    |
+651 |     pub fn defaults(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+651 |     pub fn defaults(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:683:21
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs {
+    |                     ^^^^^                   ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs<'_> {
+    |                                                  ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/buffer.rs:868:24
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter {
+    |                        ^^^^^     ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                        |
+    |                        the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter<'_> {
+    |                                               ++++
+
+warning: `cosmic-text` (lib) generated 5 warnings (run `cargo fix --lib -p cosmic-text` to apply 5 suggestions)
+warning: unused variable: `document_sheet`
+    --> crates/obscura-render/src/dom.rs:2569:5
+     |
+2569 |     document_sheet: &crate::css::Stylesheet,
+     |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_document_sheet`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `obscura-render` (lib) generated 1 warning (run `cargo fix --lib -p obscura-render` to apply 1 suggestion)
+warning: constant `K_CF_NUMBER_INT_TYPE` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:34:7
+   |
+34 | const K_CF_NUMBER_INT_TYPE: i32 = 9;
+   |       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `K_CF_STRING_ENCODING_UTF8` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:35:7
+   |
+35 | const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `profile_level` is never used
+   --> crates/obscura-media/src/videotoolbox.rs:706:12
+    |
+458 | impl VtSession {
+    | -------------- method in this implementation
+...
+706 |     pub fn profile_level(&self) -> Option<String> {
+    |            ^^^^^^^^^^^^^
+
+warning: function `CFStringGetCString` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:81:8
+   |
+81 |     fn CFStringGetCString(
+   |        ^^^^^^^^^^^^^^^^^^
+
+warning: `obscura-media` (lib) generated 4 warnings
+   Compiling obscura-host v0.1.0 (/Volumes/Intel/playground/obscura/m1-core-review-public-red-r1-20261004/crates/obscura-host)
+warning: variable does not need to be mutable
+  --> crates/obscura-host/src/catalog.rs:56:25
+   |
+56 |                     let mut store = Self {
+   |                         ----^^^^^
+   |                         |
+   |                         help: remove this `mut`
+   |
+   = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `editor_context` is never read
+   --> crates/obscura-host/src/worker.rs:388:9
+    |
+388 |         editor_context = None;
+    |         ^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `root_configured` is never used
+  --> crates/obscura-host/src/catalog.rs:69:12
+   |
+33 | impl ProfileCatalogStore {
+   | ------------------------ method in this implementation
+...
+69 |     pub fn root_configured(&self) -> bool { self.root.is_some() }
+   |            ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: variant `Release` is never constructed
+  --> crates/obscura-host/src/daemon.rs:22:5
+   |
+16 | enum Event {
+   |      ----- variant in this enum
+...
+22 |     Release { connection: u64, reply: oneshot::Sender<Result<(), &'static str>> },
+   |     ^^^^^^^
+
+warning: field `profile` is never read
+   --> crates/obscura-host/src/daemon.rs:103:5
+    |
+ 80 | struct Session {
+    |        ------- field in this struct
+...
+103 |     profile: ProfileBinding,
+    |     ^^^^^^^
+
+warning: `obscura-host` (bin "obscura-host") generated 5 warnings (run `cargo fix --bin "obscura-host" -p obscura-host` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 1.29s
+────────────
+ Nextest run ID 94c54630-c9e6-42ac-98dc-c4fc8970ae59 with nextest profile: default
+    Starting 6 tests across 2 binaries
+        PASS [   3.224s] (1/6) obscura-host::editor_context_public_c2 evaluate_mutation_publishes_new_context_and_keeps_stale_binding_rejected
+        FAIL [   3.227s] (2/6) obscura-host::lease_cancel_r2 explicit_detach_cancels_gesture_before_handover
+  stdout ───
+
+    running 1 test
+    test explicit_detach_cancels_gesture_before_handover ... FAILED
+
+    failures:
+
+    failures:
+        explicit_detach_cancels_gesture_before_handover
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 3.22s
+
+  stderr ───
+
+    thread 'explicit_detach_cancels_gesture_before_handover' (783929499) panicked at crates/obscura-host/tests/lease_cancel_r2.rs:465:5:
+    explicit detach must release the gesture lease: clean={"session_id":"eb6a9315-194a-4d9e-a28a-bed09e4e9350","profile_id":"default","attachment_id":3,"mode":"agent","attachments":1,"agent_attached":true,"operation_running":true,"control":{"epoch":1,"phase":{"type":"agent"}},"fault":null,"next_sequence":1,"viewport_revision":0,"document_revision":1,"presentation_revision":0,"active_tab_id":"eb6a9315-194a-4d9e-a28a-bed09e4e9350:t0","tabs":[{"tab_id":"eb6a9315-194a-4d9e-a28a-bed09e4e9350:t0","url":"data:text/html,<div id=target style='position:absolute;left:10px;top:10px;width:300px;height:30px;background:red'></div>","title":"","active":true}],"navigation":{"url":"data:text/html,<div id=target style='position:absolute;left:10px;top:10px;width:300px;height:30px;background:red'></div>","title":"","can_go_back":true,"can_go_forward":false},"viewport":[1280.0,720.0],"viewport_owner":null,"viewport_pending":false,"editor_context":null,"input_lease":{"kind":"gesture","operation_id":"lease-op-2","attachment_id":2,"gesture_session_id":"detach-gesture","edit_session_id":null,"target_id":null}} next_down={"type":"error","id":2,"code":"INPUT_LEASE_BUSY","message":"Another gesture/composition lease is active"} takeover={"session_id":"eb6a9315-194a-4d9e-a28a-bed09e4e9350","profile_id":"default","attachment_id":4,"mode":"observe","attachments":2,"agent_attached":true,"operation_running":true,"control":{"epoch":2,"phase":{"type":"waiting","attachment_id":4}},"fault":null,"next_sequence":1,"viewport_revision":0,"document_revision":1,"presentation_revision":0,"active_tab_id":"eb6a9315-194a-4d9e-a28a-bed09e4e9350:t0","tabs":[{"tab_id":"eb6a9315-194a-4d9e-a28a-bed09e4e9350:t0","url":"data:text/html,<div id=target style='position:absolute;left:10px;top:10px;width:300px;height:30px;background:red'></div>","title":"","active":true}],"navigation":{"url":"data:text/html,<div id=target style='position:absolute;left:10px;top:10px;width:300px;height:30px;background:red'></div>","title":"","can_go_back":true,"can_go_forward":false},"viewport":[1280.0,720.0],"viewport_owner":null,"viewport_pending":false,"editor_context":null,"input_lease":{"kind":"gesture","operation_id":"lease-op-2","attachment_id":2,"gesture_session_id":"detach-gesture","edit_session_id":null,"target_id":null}}
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   3.228s] (3/6) obscura-host::lease_cancel_r2 explicit_detach_cancels_composition_before_handover
+  stdout ───
+
+    running 1 test
+    test explicit_detach_cancels_composition_before_handover ... FAILED
+
+    failures:
+
+    failures:
+        explicit_detach_cancels_composition_before_handover
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 3.22s
+
+  stderr ───
+
+    thread 'explicit_detach_cancels_composition_before_handover' (783929498) panicked at crates/obscura-host/tests/lease_cancel_r2.rs:374:5:
+    explicit detach must release the composition lease: clean={"session_id":"18f7d509-1349-49df-9af0-01da997c4972","profile_id":"default","attachment_id":3,"mode":"agent","attachments":1,"agent_attached":true,"operation_running":true,"control":{"epoch":1,"phase":{"type":"agent"}},"fault":null,"next_sequence":1,"viewport_revision":0,"document_revision":1,"presentation_revision":0,"active_tab_id":"18f7d509-1349-49df-9af0-01da997c4972:t0","tabs":[{"tab_id":"18f7d509-1349-49df-9af0-01da997c4972:t0","url":"data:text/html,<input id=f value=seed style='position:absolute;left:10px;top:10px;width:300px;height:30px'>","title":"","active":true}],"navigation":{"url":"data:text/html,<input id=f value=seed style='position:absolute;left:10px;top:10px;width:300px;height:30px'>","title":"","can_go_back":true,"can_go_forward":false},"viewport":[1280.0,720.0],"viewport_owner":null,"viewport_pending":false,"editor_context":{"target_id":"node-4","kind":"input","editable":true,"read_only":false,"input_type":"text","input_mode":null,"enter_key_hint":null,"multiline":false,"password":false,"focus_revision":1,"editor_revision":0,"selection":{"start":2,"end":2,"direction":"none"},"composition":{"data":"中文","start":0,"end":2},"caret":null,"surrounding":{"text":"中文seed","offset":0,"before_length":2,"after_length":4}},"input_lease":{"kind":"composition","operation_id":"lease-op-3","attachment_id":2,"gesture_session_id":null,"edit_session_id":"detach-compose","target_id":"node-4"}} next_begin={"type":"error","id":2,"code":"INPUT_LEASE_BUSY","message":"Another gesture/composition lease is active"} takeover={"session_id":"18f7d509-1349-49df-9af0-01da997c4972","profile_id":"default","attachment_id":4,"mode":"observe","attachments":2,"agent_attached":true,"operation_running":true,"control":{"epoch":2,"phase":{"type":"waiting","attachment_id":4}},"fault":null,"next_sequence":1,"viewport_revision":0,"document_revision":1,"presentation_revision":0,"active_tab_id":"18f7d509-1349-49df-9af0-01da997c4972:t0","tabs":[{"tab_id":"18f7d509-1349-49df-9af0-01da997c4972:t0","url":"data:text/html,<input id=f value=seed style='position:absolute;left:10px;top:10px;width:300px;height:30px'>","title":"","active":true}],"navigation":{"url":"data:text/html,<input id=f value=seed style='position:absolute;left:10px;top:10px;width:300px;height:30px'>","title":"","can_go_back":true,"can_go_forward":false},"viewport":[1280.0,720.0],"viewport_owner":null,"viewport_pending":false,"editor_context":{"target_id":"node-4","kind":"input","editable":true,"read_only":false,"input_type":"text","input_mode":null,"enter_key_hint":null,"multiline":false,"password":false,"focus_revision":1,"editor_revision":0,"selection":{"start":2,"end":2,"direction":"none"},"composition":{"data":"中文","start":0,"end":2},"caret":null,"surrounding":{"text":"中文seed","offset":0,"before_length":2,"after_length":4}},"input_lease":{"kind":"composition","operation_id":"lease-op-3","attachment_id":2,"gesture_session_id":null,"edit_session_id":"detach-compose","target_id":"node-4"}}
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        FAIL [   3.228s] (4/6) obscura-host::editor_context_public_c2 evaluate_mutation_exception_publishes_current_editor_context
+  stdout ───
+
+    running 1 test
+    test evaluate_mutation_exception_publishes_current_editor_context ... FAILED
+
+    failures:
+
+    failures:
+        evaluate_mutation_exception_publishes_current_editor_context
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 3.22s
+
+  stderr ───
+    attachment ended: Broken pipe (os error 32)
+
+    thread 'evaluate_mutation_exception_publishes_current_editor_context' (783929501) panicked at crates/obscura-host/tests/editor_context_public_c2.rs:275:5:
+    Evaluate must publish the mutated editor revision after a JavaScript exception: {"session_id":"6ff74ceb-e432-488c-a26f-6c828923ae99","profile_id":"default","attachment_id":2,"mode":"agent","attachments":1,"agent_attached":true,"operation_running":false,"control":{"epoch":1,"phase":{"type":"agent"}},"fault":null,"next_sequence":4,"viewport_revision":0,"document_revision":1,"presentation_revision":0,"active_tab_id":"6ff74ceb-e432-488c-a26f-6c828923ae99:t0","tabs":[{"tab_id":"6ff74ceb-e432-488c-a26f-6c828923ae99:t0","url":"data:text/html,<input id=field style='position:absolute;left:10px;top:10px;width:300px;height:30px'>","title":"","active":true}],"navigation":{"url":"data:text/html,<input id=field style='position:absolute;left:10px;top:10px;width:300px;height:30px'>","title":"","can_go_back":true,"can_go_forward":false},"viewport":[1280.0,720.0],"viewport_owner":null,"viewport_pending":false,"editor_context":{"target_id":"node-4","kind":"input","editable":true,"read_only":false,"input_type":"text","input_mode":null,"enter_key_hint":null,"multiline":false,"password":false,"focus_revision":1,"editor_revision":0,"selection":{"start":0,"end":0,"direction":"none"},"composition":null,"caret":null,"surrounding":{"text":"","offset":0,"before_length":0,"after_length":0}},"input_lease":null} edit_receipt={"type":"error","id":10,"code":"STALE_EDITOR_REVISION","message":"Editor revision changed"}
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+        PASS [   3.229s] (5/6) obscura-host::lease_cancel_r2 direct_same_session_composition_cancel_stays_green
+        PASS [   3.234s] (6/6) obscura-host::lease_cancel_r2 disconnect_terminates_engine_composition_before_lease_release
+────────────
+     Summary [   3.234s] 6 tests run: 3 passed, 3 failed, 0 skipped
+        FAIL [   3.227s] (2/6) obscura-host::lease_cancel_r2 explicit_detach_cancels_gesture_before_handover
+        FAIL [   3.228s] (3/6) obscura-host::lease_cancel_r2 explicit_detach_cancels_composition_before_handover
+        FAIL [   3.228s] (4/6) obscura-host::editor_context_public_c2 evaluate_mutation_exception_publishes_current_editor_context
+error: test run failed
