@@ -41,6 +41,17 @@ pub enum WorkKind {
     Flush,
 }
 const BUDGET: Duration = Duration::from_secs(5);
+const NAVIGATION_BUDGET_SLACK: Duration = Duration::from_secs(5);
+
+/// Navigation uses the engine's own end-to-end deadline plus slack. The fixed
+/// BUDGET exists for short control operations: navigation repeatedly timed out
+/// on slow real-world sites (xiaohongshu/weibo) while the engine's 30s default
+/// was still allowed to finish, fencing the session as OUTCOME_UNKNOWN.
+fn navigation_budget(page: &Page) -> Duration {
+    page.navigation_timeout()
+        .checked_add(NAVIGATION_BUDGET_SLACK)
+        .unwrap_or_else(|| page.navigation_timeout())
+}
 
 fn empty_navigation() -> NavigationState {
     NavigationState { url: String::new(), title: String::new(), can_go_back: false, can_go_forward: false }
@@ -185,7 +196,8 @@ pub fn start(id: String, profile_dir: Option<PathBuf>, network: bool, mut incomi
                 // after the input receipt. Never cancel it to inject another input.
                 if failure.is_none() {
                     if let Some(page) = pages.active_page() {
-                        match timeout(BUDGET, page_work(page.process_pending_navigation())).await {
+                        let budget = navigation_budget(page);
+                        match timeout(budget, page_work(page.process_pending_navigation())).await {
                             Ok(Ok(false)) => {},
                             outcome => {
                                 document_revision += 1;
@@ -394,7 +406,11 @@ async fn execute(
     let result = match command {
         Command::Navigate { url } => {
             let page = pages.active_page().expect("non-empty pages");
-            match timeout(BUDGET, page_work(page.navigate(&url))).await {
+            let budget = navigation_budget(page);
+            match timeout(
+                budget,
+                page_work(page.navigate_with_wait(&url, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)),
+            ).await {
                 Ok(Ok(())) => { editor_context = None; Ok(None) }
                 Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
                 Err(_) => {
@@ -414,7 +430,8 @@ async fn execute(
                 if page.history_index + 1 >= page.history.len() { return simple(Err(("NO_HISTORY", "No later history entry".into())), editor_context, Some(page.viewport)); }
                 page.history_index + 1
             };
-            match timeout(BUDGET, page_work(page.navigate_history_entry(index))).await {
+            let budget = navigation_budget(page);
+            match timeout(budget, page_work(page.navigate_history_entry(index))).await {
                 Ok(Ok(())) => { editor_context = None; Ok(None) }
                 Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
                 Err(_) => {
@@ -426,7 +443,8 @@ async fn execute(
         }
         Command::Reload => {
             let page = pages.active_page().expect("non-empty pages");
-            match timeout(BUDGET, page_work(page.reload())).await {
+            let budget = navigation_budget(page);
+            match timeout(budget, page_work(page.reload())).await {
                 Ok(Ok(())) => { editor_context = None; Ok(None) }
                 Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
                 Err(_) => {

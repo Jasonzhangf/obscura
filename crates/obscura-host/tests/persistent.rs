@@ -1105,3 +1105,26 @@ fn page_initiated_navigation_advances_status_document_revision() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn slow_navigation_does_not_fence_the_session() {
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("slow navigation fixture connection");
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let request = read_complete_http_request(&stream, 8 * 1024).expect("slow navigation request");
+        assert!(request.starts_with(b"GET / HTTP/"), "unexpected navigation request: {request:?}");
+        std::thread::sleep(Duration::from_secs(6));
+        let body = "<title>slow destination</title>done";
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":format!("http://{address}/")}));
+    server.join().unwrap();
+    let status = agent.ok(json!({"type":"status"}));
+    assert_eq!(status["tabs"][0]["title"], "slow destination");
+}
