@@ -1069,3 +1069,39 @@ fn admin_authority_refuses_malformed_partial_and_unknown_ops() {
     assert_eq!(refusal["state"], "error");
     assert_eq!(refusal["code"], "ADMIN_FRAME_MALFORMED");
 }
+
+#[test]
+fn page_initiated_navigation_advances_status_document_revision() {
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("page navigation fixture connection");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let request = read_complete_http_request(&stream, 8 * 1024).expect("page navigation request");
+        assert!(request.starts_with(b"GET / HTTP/"), "unexpected navigation request: {request:?}");
+        let body = "<title>destination</title>done";
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    let link = format!("data:text/html,<a style='position:absolute;left:10px;top:10px;width:200px;height:60px' href='http://{address}/'>next</a>");
+    agent.ok(json!({"type":"navigate","url":link}));
+    let mut human = daemon.connect();
+    let attached = human.ok(json!({"type":"attach","mode":"observe"}));
+    let takeover = human.ok(json!({"type":"request_takeover","epoch":attached["control"]["epoch"]}));
+    let before = takeover["document_revision"].as_u64().expect("document revision before click");
+    human.ok(json!({"type":"click","x":30,"y":30}));
+    server.join().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = human.ok(json!({"type":"status"}));
+        if status["document_revision"].as_u64() == Some(before + 1) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "page navigation did not reach Host status: {status}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
