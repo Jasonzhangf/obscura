@@ -407,10 +407,7 @@ async fn execute(
         Command::Navigate { url } => {
             let page = pages.active_page().expect("non-empty pages");
             let budget = navigation_budget(page);
-            match timeout(
-                budget,
-                page_work(page.navigate_with_wait(&url, obscura_browser::lifecycle::WaitUntil::DomContentLoaded)),
-            ).await {
+            match timeout(budget, page_work(page.navigate(&url))).await {
                 Ok(Ok(())) => { editor_context = None; Ok(None) }
                 Ok(Err(cause)) => Err(("NAVIGATION_FAILED", cause.to_string())),
                 Err(_) => {
