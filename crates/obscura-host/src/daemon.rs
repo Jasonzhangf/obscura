@@ -816,10 +816,13 @@ async fn spawn_session(
         .context("Bind exact-session media source")?;
     let listener = media_source.take_listener().expect("session media listener is bound");
     tokio::spawn(media::serve_session(listener, latest.clone(), interest.clone(), id.clone()));
-    let forward_id = id.clone();
+    // The daemon session map is keyed by profile id. Forward worker updates
+    // with that same key so page-initiated revision and fault updates land in
+    // the owning runtime instead of being silently dropped.
+    let forward_profile = profile_id.clone();
     tokio::spawn(async move {
         while let Some(update) = fault_events.recv().await {
-            if faults_out.send((forward_id.clone(), update)).await.is_err() { break; }
+            if faults_out.send((forward_profile.clone(), update)).await.is_err() { break; }
         }
     });
     let session = Session {
@@ -1652,8 +1655,8 @@ pub async fn serve(
             },
             update = fault_rx.recv() => {
                 match update {
-                    Some((sid, update)) => {
-                        if let Some(runtime) = sessions.get_mut(&sid) {
+                    Some((profile_id, update)) => {
+                        if let Some(runtime) = sessions.get_mut(&profile_id) {
                             if runtime.session.fault.is_none() {
                                 runtime.session.document_revision = runtime.session.document_revision.max(update.document_revision);
                                 runtime.session.fault = update.fault;
