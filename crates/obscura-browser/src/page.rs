@@ -3184,6 +3184,7 @@ impl Page {
         let mut current_method = method.to_string();
         let mut current_body = body.to_string();
         let mut document_referrer = initial_referrer.to_string();
+        let mut followed_self_reload = false;
         let chain_limit = self.navigation_chain_limit();
         for chain in 0..chain_limit {
             self.navigate_single(
@@ -3215,6 +3216,18 @@ impl Page {
                     current_url,
                     next_url
                 );
+                if Self::same_document_url(&current_url, &next_url) {
+                    // A page that re-navigates to its own address (login/SSO
+                    // bounces, anti-crawl self-reloads) is a landing state.
+                    // Chrome performs at most one such reload and then keeps
+                    // the committed document, so the engine may not run the
+                    // identical target to the chain limit: that turns a real
+                    // login page into a "too many client navigations" error.
+                    if followed_self_reload {
+                        break;
+                    }
+                    followed_self_reload = true;
+                }
                 document_referrer = self
                     .url
                     .as_ref()
@@ -3239,6 +3252,24 @@ impl Page {
             break;
         }
         Ok(())
+    }
+
+    /// Whether a pending navigation points at the same document as the URL
+    /// just committed. Login/SSO pages and anti-crawl shells re-assign their
+    /// own address, so the chain must stop on the identical target instead
+    /// of running it to the chain limit and failing the whole navigation.
+    fn same_document_url(current: &str, candidate: &str) -> bool {
+        let Ok(base) = Url::parse(current) else {
+            return current == candidate;
+        };
+        let Ok(target) = base.join(candidate) else {
+            return false;
+        };
+        let mut base = base;
+        let mut target = target;
+        base.set_fragment(None);
+        target.set_fragment(None);
+        base == target
     }
 
     async fn navigate_single(
@@ -5135,6 +5166,55 @@ mod tests {
             error.to_string(),
             "Too many client-initiated navigations, the chain reached its limit of 10 documents"
         );
+    }
+
+    /// A page that reassigns its own address is a login/SSO landing page, not
+    /// a navigation storm: xiaohongshu's login document sets `location.href`
+    /// to its identical URL and a real browser simply shows that page. The
+    /// chain must commit the document instead of failing at the limit.
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_chain_stops_on_a_self_referencing_client_navigation() {
+        let address = self_reloading_address("login");
+        let mut page = chain_page("chain-self-reference", DEFAULT_NAVIGATION_CHAIN_LIMIT);
+
+        page.navigate(&format!("http://{address}/login"))
+            .await
+            .expect("a self-referencing navigation must commit, not fail");
+
+        assert_eq!(page.url_string(), format!("http://{address}/login"));
+    }
+
+    /// Every document reassigns `location.href` to its own address.
+    fn self_reloading_address(name: &str) -> std::net::SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let name = name.to_string();
+        std::thread::spawn(move || {
+            use std::io::{Read as _, Write as _};
+
+            loop {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut buffer = [0u8; 2048];
+                let length = stream.read(&mut buffer).unwrap_or(0);
+                let path = String::from_utf8_lossy(&buffer[..length])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_ascii_whitespace().nth(1))
+                    .map(str::to_string)
+                    .unwrap_or_default();
+                let body = format!(
+                    "<!doctype html><title>{name}</title><script>location.href={path:?}</script>"
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        address
     }
 
     #[tokio::test(flavor = "current_thread")]
