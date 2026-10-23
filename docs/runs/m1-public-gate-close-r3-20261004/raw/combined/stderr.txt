@@ -1,0 +1,667 @@
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:136:22
+    |
+136 |     pub fn as_family(&self) -> Family {
+    |                      ^^^^^     ^^^^^^ the same lifetime is hidden here
+    |                      |
+    |                      the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+    = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+    |
+136 |     pub fn as_family(&self) -> Family<'_> {
+    |                                      ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:611:21
+    |
+611 |     pub fn as_attrs(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+611 |     pub fn as_attrs(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:651:21
+    |
+651 |     pub fn defaults(&self) -> Attrs {
+    |                     ^^^^^     ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+651 |     pub fn defaults(&self) -> Attrs<'_> {
+    |                                    ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/attrs.rs:683:21
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs {
+    |                     ^^^^^                   ^^^^^ the same lifetime is hidden here
+    |                     |
+    |                     the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+683 |     pub fn get_span(&self, index: usize) -> Attrs<'_> {
+    |                                                  ++++
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+   --> vendor/cosmic-text/src/buffer.rs:868:24
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter {
+    |                        ^^^^^     ^^^^^^^^^^^^^ the same lifetime is hidden here
+    |                        |
+    |                        the lifetime is elided here
+    |
+    = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+help: use `'_` for type paths
+    |
+868 |     pub fn layout_runs(&self) -> LayoutRunIter<'_> {
+    |                                               ++++
+
+warning: `cosmic-text` (lib) generated 5 warnings (run `cargo fix --lib -p cosmic-text` to apply 5 suggestions)
+warning: unused variable: `document_sheet`
+    --> crates/obscura-render/src/dom.rs:2569:5
+     |
+2569 |     document_sheet: &crate::css::Stylesheet,
+     |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_document_sheet`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `obscura-render` (lib) generated 1 warning (run `cargo fix --lib -p obscura-render` to apply 1 suggestion)
+warning: constant `K_CF_NUMBER_INT_TYPE` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:34:7
+   |
+34 | const K_CF_NUMBER_INT_TYPE: i32 = 9;
+   |       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `K_CF_STRING_ENCODING_UTF8` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:35:7
+   |
+35 | const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `profile_level` is never used
+   --> crates/obscura-media/src/videotoolbox.rs:706:12
+    |
+458 | impl VtSession {
+    | -------------- method in this implementation
+...
+706 |     pub fn profile_level(&self) -> Option<String> {
+    |            ^^^^^^^^^^^^^
+
+warning: function `CFStringGetCString` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:81:8
+   |
+81 |     fn CFStringGetCString(
+   |        ^^^^^^^^^^^^^^^^^^
+
+warning: `obscura-media` (lib) generated 4 warnings
+warning: method `wire_name` is never used
+  --> crates/obscura-host/src/endpoint/../remote_admission.rs:44:18
+   |
+43 | impl RemoteScope {
+   | ---------------- method in this implementation
+44 |     pub const fn wire_name(self) -> &'static str {
+   |                  ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated function `denial` is never used
+  --> crates/obscura-host/src/endpoint/../remote_admission.rs:93:12
+   |
+92 | impl RemoteAdmissionResult {
+   | -------------------------- associated function in this implementation
+93 |     pub fn denial(request_id: u64, code: RemoteAdmissionErrorCode, message: impl Into<String>) -> Self {
+   |            ^^^^^^
+
+warning: enum `AdmissionReadError` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:138:10
+    |
+138 | pub enum AdmissionReadError {
+    |          ^^^^^^^^^^^^^^^^^^
+
+warning: method `message` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:145:18
+    |
+144 | impl AdmissionReadError {
+    | ----------------------- method in this implementation
+145 |     pub const fn message(self) -> &'static str {
+    |                  ^^^^^^^
+
+warning: enum `AdmissionRead` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:155:10
+    |
+155 | pub enum AdmissionRead {
+    |          ^^^^^^^^^^^^^
+
+warning: struct `RemoteConnectionIo` is never constructed
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:163:12
+    |
+163 | pub struct RemoteConnectionIo {
+    |            ^^^^^^^^^^^^^^^^^^
+
+warning: associated function `from_stream` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:169:12
+    |
+168 | impl RemoteConnectionIo {
+    | ----------------------- associated function in this implementation
+169 |     pub fn from_stream(stream: tokio::net::UnixStream) -> Self {
+    |            ^^^^^^^^^^^
+
+warning: function `read_remote_admission` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:178:14
+    |
+178 | pub async fn read_remote_admission(
+    |              ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `admission_error_result` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:209:8
+    |
+209 | pub fn admission_error_result(failure: AdmissionReadError) -> RemoteAdmissionResult {
+    |        ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `write_remote_admission_result` is never used
+   --> crates/obscura-host/src/endpoint/../remote_admission.rs:218:14
+    |
+218 | pub async fn write_remote_admission_result(
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `AuthFailure` is never constructed
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:26:12
+   |
+26 | pub struct AuthFailure {
+   |            ^^^^^^^^^^^
+
+warning: associated function `new` is never used
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:32:12
+   |
+31 | impl AuthFailure {
+   | ---------------- associated function in this implementation
+32 |     pub fn new(code: RemoteAdmissionErrorCode, message: impl Into<String>) -> Self {
+   |            ^^^
+
+warning: enum `DeviceStatus` is never used
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:48:10
+   |
+48 | pub enum DeviceStatus {
+   |          ^^^^^^^^^^^^
+
+warning: struct `RegistryDevice` is never constructed
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:57:12
+   |
+57 | pub struct RegistryDevice {
+   |            ^^^^^^^^^^^^^^
+
+warning: struct `RegistryFile` is never constructed
+  --> crates/obscura-host/src/endpoint/../remote_authorization.rs:73:12
+   |
+73 | pub struct RegistryFile {
+   |            ^^^^^^^^^^^^
+
+warning: associated items `parse`, `load`, and `authorize` are never used
+   --> crates/obscura-host/src/endpoint/../remote_authorization.rs:83:12
+    |
+ 80 | impl RegistryFile {
+    | ----------------- associated items in this implementation
+...
+ 83 |     pub fn parse(bytes: &[u8]) -> Result<Self> {
+    |            ^^^^^
+...
+110 |     pub fn load(path: &Path) -> Result<Self> {
+    |            ^^^^
+...
+117 |     pub fn authorize(&self, principal: &RemotePrincipalContext) -> Result<InitialProfileGrant, AuthFailure> {
+    |            ^^^^^^^^^
+
+warning: function `unix_now` is never used
+   --> crates/obscura-host/src/endpoint/../remote_authorization.rs:339:4
+    |
+339 | fn unix_now() -> i64 {
+    |    ^^^^^^^^
+
+warning: `obscura-host` (bin "obscura-endpoint") generated 17 warnings
+   Compiling obscura-host v0.1.0 (/Volumes/Intel/playground/obscura/m1-public-gate-close-r3-20261004/crates/obscura-host)
+warning: unused import: `AsyncReadExt`
+  --> crates/obscura-host/tests/remote_admission_r1.rs:21:34
+   |
+21 | use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+   |                                  ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `DirBuilderExt`
+    --> crates/obscura-host/tests/remote_admission_r1.rs:1039:29
+     |
+1039 |     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+     |                             ^^^^^^^^^^^^^
+
+warning: function `fingerprint_array` is never used
+  --> crates/obscura-host/tests/remote_admission_r1.rs:43:4
+   |
+43 | fn fingerprint_array(byte: u8) -> Value {
+   |    ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `registry_path` is never used
+   --> crates/obscura-host/tests/remote_admission_r1.rs:206:8
+    |
+162 | impl HostFixture {
+    | ---------------- method in this implementation
+...
+206 |     fn registry_path(&self) -> &Path { &self.registry }
+    |        ^^^^^^^^^^^^^
+
+warning: `obscura-host` (test "remote_admission_r1") generated 4 warnings (run `cargo fix --test "remote_admission_r1" -p obscura-host` to apply 2 suggestions)
+warning: variable does not need to be mutable
+   --> crates/obscura-host/tests/navigation_profile.rs:241:9
+    |
+241 |     let mut restarted = Daemon::start(&root);
+    |         ----^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `profile_root` is never read
+  --> crates/obscura-host/tests/navigation_profile.rs:33:5
+   |
+30 | struct Daemon {
+   |        ------ field in this struct
+...
+33 |     profile_root: PathBuf,
+   |     ^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `profile_root` is never used
+  --> crates/obscura-host/tests/navigation_profile.rs:86:8
+   |
+36 | impl Daemon {
+   | ----------- method in this implementation
+...
+86 |     fn profile_root(&self) -> &Path { &self.profile_root }
+   |        ^^^^^^^^^^^^
+
+warning: `obscura-host` (test "navigation_profile") generated 3 warnings (run `cargo fix --test "navigation_profile" -p obscura-host` to apply 1 suggestion)
+warning: variable does not need to be mutable
+   --> crates/obscura-host/src/catalog.rs:131:25
+    |
+131 |                     let mut store = Self {
+    |                         ----^^^^^
+    |                         |
+    |                         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `editor_context` is never read
+   --> crates/obscura-host/src/worker.rs:388:9
+    |
+388 |         editor_context = None;
+    |         ^^^^^^^^^^^^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: struct `MembershipReceipt` is never constructed
+  --> crates/obscura-host/src/catalog.rs:86:12
+   |
+86 | pub struct MembershipReceipt {
+   |            ^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: methods `root_configured`, `catalog_revision`, `access_for`, and `assign_access` are never used
+   --> crates/obscura-host/src/catalog.rs:145:12
+    |
+100 | impl ProfileCatalogStore {
+    | ------------------------ methods in this implementation
+...
+145 |     pub fn root_configured(&self) -> bool { self.root.is_some() }
+    |            ^^^^^^^^^^^^^^^
+146 |
+147 |     pub fn catalog_revision(&self) -> u64 { self.catalog_revision }
+    |            ^^^^^^^^^^^^^^^^
+...
+178 |     pub fn access_for(&self, profile_id: &str) -> Option<&ProfileAccess> {
+    |            ^^^^^^^^^^
+...
+236 |     pub fn assign_access(
+    |            ^^^^^^^^^^^^^
+
+warning: variant `Release` is never constructed
+  --> crates/obscura-host/src/daemon.rs:31:5
+   |
+21 | enum Event {
+   |      ----- variant in this enum
+...
+31 |     Release { connection: u64, reply: oneshot::Sender<Result<(), &'static str>> },
+   |     ^^^^^^^
+
+warning: field `profile` is never read
+   --> crates/obscura-host/src/daemon.rs:152:5
+    |
+129 | struct Session {
+    |        ------- field in this struct
+...
+152 |     profile: ProfileBinding,
+    |     ^^^^^^^
+
+warning: fields `session_id` and `reservation_id` are never read
+   --> crates/obscura-host/src/daemon.rs:827:5
+    |
+825 | struct Route {
+    |        ----- fields in this struct
+826 |     profile_id: String,
+827 |     session_id: String,
+    |     ^^^^^^^^^^
+828 |     reservation_id: String,
+    |     ^^^^^^^^^^^^^^
+
+warning: function `write_remote_admission_request` is never used
+   --> crates/obscura-host/src/remote_admission.rs:233:14
+    |
+233 | pub async fn write_remote_admission_request(
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `read_remote_admission_result` is never used
+   --> crates/obscura-host/src/remote_admission.rs:250:14
+    |
+250 | pub async fn read_remote_admission_result(
+    |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `ProjectionClient` is never constructed
+   --> crates/obscura-host/src/remote_authorization.rs:185:12
+    |
+185 | pub struct ProjectionClient {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: struct `ProjectionFile` is never constructed
+   --> crates/obscura-host/src/remote_authorization.rs:194:12
+    |
+194 | pub struct ProjectionFile {
+    |            ^^^^^^^^^^^^^^
+
+warning: struct `LoadedProjection` is never constructed
+   --> crates/obscura-host/src/remote_authorization.rs:203:12
+    |
+203 | pub struct LoadedProjection {
+    |            ^^^^^^^^^^^^^^^^
+
+warning: associated items `load`, `principal_for_cert`, `registry_sha256`, and `authorization_revision` are never used
+   --> crates/obscura-host/src/remote_authorization.rs:209:12
+    |
+208 | impl LoadedProjection {
+    | --------------------- associated items in this implementation
+209 |     pub fn load(path: &Path) -> Result<Self> {
+    |            ^^^^
+...
+243 |     pub fn principal_for_cert(&self, cert_sha256: &[u8; 32]) -> Option<(RemotePrincipalContext, InitialProfileGrant)> {
+    |            ^^^^^^^^^^^^^^^^^^
+...
+263 |     pub fn registry_sha256(&self) -> &str {
+    |            ^^^^^^^^^^^^^^^
+...
+267 |     pub fn authorization_revision(&self) -> u64 {
+    |            ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: struct `EndpointStatusReceipt` is never constructed
+   --> crates/obscura-host/src/remote_authorization.rs:275:12
+    |
+275 | pub struct EndpointStatusReceipt {
+    |            ^^^^^^^^^^^^^^^^^^^^^
+
+warning: associated function `ready` is never used
+   --> crates/obscura-host/src/remote_authorization.rs:284:12
+    |
+283 | impl EndpointStatusReceipt {
+    | -------------------------- associated function in this implementation
+284 |     pub fn ready(projection: &LoadedProjection, endpoint_pid: u32) -> Self {
+    |            ^^^^^
+
+warning: function `sha256` is never used
+   --> crates/obscura-host/src/remote_authorization.rs:295:8
+    |
+295 | pub fn sha256(data: &[u8]) -> [u8; 32] {
+    |        ^^^^^^
+
+warning: function `encode_hex` is never used
+   --> crates/obscura-host/src/remote_authorization.rs:304:8
+    |
+304 | pub fn encode_hex(bytes: &[u8]) -> String {
+    |        ^^^^^^^^^^
+
+warning: `obscura-host` (bin "obscura-endpoint" test) generated 17 warnings (17 duplicates)
+warning: `obscura-host` (bin "obscura-host") generated 17 warnings (17 duplicates)
+   Compiling obscura-browser v0.1.0 (/Volumes/Intel/playground/obscura/m1-public-gate-close-r3-20261004/crates/obscura-browser)
+warning: `obscura-host` (bin "obscura-host" test) generated 17 warnings (run `cargo fix --bin "obscura-host" -p obscura-host --tests` to apply 1 suggestion)
+   Compiling obscura-host-protocol v0.1.0 (/Volumes/Intel/playground/obscura/m1-public-gate-close-r3-20261004/protocol/browser)
+    Finished `release` profile [optimized] target(s) in 57.53s
+────────────
+ Nextest run ID 056bd704-5d5b-478e-8105-8908c26491a3 with nextest profile: default
+    Starting 186 tests across 19 binaries
+        PASS [   0.021s] (  1/186) obscura-browser page::tests::an_unterminated_font_face_block_falls_back_to_the_generic_scan
+        PASS [   0.026s] (  2/186) obscura-browser page::tests::font_face_warmup_skips_data_sources_and_survives_a_brace_in_a_string
+        PASS [   0.029s] (  3/186) obscura-browser page::tests::font_face_warmup_ignores_local_sources_and_keeps_scanning_after_the_block
+        PASS [   0.029s] (  4/186) obscura-browser context::tests::with_full_options_propagates_user_agent_to_http_client
+        PASS [   0.030s] (  5/186) obscura-browser page::tests::a_per_page_navigation_chain_limit_wins_over_the_environment
+        PASS [   0.030s] (  6/186) obscura-browser input::tests::js_str_escapes_control_characters
+        PASS [   0.030s] (  7/186) obscura-browser context::tests::isolated_copy_does_not_share_mutable_network_state
+        PASS [   0.031s] (  8/186) obscura-browser page::tests::font_face_warmup_takes_the_last_src_descriptor_and_skips_undecodable_sources
+        PASS [   0.031s] (  9/186) obscura-browser page::tests::external_scripts_require_a_successful_http_status
+        PASS [   0.031s] ( 10/186) obscura-browser page::tests::default_navigation_referrer_matches_strict_origin_when_cross_origin
+        PASS [   0.030s] ( 11/186) obscura-browser page::tests::css_resource_discovery_ignores_strings_comments_data_and_fragments
+        PASS [   0.031s] ( 12/186) obscura-browser context::tests::with_full_options_falls_back_to_chrome_default
+        PASS [   0.031s] ( 13/186) obscura-browser context::tests::with_options_keeps_default_user_agent
+        PASS [   0.018s] ( 14/186) obscura-browser page::tests::materialized_import_graph_retains_print_condition_and_import_base
+        PASS [   0.048s] ( 15/186) obscura-browser page::tests::external_stylesheets_keep_their_positions_between_inline_sheets
+        PASS [   0.019s] ( 16/186) obscura-browser page::tests::media_gated_stylesheets_are_fetched_but_disabled_sheets_are_not
+        PASS [   0.049s] ( 17/186) obscura-browser page::tests::body_onload_content_attribute_reflects_to_window
+        PASS [   0.050s] ( 18/186) obscura-browser page::tests::a_zero_navigation_chain_limit_still_loads_the_initial_document
+        PASS [   0.019s] ( 19/186) obscura-browser page::tests::navigation_chain_limit_environment_override_remains_available
+        PASS [   0.017s] ( 20/186) obscura-browser page::tests::navigation_chain_limit_reads_the_environment_variable_by_name
+        PASS [   0.018s] ( 21/186) obscura-browser page::tests::navigation_chain_limit_raises_a_zero_that_would_load_nothing
+        PASS [   0.019s] ( 22/186) obscura-browser page::tests::navigation_chain_limit_environment_default_remains_ten
+        PASS [   0.051s] ( 23/186) obscura-browser page::tests::later_import_map_adds_unrelated_rule_without_rebinding_resolved_rule
+        PASS [   0.053s] ( 24/186) obscura-browser page::tests::linked_stylesheet_graph_fetches_once_and_preserves_order_and_bases
+        PASS [   0.053s] ( 25/186) obscura-browser page::tests::document_navigation_referrer_survives_http_redirects
+        PASS [   0.058s] ( 26/186) obscura-browser page::tests::a_frame_inside_a_shadow_root_survives_the_detach_sweep
+        PASS [   0.058s] ( 27/186) obscura-browser page::tests::inline_imports_fetch_in_order_and_materialize_before_source_style
+        PASS [   0.016s] ( 28/186) obscura-browser page::tests::navigation_timeout_environment_default_remains_thirty_seconds
+        PASS [   0.034s] ( 29/186) obscura-browser page::tests::materialized_linked_stylesheets_expose_link_owned_cssom_with_origin_security
+        PASS [   0.015s] ( 30/186) obscura-browser page::tests::navigation_timeout_environment_override_remains_available
+        PASS [   0.015s] ( 31/186) obscura-browser page::tests::parse_import_url_extracts_url_forms
+        PASS [   0.015s] ( 32/186) obscura-browser page::tests::parse_import_url_preserves_print_and_color_scheme_media
+        PASS [   0.021s] ( 33/186) obscura-browser page::tests::ordinary_fetch_does_not_extend_dynamic_module_settle
+        PASS [   0.024s] ( 34/186) obscura-browser page::tests::navigation_post_script_warmup_seeds_dynamic_images_and_fonts
+        PASS [   0.022s] ( 35/186) obscura-browser page::tests::page_screenshot_uses_the_live_window_scroll_offset
+        PASS [   0.021s] ( 36/186) obscura-browser page::tests::parser_import_map_before_first_module_controls_resolution
+        PASS [   0.024s] ( 37/186) obscura-browser page::tests::new_document_does_not_inherit_suspended_script_ids
+        PASS [   0.022s] ( 38/186) obscura-browser page::tests::parser_script_body_replacement_survives_navigation
+        PASS [   0.020s] ( 39/186) obscura-browser page::tests::print_media_onload_can_activate_a_fetched_stylesheet
+        PASS [   0.013s] ( 40/186) obscura-browser page::tests::split_css_imports_pulls_imports_and_strips_them
+        PASS [   0.014s] ( 41/186) obscura-browser page::tests::split_css_imports_leaves_import_free_css_untouched
+        PASS [   0.014s] ( 42/186) obscura-browser page::tests::settle_resource_warmup_uses_only_remaining_absolute_budget
+        PASS [   0.026s] ( 43/186) obscura-browser page::tests::removing_an_iframe_releases_its_realm
+        PASS [   0.015s] ( 44/186) obscura-browser page::tests::stylesheet_asset_urls_keep_the_importing_sheets_base
+        PASS [   0.014s] ( 45/186) obscura-browser page::tests::stylesheet_rel_token_selector_includes_preloaded_stylesheets
+        PASS [   0.068s] ( 46/186) obscura-browser page::tests::navigation_chain_beyond_the_default_reports_client_navigations
+        PASS [   0.068s] ( 47/186) obscura-browser page::tests::navigation_chain_default_allows_nine_client_navigations
+        PASS [   0.029s] ( 48/186) obscura-browser page::tests::render_resource_deadline_does_not_negative_cache_cancelled_requests
+        PASS [   0.029s] ( 49/186) obscura-browser page::tests::runtime_teardown_discards_queued_frame_script_work
+        PASS [   0.022s] ( 50/186) obscura-browser page::tests::suspend_resume_preserves_cdp_evaluation_handles
+        PASS [   0.022s] ( 51/186) obscura-browser page::tests::suspend_resume_preserves_document_script_start_state
+        PASS [   0.019s] ( 52/186) obscura-browser page::tests::true_print_stylesheet_loads_and_remains_media_gated
+        PASS [   0.020s] ( 53/186) obscura-browser page::tests::timer_body_replacement_survives_settle
+        PASS [   0.012s] ( 54/186) obscura-browser pdf::tests::options_reject_impossible_media_boxes
+        PASS [   0.011s] ( 55/186) obscura-browser pdf::tests::page_ranges_clip_deduplicate_and_preserve_document_order
+        PASS [   0.013s] ( 56/186) obscura-browser page::tests::url_matches_cdp_pattern_handles_wildcards_across_url_parts
+        PASS [   0.013s] ( 57/186) obscura-browser page::tests::truncate_never_splits_a_multibyte_char
+        PASS [   0.011s] ( 58/186) obscura-browser pdf::tests::page_rasters_are_released_before_capturing_the_next_page
+        PASS [   0.011s] ( 59/186) obscura-browser pdf::tests::pagination_preflight_bounds_pages_and_raster_work
+        PASS [   0.034s] ( 60/186) obscura-browser page::tests::suspending_the_runtime_releases_the_frame_realms_it_owns
+        PASS [   0.013s] ( 61/186) obscura-browser pdf::tests::selected_ranges_alone_determine_output_and_raster_budgets
+        PASS [   0.013s] ( 62/186) obscura-browser pdf::tests::writer_enforces_the_output_limit_while_encoding_the_image_stream
+        PASS [   0.013s] ( 63/186) obscura-browser pdf::tests::writer_emits_xref_and_one_image_per_page
+        PASS [   0.013s] ( 64/186) obscura-browser pdf::tests::scale_changes_css_page_span_and_rejects_invalid_values
+        PASS [   0.065s] ( 65/186) obscura-browser page::tests::raised_navigation_chain_limit_reaches_a_longer_chain
+        PASS [   0.019s] ( 66/186) obscura-browser pdf::tests::raster_pdf_selects_print_media_and_restores_screen_render_state
+        PASS [   0.020s] ( 67/186) obscura-browser pdf::tests::raster_pdf_repeats_fixed_content_and_advances_flow_on_every_selected_page
+        PASS [   0.131s] ( 68/186) obscura-browser page::tests::detaching_a_parent_discards_its_queued_descendant_work
+        PASS [   0.131s] ( 69/186) obscura-browser page::tests::duplicate_cacheable_scripts_fetch_once_but_execute_for_each_element
+        PASS [   0.015s] ( 70/186) obscura-browser::storage_clear_r2 failed_write_returns_profile_storage_failed_and_keeps_state_recoverable
+        PASS [   0.015s] ( 71/186) obscura-browser::storage_clear_r2 failed_removal_returns_profile_storage_failed_and_keeps_obstacle
+        PASS [   0.015s] ( 72/186) obscura-browser::storage_clear_r2 flush_preserves_unrelated_files_and_the_root
+        PASS [   0.015s] ( 73/186) obscura-browser::storage_clear_r2 clear_then_flush_removes_snapshot_and_cold_reload_has_no_resurrection
+        PASS [   0.027s] ( 74/186) obscura-browser::input_accept input_accept_reflects_the_content_attribute
+        PASS [   0.119s] ( 75/186) obscura-browser page::tests::load_delaying_script_progresses_through_continuously_ready_timer_work
+        PASS [   0.030s] ( 76/186) obscura-browser::binary_fetch_body fetch_preserves_binary_request_body
+        PASS [   0.036s] ( 77/186) obscura-browser::raw_frame raw_frame_matches_png_pixels_and_preserves_document_on_resize
+        PASS [   0.051s] ( 78/186) obscura-browser::unhandled_rejection rejected_background_promise_does_not_stop_the_page_event_loop
+        PASS [   0.163s] ( 79/186) obscura-browser page::tests::load_delaying_script_driver_respects_absolute_deadline
+        PASS [   0.101s] ( 80/186) obscura-browser page::tests::timer_hydration_runs_during_explicit_adaptive_settle_not_navigation_load
+        PASS [   0.194s] ( 81/186) obscura-browser page::tests::load_delaying_script_driver_survives_a_page_script_exception
+        PASS [   0.223s] ( 82/186) obscura-browser page::tests::distinct_cacheable_scripts_keep_distinct_network_requests
+        PASS [   0.182s] ( 83/186) obscura-browser page::tests::preload_dynamic_script_delays_load_but_not_dom_content_loaded
+        LEAK [   0.249s] ( 84/186) obscura-browser page::tests::later_base_element_does_not_rebase_an_earlier_import_map
+        LEAK [   0.257s] ( 85/186) obscura-browser page::tests::detached_frame_discards_queued_script_work_before_fetching
+        LEAK [   0.258s] ( 86/186) obscura-browser page::tests::detached_unattached_frame_is_discarded_before_realm_or_script_work
+        PASS [   0.235s] ( 87/186) obscura-browser page::tests::page_transport_prefetches_once_and_capture_reuses_the_bytes
+        PASS [   0.282s] ( 88/186) obscura-browser page::tests::pruning_an_old_batch_does_not_strand_a_new_runtime_batch
+        PASS [   0.390s] ( 89/186) obscura-browser page::tests::module_graph_and_evaluation_share_one_active_budget
+        PASS [   0.546s] ( 90/186) obscura-browser page::tests::classic_dynamic_import_does_not_see_a_later_parser_import_map
+        PASS [   0.548s] ( 91/186) obscura-browser page::tests::dynamically_inserted_import_map_controls_later_dynamic_import
+        PASS [   0.552s] ( 92/186) obscura-browser page::tests::dynamic_import_map_uses_live_document_base_at_insertion
+        PASS [   0.565s] ( 93/186) obscura-browser page::tests::cancelling_frame_script_fetch_keeps_all_siblings_resumable
+        PASS [   0.520s] ( 94/186) obscura-browser page::tests::queued_module_does_not_spend_its_budget_waiting_for_deferred_script
+        PASS [   0.524s] ( 95/186) obscura-browser page::tests::ready_async_classic_script_runs_before_a_later_parser_import_map
+        PASS [   0.724s] ( 96/186) obscura-browser page::tests::post_load_dynamic_script_waits_only_when_caller_requests_settle
+        PASS [   1.047s] ( 97/186) obscura-browser page::tests::lazy_module_graph_is_post_load_work_until_caller_settles
+        PASS [   4.479s] ( 98/186) obscura-host::navigation_profile corrupt_profile_catalog_fails_startup_with_a_typed_error
+        PASS [   4.316s] ( 99/186) obscura-host::persistent human_disconnect_pauses_until_explicit_agent_resume
+        PASS [   4.115s] (100/186) obscura-host::persistent observers_cannot_mutate_and_close_is_explicit
+        PASS [   4.122s] (101/186) obscura-host::persistent operation_receipts_prevent_duplicate_effects_and_reject_stale_context
+        PASS [   4.254s] (102/186) obscura-host::persistent human_navigation_respects_control_identity_and_document_revision
+        PASS [   4.455s] (103/186) obscura-host::persistent declared_phone_viewport_preserves_page_and_rejects_stale_input
+        PASS [   4.124s] (104/186) obscura-host::persistent private_socket_rejects_replacement_and_invalid_protocol_frames
+        PASS [   4.537s] (105/186) obscura-host::lease_cancel_r2 direct_same_session_gesture_cancel_terminates_engine_pointer
+        PASS [   4.539s] (106/186) obscura-host::lease_cancel_r2 direct_same_session_composition_cancel_stays_green
+        PASS [   4.551s] (107/186) obscura-host::editor_context_public_c2 evaluate_mutation_exception_publishes_current_editor_context
+        PASS [   4.553s] (108/186) obscura-host::editor_context_public_c2 evaluate_mutation_publishes_new_context_and_keeps_stale_binding_rejected
+        PASS [   4.535s] (109/186) obscura-host::lease_cancel_r2 explicit_detach_cancels_gesture_before_handover
+        PASS [   4.544s] (110/186) obscura-host::editor_events_public_r2 public_page_mutation_rejects_stale_revision_and_new_context_recovers
+        PASS [   4.537s] (111/186) obscura-host::lease_cancel_r2 explicit_detach_cancels_composition_before_handover
+        PASS [   4.553s] (112/186) obscura-host::editor_events_public_r2 public_editor_rejects_stale_target_and_epoch
+        PASS [   4.538s] (113/186) obscura-host::lease_cancel_r2 disconnect_terminates_engine_composition_before_lease_release
+        PASS [   4.495s] (114/186) obscura-host::persistent click_receipt_precedes_navigation_and_old_document_input_is_rejected
+        PASS [   4.406s] (115/186) obscura-host::persistent human_click_text_and_scroll_use_the_live_page
+        PASS [   4.568s] (116/186) obscura-host::editor_events_public_r2 public_composition_events_order_commit_cancel_and_prevented_input
+        PASS [   0.042s] (117/186) obscura-host::persistent viewport_declarations_validate_identity_and_capture_budget
+        PASS [   0.041s] (118/186) obscura-host::remote_admission_r1 rp09_unauthorized_initial_profile_is_denied_before_ready
+        PASS [   0.045s] (119/186) obscura-host::remote_admission_r1 rp01_remote_catalog_filters_to_accessible_profiles
+        PASS [   0.042s] (120/186) obscura-host::remote_admission_r1 rp04_missing_scope_is_denied_before_ready
+        PASS [   0.047s] (121/186) obscura-host::profile_replay_r2 profile_create_replays_identical_and_rejects_conflict
+        PASS [   0.039s] (122/186) obscura-host::remote_admission_r1 rp12_stale_or_revoked_grant_is_denied
+        PASS [   0.042s] (123/186) obscura-host::remote_admission_r1 rp11_unbound_initial_selection_is_denied
+        PASS [   0.049s] (124/186) obscura-host::remote_admission_r1 rp02_remote_create_persists_remote_owner
+        PASS [   0.051s] (125/186) obscura-host::remote_admission_r1 rp07_other_observer_keeps_its_own_session_after_peer_select
+        PASS [   0.052s] (126/186) obscura-host::remote_admission_r1 rp03_remote_select_rebinds_without_killing_source
+        PASS [   0.061s] (127/186) obscura-host::profile_replay_r2 close_session_storage_failure_is_typed_and_recoverable
+        PASS [   0.043s] (128/186) obscura-host::remote_admission_r1 rp13_two_registered_devices_observe_the_same_session
+        PASS [   0.063s] (129/186) obscura-host::remote_admission_r1 rp05_two_profile_storage_is_isolated
+        PASS [   0.074s] (130/186) obscura-host::persistent viewport_election_uses_whole_smallest_phone_and_reselects_on_disconnect
+        PASS [   0.044s] (131/186) obscura-host::remote_admission_r1 rp14_revoking_second_device_keeps_owner_alive
+        PASS [   0.043s] (132/186) obscura-host::remote_admission_r1 rp18_rejected_attach_reclaims_only_its_own_route
+        PASS [   0.045s] (133/186) obscura-host::remote_admission_r1 rp20_revision_change_rejects_attach_without_destroying_owner
+        PASS [   0.046s] (134/186) obscura-host::remote_admission_r1 rp17_disconnect_releases_reservation_without_touching_other_routes
+        PASS [   0.042s] (135/186) obscura-host::remote_admission_r1 rp22_interleaved_local_accept_keeps_routes_separate
+        PASS [   0.049s] (136/186) obscura-host::remote_admission_r1 rp19_local_host_socket_stays_ready_first
+        PASS [   0.042s] (137/186) obscura-host::remote_admission_r1 rp23_repeated_admission_frame_is_invalid_request
+        PASS [   4.216s] (138/186) obscura-host::persistent sleeping_page_remains_responsive_and_fetch_finishes_after_disconnect
+        PASS [   0.044s] (139/186) obscura-host::remote_admission_r1 rp25_eof_before_handoff_writes_no_result
+        PASS [   0.045s] (140/186) obscura-host::remote_admission_r1 rp24_admission_denial_creates_no_route
+        PASS [   0.047s] (141/186) obscura-host::remote_admission_r1 rp26_eof_after_ok_before_attach_releases_reservation
+        PASS [   0.044s] (142/186) obscura-host::remote_admission_r1 rp27_eof_after_ready_releases_connection_route
+        PASS [   0.114s] (143/186) obscura-host::profile_replay_r2 close_session_flushes_before_closed_and_survives_cold_restart
+        PASS [   0.044s] (144/186) obscura-host::remote_admission_r1 rp31_coalesced_admission_and_attach_share_one_reader
+        PASS [   0.073s] (145/186) obscura-host::remote_admission_r1 rp21_concurrent_remote_admissions_keep_distinct_sessions
+        PASS [   0.041s] (146/186) obscura-host::remote_admission_r1 rp33_malformed_newline_json_is_uncorrelated_refusal
+        PASS [   0.040s] (147/186) obscura-host::remote_admission_r1 rp36_partial_frame_at_eof_is_not_empty_eof
+        PASS [   0.041s] (148/186) obscura-host::remote_admission_r1 rp35_oversized_frame_without_delimiter_is_refused_at_the_bound
+        PASS [   0.043s] (149/186) obscura-host::remote_admission_r1 rp34_structurally_invalid_request_is_refused_before_binding
+        PASS [   0.040s] (150/186) obscura-host::remote_admission_r1 rp37_empty_eof_writes_no_result
+        PASS [   4.645s] (151/186) obscura-host::navigation_profile navigation_tabs_and_profiles_keep_actual_page_state_across_restart
+        PASS [   0.045s] (152/186) obscura-host::remote_admission_r1 rp_migration_legacy_catalog_without_access_refuses_remote_binding
+        PASS [   0.061s] (153/186) obscura-host::remote_admission_r1 rp40_failing_stream_does_not_touch_healthy_routes
+        PASS [   0.095s] (154/186) obscura-host::remote_admission_r1 rp30_shutdown_removes_owned_sockets
+        PASS [   0.105s] (155/186) obscura-host::remote_admission_r1 rp32_fragmented_admission_frame_is_accumulated
+        PASS [   0.082s] (156/186) obscura-host::remote_admission_r1 rp41_newline_at_the_consumed_bound_is_oversized
+        PASS [   0.032s] (157/186) obscura-host::bin/obscura-endpoint channels::tests::closed_packet_is_terminal_and_preserves_matching_session_state
+        PASS [   0.026s] (158/186) obscura-host::bin/obscura-endpoint channels::tests::host_unavailable_eof_keeps_generic_stream_error
+        PASS [   0.063s] (159/186) obscura-host::remote_editing public_editor_consumer_never_exposes_password_surrounding_text
+        PASS [   0.082s] (160/186) obscura-host::remote_editing disconnect_cancels_open_composition_without_leaking_to_next_target
+        PASS [   4.695s] (161/186) obscura-host::persistent all_clients_detach_without_destroying_document_or_timers
+        PASS [   0.068s] (162/186) obscura-host::remote_editing public_editor_consumer_rejects_stale_epoch_target_and_keeps_frame_sequence_local
+        PASS [   0.067s] (163/186) obscura-host::remote_editing takeover_waits_for_gesture_and_composition_lease_terminal_events
+        PASS [   0.073s] (164/186) obscura-host::remote_editing rejected_editor_event_does_not_consume_operation_sequence
+        PASS [   0.089s] (165/186) obscura-host::remote_editing public_editor_consumer_covers_context_composition_utf16_selection_and_contenteditable
+        PASS [   0.127s] (166/186) obscura-host::bin/obscura-endpoint channels::tests::terminal_encoder_unavailable_closes_fanout_watches
+        PASS [   4.764s] (167/186) obscura-host::persistent declared_viewports_publish_one_shared_frame_after_rotation
+        PASS [   0.415s] (168/186) obscura-host::remote_admission_r1 rp44_endpoint_accepts_sole_outstanding_none_malformed
+        PASS [   0.421s] (169/186) obscura-host::remote_admission_r1 rp42_endpoint_rejects_mismatched_request_id
+        PASS [   0.416s] (170/186) obscura-host::remote_admission_r1 rp43_endpoint_rejects_illegal_none_code
+        PASS [   0.706s] (171/186) obscura-host::persistent viewers_share_raw_frames_and_follow_input_and_viewport_changes
+        PASS [   0.630s] (172/186) obscura-host::remote_admission_r1 rp38_endpoint_surfaces_missing_result_without_forwarding_ready
+        PASS [   5.285s] (173/186) obscura-host::endpoint mutual_tls_endpoint_preserves_host_and_fences_remote_agent_access
+        PASS [   1.155s] (174/186) obscura-host::webrtc_endpoint real_receiver_gets_typed_encoder_unavailable_error
+        PASS [   5.571s] (175/186) obscura-host::persistent status_stays_responsive_during_synchronous_javascript
+        PASS [   5.908s] (176/186) obscura-host::persistent detaching_viewport_owner_during_pending_layout_does_not_publish_stale_owner_or_layout
+        PASS [   5.387s] (177/186) obscura-host::persistent takeover_waits_for_current_operation_and_requires_explicit_release
+        PASS [   5.584s] (178/186) obscura-host::persistent takeover_during_real_click_waits_for_release_and_click_dispatch
+        PASS [   5.945s] (179/186) obscura-host::persistent detaching_pending_owner_with_remaining_committed_observer_keeps_frames_live
+        PASS [   5.937s] (180/186) obscura-host::persistent detaching_pending_viewport_restores_committed_dimensions_before_next_frame
+        PASS [   1.556s] (181/186) obscura-host::persistent viewport_waits_for_atomic_click_and_coalesces_before_human_input
+        PASS [   6.679s] (182/186) obscura-host::persistent detaching_pending_owner_reselects_remaining_observer_after_cancellation
+        PASS [   8.621s] (183/186) obscura-host::persistent timeout_fences_session_and_exception_is_not_success_null
+        PASS [   5.069s] (184/186) obscura-host::persistent unknown_outcome_never_grants_pending_takeover
+        PASS [   5.060s] (185/186) obscura-host::persistent viewport_callback_deadline_faults_without_committing_or_handover
+        FAIL [  21.498s] (186/186) obscura-host::webrtc_endpoint real_receiver_gets_continuous_host_media_and_rejects_stale_binding
+  stdout ───
+
+    running 1 test
+    test real_receiver_gets_continuous_host_media_and_rejects_stale_binding ... FAILED
+
+    failures:
+
+    failures:
+        real_receiver_gets_continuous_host_media_and_rejects_stale_binding
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 21.47s
+
+  stderr ───
+
+    thread 'real_receiver_gets_continuous_host_media_and_rejects_stale_binding' (800304921) panicked at crates/obscura-host/tests/webrtc_endpoint.rs:11:123:
+    called `Result::unwrap()` on an `Err` value: independent WebRTC receiver failed at /Volumes/Intel/playground/obscura/m1-public-gate-close-r3-20261004/crates/obscura-host/../../docs/runs/m1-public-gate-close-r3-20261004/raw/webrtc/ow-fa065723f4d343d6b0b16fdb3fbb127d: Error: timed out waiting for WebRTC browser response
+
+    Caused by:
+        deadline has elapsed
+
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [  26.316s] 186 tests run: 185 passed (3 leaky), 1 failed, 0 skipped
+        FAIL [  21.498s] (186/186) obscura-host::webrtc_endpoint real_receiver_gets_continuous_host_media_and_rejects_stale_binding
+error: test run failed

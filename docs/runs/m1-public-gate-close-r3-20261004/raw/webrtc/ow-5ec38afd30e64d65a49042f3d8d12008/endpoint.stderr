@@ -1,0 +1,6 @@
+{"status":"ready","authorization_revision":1,"registry_sha256":"0000000000000000000000000000000000000000000000000000000000000000","projection_sha256":"342c81647a7c9a2385ab560ebe29fa650560a8d4884ac2707092f0f55ec886f3","endpoint_pid":37777}
+Error: Start configured FFmpeg H.264 encoder
+
+Caused by:
+    No such file or directory (os error 2)
+endpoint connection ended: IO error: peer closed connection without sending TLS close_notify: https://docs.rs/rustls/latest/rustls/manual/_03_howto/index.html#unexpected-eof

@@ -1,5 +1,9 @@
 #[cfg(unix)]
+mod catalog;
+#[cfg(unix)]
 mod daemon;
+#[cfg(unix)]
+mod remote_admission;
 #[cfg(unix)]
 mod worker;
 #[cfg(unix)]
@@ -12,6 +16,16 @@ struct Args {
     /// New private directory for host.sock. Existing directories are rejected.
     #[arg(long)]
     socket_dir: std::path::PathBuf,
+    /// Explicit persistent profile root. When set, the Host loads/creates the
+    /// typed profile catalog under this directory and each profile owns a
+    /// child directory. When omitted the Host runs a single in-memory profile.
+    #[arg(long)]
+    profile_root: Option<std::path::PathBuf>,
+    /// The one access token for remote connections. The Host compares the
+    /// `Authorization: Bearer` value the endpoint forwards. When unset, every
+    /// remote admission is refused with REMOTE_TOKEN_INVALID.
+    #[arg(long)]
+    access_token: Option<String>,
     #[arg(long)]
     allow_private_network: bool,
 }
@@ -20,7 +34,13 @@ struct Args {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    daemon::serve(args.socket_dir, args.allow_private_network).await
+    daemon::serve(
+        args.socket_dir,
+        args.profile_root,
+        args.access_token,
+        args.allow_private_network,
+    )
+    .await
 }
 
 #[cfg(not(unix))]

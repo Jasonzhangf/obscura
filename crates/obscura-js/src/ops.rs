@@ -97,6 +97,19 @@ pub(crate) struct CanvasBackingSurface {
     pub pixels: JsBuffer,
 }
 
+/// Shared origin-partitioned localStorage owner supplied by the browser layer.
+///
+/// The JS `Storage` object hydrates from and writes through this backend so all
+/// Pages in one profile share one consistent store instead of each runtime
+/// keeping a private copy.
+pub trait LocalStorageBackend: Send + Sync {
+    /// JSON object of `key -> value` for `origin` (`"{}"` when empty).
+    fn load(&self, origin: &str) -> String;
+    fn set(&self, origin: &str, key: &str, value: &str);
+    fn remove(&self, origin: &str, key: &str);
+    fn clear(&self, origin: &str);
+}
+
 pub struct ObscuraState {
     pub dom: Option<DomTree>,
     pub url: String,
@@ -112,6 +125,11 @@ pub struct ObscuraState {
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
+    /// Shared origin-partitioned localStorage owner for the profile. `None`
+    /// keeps the historical in-memory-only Storage behavior (CLI/CDP).
+    pub local_storage: Option<Arc<dyn LocalStorageBackend>>,
+    /// Origin the runtime's `localStorage` is partitioned by.
+    pub local_storage_origin: String,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
     /// the page that registered it.
@@ -303,6 +321,8 @@ impl ObscuraState {
             blocked_urls: Vec::new(),
             cookie_jar: None,
             http_client: None,
+            local_storage: None,
+            local_storage_origin: String::new(),
             callbacks: None,
             #[cfg(feature = "stealth")]
             stealth_client: None,
@@ -4897,9 +4917,51 @@ fn op_canvas_paint_damage(state: &OpState, nid: u32) -> bool {
     connected
 }
 
+/// Shared localStorage bridge. `cmd` is `load` / `set` / `remove` / `clear`.
+///
+/// `load` carries the backend as a typed presence: `None` when no profile
+/// backend is installed (JS `null`) and `Some(snapshot)` when one is, where a
+/// valid empty backend snapshot is the present `"{}"` and stays distinct from
+/// absence. The JS mirror treats `null` as "no backend, keep the standalone
+/// in-memory store" and a present string as the authoritative snapshot. Every
+/// other command performs its backend effect and returns `Some("")`; with no
+/// backend the storage commands are no-ops.
+#[op2]
+#[string]
+fn op_local_storage(
+    state: &OpState,
+    #[string] cmd: String,
+    #[string] key: String,
+    #[string] value: String,
+) -> Option<String> {
+    let shared = state.borrow::<SharedState>().clone();
+    let state = shared.borrow();
+    let Some(backend) = state.local_storage.as_ref() else {
+        return None;
+    };
+    let origin = state.local_storage_origin.clone();
+    match cmd.as_str() {
+        "load" => Some(backend.load(&origin)),
+        "set" => {
+            backend.set(&origin, &key, &value);
+            Some(String::new())
+        }
+        "remove" => {
+            backend.remove(&origin, &key);
+            Some(String::new())
+        }
+        "clear" => {
+            backend.clear(&origin);
+            Some(String::new())
+        }
+        _ => Some(String::new()),
+    }
+}
+
 pub fn build_extension() -> Extension {
     let mut ops = vec![
         op_dom(),
+        op_local_storage(),
         op_script_mark_started(),
         op_script_try_start(),
         op_shadow_attach(),

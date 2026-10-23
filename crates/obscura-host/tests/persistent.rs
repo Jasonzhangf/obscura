@@ -55,7 +55,13 @@ impl Client {
         serde_json::from_str(&line).unwrap()
     }
     fn send(&mut self, command: Value) -> Value {
-        let operation = if matches!(command["type"].as_str(), Some("evaluate" | "navigate" | "resize" | "close_session" | "click" | "input_text" | "scroll")) {
+        let mutation_types = [
+            "evaluate", "navigate", "back", "forward", "reload",
+            "tab_create", "tab_select", "tab_close",
+            "profile_create", "profile_select",
+            "resize", "close_session", "click", "input_text", "scroll",
+        ];
+        let operation = if mutation_types.iter().any(|name| command["type"].as_str() == Some(name)) {
             let status = self.ok(json!({"type":"status"}));
             Some(identity(&status))
         } else { None };
@@ -73,6 +79,25 @@ impl Client {
 }
 fn identity(status: &Value) -> Value {
     json!({"session_id":status["session_id"],"attachment_id":status["attachment_id"],"sequence":status["next_sequence"],"control_epoch":status["control"]["epoch"],"viewport_revision":status["viewport_revision"],"document_revision":status["document_revision"]})
+}
+
+fn read_complete_http_request(mut stream: &std::net::TcpStream, max_header_bytes: usize) -> std::io::Result<Vec<u8>> {
+    let mut buffered = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if buffered.windows(4).any(|window| window == b"\r\n\r\n") {
+            return Ok(buffered);
+        }
+        if buffered.len() >= max_header_bytes {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "HTTP request headers exceeded fixture bound"));
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "HTTP request closed before header end")),
+            Ok(read) => buffered.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 struct Media(BufReader<UnixStream>);
@@ -380,7 +405,10 @@ fn viewport_callback_deadline_faults_without_committing_or_handover() {
 }
 impl Media {
     fn connect(daemon: &Daemon) -> Self {
-        let socket = UnixStream::connect(daemon.dir.join("frames.sock")).unwrap();
+        Self::connect_path(&daemon.dir.join("frames.sock"))
+    }
+    fn connect_path(path: &std::path::Path) -> Self {
+        let socket = UnixStream::connect(path).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
         Self(BufReader::new(socket))
     }
@@ -533,9 +561,15 @@ fn click_receipt_precedes_navigation_and_old_document_input_is_rejected() {
                 Err(e) => panic!("fixture accept: {e}"),
             }
         };
+        // The listener is nonblocking to poll accept, but macOS accepts inherit
+        // O_NONBLOCK, which makes set_read_timeout inert and read() return EAGAIN
+        // before the request arrives. Restore blocking mode so the read waits for
+        // the request (bounded by the timeout) instead of racing the client.
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        loop { let mut line = String::new(); assert!(reader.read_line(&mut line).unwrap() > 0); if line == "\r\n" { break; } }
+        let request = read_complete_http_request(&stream, 8 * 1024)
+            .unwrap_or_else(|error| panic!("fixture request read: {error}"));
+        assert!(request.starts_with(b"GET / HTTP/"), "fixture did not observe a complete HTTP GET request: {request:?}");
         arrived.send(()).unwrap();
         gate.recv_timeout(Duration::from_secs(4)).unwrap();
         let body = "<title>destination</title><button style='position:absolute;left:10px;top:10px;width:200px;height:60px' onclick='window.unwanted=true'>new document</button>";
@@ -626,10 +660,17 @@ fn sleeping_page_remains_responsive_and_fetch_finishes_after_disconnect() {
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // The listener is nonblocking so the accept loop can poll,
+                    // but on macOS the accepted socket inherits O_NONBLOCK, which
+                    // makes set_read_timeout inert: read() would return EAGAIN
+                    // before the request arrives. Return the stream to blocking
+                    // mode so the read waits for the request (bounded by the
+                    // timeout) instead of racing the client.
+                    stream.set_nonblocking(false).unwrap();
                     stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                    let mut input = BufReader::new(stream.try_clone().unwrap());
-                    loop { let mut line = String::new(); input.read_line(&mut line).unwrap(); if line == "\r\n" { break; } }
-                    std::thread::sleep(Duration::from_millis(250));
+                    let request = read_complete_http_request(&stream, 8 * 1024)
+                        .unwrap_or_else(|error| panic!("fixture request read: {error}"));
+                    assert!(request.starts_with(b"GET / HTTP/"), "fixture did not observe a complete HTTP GET request: {request:?}");
                     write!(stream, "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone").unwrap();
                     break;
                 }
@@ -810,4 +851,280 @@ fn private_socket_rejects_replacement_and_invalid_protocol_frames() {
     client.0.get_mut().write_all(&vec![b'x';65537]).unwrap();
     assert_eq!(client.read()["code"], "INVALID_FRAME");
     let mut line = String::new(); assert_eq!(client.0.read_line(&mut line).unwrap(), 0);
+}
+
+/// B2: frame interest has exactly one accounting owner. The exact-session raw
+/// socket and the legacy `frames.sock` share one count. A legacy viewer that
+/// connects and then leaves must not drop that count to zero while an
+/// exact-session consumer is still attached, so the worker must keep painting.
+#[test]
+fn exact_session_interest_survives_legacy_viewer_disconnect() {
+    let daemon = Daemon::start();
+    let mut agent = daemon.connect(); agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"resize","width":160,"height":120}));
+    let state = agent.ok(json!({"type":"navigate","url":"data:text/html,<style>html,body{margin:0;background:rgb(12,34,56)}</style>"}));
+    let session_id = state["session_id"].as_str().unwrap().to_string();
+    let exact_path = daemon.dir.join(format!("session-{session_id}.sock"));
+    let mut exact = Media::connect_path(&exact_path);
+    let (mut previous, _) = exact.frame();
+    assert_eq!(previous["session_id"], state["session_id"]);
+    // A legacy viewer joins and is fully accepted (one frame), then leaves.
+    let mut legacy = Media::connect(&daemon);
+    let _ = legacy.frame();
+    drop(legacy);
+    // The exact-session consumer must keep receiving new frames. Before the
+    // one-owner fix the legacy disconnect drives the shared interest to zero and
+    // the worker stops painting, so this advance cannot be reached.
+    let target = previous["sequence"].as_u64().unwrap() + 6;
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while previous["sequence"].as_u64().unwrap() < target {
+        let (next, _) = exact.frame();
+        if next["sequence"].as_u64().unwrap() > previous["sequence"].as_u64().unwrap() { previous = next; }
+        assert!(Instant::now() < deadline, "exact-session stream stopped after the legacy viewer disconnected: {previous}");
+    }
+    agent.ok(json!({"type":"close_session"}));
+}
+
+// ---------------------------------------------------------------------------
+// Local admin authority (`host-admin.sock`)
+//
+// These cases drive the real daemon process over the real Unix socket. They
+// assert only the public frame/receipt surface: typed success receipts, typed
+// refusals, and the persisted catalog revision observed through
+// `admin.catalog.info`.
+// ---------------------------------------------------------------------------
+
+struct AdminDaemon {
+    child: Child,
+    root: std::path::PathBuf,
+    socket_dir: std::path::PathBuf,
+}
+
+impl AdminDaemon {
+    /// Start a daemon with a persistent profile root. The daemon opens the
+    /// default profile in the catalog it owns.
+    fn start() -> Self {
+        let root = std::path::PathBuf::from("/tmp").join(format!("oha-{}", uuid::Uuid::new_v4()));
+        let socket_dir = root.join("host");
+        let profile_root = root.join("profiles");
+        std::fs::create_dir_all(&root).unwrap();
+        let child = Command::new(env!("CARGO_BIN_EXE_obscura-host"))
+            .arg("--socket-dir").arg(&socket_dir)
+            .arg("--profile-root").arg(&profile_root)
+            .arg("--access-token").arg(ADMIN_TOKEN)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut daemon = Self { child, root, socket_dir };
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            match UnixStream::connect(daemon.socket_dir.join("host-admin.sock")) {
+                Ok(_) => break,
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused) => {}
+                Err(error) => panic!("admin listener startup: {error}"),
+            }
+            assert!(daemon.child.try_wait().unwrap().is_none(), "daemon exited before admin listener ready");
+            assert!(Instant::now() < deadline, "admin listener startup timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        daemon
+    }
+}
+
+impl Drop for AdminDaemon {
+    fn drop(&mut self) {
+        if self.child.try_wait().unwrap().is_none() { self.child.kill().unwrap(); }
+        self.child.wait().unwrap();
+        if self.root.exists() { std::fs::remove_dir_all(&self.root).unwrap(); }
+    }
+}
+
+struct AdminClient {
+    stream: UnixStream,
+    buffered: BufReader<UnixStream>,
+}
+
+impl AdminClient {
+    fn connect(socket_dir: &std::path::Path) -> Self {
+        let stream = UnixStream::connect(socket_dir.join("host-admin.sock")).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let buffered = BufReader::new(stream.try_clone().unwrap());
+        Self { stream, buffered }
+    }
+
+    fn raw(&mut self, frame: &[u8]) -> Value {
+        self.stream.write_all(frame).unwrap();
+        let mut line = String::new();
+        assert!(self.buffered.read_line(&mut line).unwrap() > 0, "admin connection closed without a response");
+        serde_json::from_str(&line).unwrap()
+    }
+
+    fn request(&mut self, request: Value) -> Value {
+        let mut frame = serde_json::to_vec(&request).unwrap();
+        frame.push(b'\n');
+        self.raw(&frame)
+    }
+
+    /// Send a request and require the typed success shape, returning the full
+    /// response so the caller can inspect `catalog_revision` and receipts.
+    fn ok(&mut self, request: Value) -> Value {
+        let response = self.request(request);
+        assert_eq!(response["state"], "ok", "expected admin success: {response}");
+        response
+    }
+
+    fn error(&mut self, request: Value, code: &str) -> Value {
+        let response = self.request(request);
+        assert_eq!(response["state"], "error", "expected admin refusal {code}: {response}");
+        assert_eq!(response["code"], code, "unexpected admin refusal: {response}");
+        response
+    }
+}
+
+/// The one access token this fixture configures on the Host.
+const ADMIN_TOKEN: &str = "persistent-admin-token";
+
+fn admin_create(id: u64, display_name: &str, make_default: bool, expected: Option<u64>) -> Value {
+    let mut request = json!({
+        "schema_version": 1,
+        "id": id,
+        "op": "admin.catalog.create",
+        "display_name": display_name,
+        "make_default": make_default,
+    });
+    if let Some(expected) = expected { request["expected_catalog_revision"] = json!(expected); }
+    request
+}
+
+fn admin_select(id: u64, profile_id: &str, expected: Option<u64>) -> Value {
+    let mut request = json!({
+        "schema_version": 1,
+        "id": id,
+        "op": "admin.catalog.select",
+        "profile_id": profile_id,
+    });
+    if let Some(expected) = expected { request["expected_catalog_revision"] = json!(expected); }
+    request
+}
+
+#[test]
+fn admin_authority_commits_catalog_and_refuses_invalid_selection() {
+    use std::os::unix::fs::PermissionsExt;
+    let daemon = AdminDaemon::start();
+    let mode = std::fs::metadata(daemon.socket_dir.join("host-admin.sock")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "host-admin.sock must be owner-only");
+
+    let mut admin = AdminClient::connect(&daemon.socket_dir);
+    let info = admin.ok(json!({"schema_version":1,"id":1,"op":"admin.catalog.info"}));
+    assert_eq!(info["catalog_revision"], 1);
+    assert_eq!(info["default_profile_id"], "default");
+
+    // Catalog create commits a new revision and returns the created profile.
+    let created = admin.ok(admin_create(2, "Work", false, Some(1)));
+    assert_eq!(created["catalog_revision"], 2);
+    assert_eq!(created["profile"]["profile_id"], "p1");
+    assert_eq!(created["profile"]["display_name"], "Work");
+
+    // Select commits another revision, never creating a profile.
+    let selected = admin.ok(admin_select(3, "p1", Some(2)));
+    assert_eq!(selected["catalog_revision"], 3);
+    assert_eq!(selected["default_profile_id"], "p1");
+    admin.error(admin_select(4, "p404", None), "PROFILE_NOT_FOUND");
+
+    // A stale expected revision is refused before any write.
+    admin.error(admin_create(5, "Stale", false, Some(1)), "CATALOG_REVISION_CONFLICT");
+
+    // Persisted truth matches the committed revision.
+    let after = admin.ok(json!({"schema_version":1,"id":6,"op":"admin.catalog.info"}));
+    assert_eq!(after["catalog_revision"], 3);
+    assert_eq!(after["default_profile_id"], "p1");
+    let ids: Vec<&str> = after["profiles"].as_array().unwrap().iter()
+        .map(|profile| profile["profile_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["default", "p1"]);
+}
+
+#[test]
+fn admin_authority_refuses_malformed_partial_and_unknown_ops() {
+    let daemon = AdminDaemon::start();
+    let mut admin = AdminClient::connect(&daemon.socket_dir);
+
+    // Unknown op and an incomplete known op are typed malformed refusals.
+    admin.error(json!({"schema_version":1,"id":1,"op":"admin.catalog.delete"}), "ADMIN_FRAME_MALFORMED");
+    admin.error(json!({"schema_version":1,"id":2,"op":"admin.catalog.select"}), "ADMIN_FRAME_MALFORMED");
+
+    // Malformed JSON on one frame is refused and the connection stays usable.
+    let malformed = admin.raw(b"{not json}\n");
+    assert_eq!(malformed["state"], "error");
+    assert_eq!(malformed["code"], "ADMIN_FRAME_MALFORMED");
+    admin.ok(json!({"schema_version":1,"id":3,"op":"admin.catalog.info"}));
+
+    // A partial frame at EOF is refused while the response side stays writable.
+    let mut partial = AdminClient::connect(&daemon.socket_dir);
+    partial.stream.write_all(b"{\"schema_version\":1,\"id\":4,").unwrap();
+    partial.stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut line = String::new();
+    assert!(partial.buffered.read_line(&mut line).unwrap() > 0, "partial frame must receive a typed refusal");
+    let refusal: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(refusal["state"], "error");
+    assert_eq!(refusal["code"], "ADMIN_FRAME_MALFORMED");
+}
+
+#[test]
+fn page_initiated_navigation_advances_status_document_revision() {
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("page navigation fixture connection");
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let request = read_complete_http_request(&stream, 8 * 1024).expect("page navigation request");
+        assert!(request.starts_with(b"GET / HTTP/"), "unexpected navigation request: {request:?}");
+        let body = "<title>destination</title>done";
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    let link = format!("data:text/html,<a style='position:absolute;left:10px;top:10px;width:200px;height:60px' href='http://{address}/'>next</a>");
+    agent.ok(json!({"type":"navigate","url":link}));
+    let mut human = daemon.connect();
+    let attached = human.ok(json!({"type":"attach","mode":"observe"}));
+    let takeover = human.ok(json!({"type":"request_takeover","epoch":attached["control"]["epoch"]}));
+    let before = takeover["document_revision"].as_u64().expect("document revision before click");
+    human.ok(json!({"type":"click","x":30,"y":30}));
+    server.join().unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = human.ok(json!({"type":"status"}));
+        if status["document_revision"].as_u64() == Some(before + 1) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "page navigation did not reach Host status: {status}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn slow_navigation_does_not_fence_the_session() {
+    let daemon = Daemon::start_with_network(true);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("slow navigation fixture connection");
+        stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let request = read_complete_http_request(&stream, 8 * 1024).expect("slow navigation request");
+        assert!(request.starts_with(b"GET / HTTP/"), "unexpected navigation request: {request:?}");
+        std::thread::sleep(Duration::from_secs(6));
+        let body = "<title>slow destination</title>done";
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    });
+
+    let mut agent = daemon.connect();
+    agent.ok(json!({"type":"attach","mode":"agent"}));
+    agent.ok(json!({"type":"navigate","url":format!("http://{address}/")}));
+    server.join().unwrap();
+    let status = agent.ok(json!({"type":"status"}));
+    assert_eq!(status["tabs"][0]["title"], "slow destination");
 }

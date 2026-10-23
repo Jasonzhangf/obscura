@@ -1,0 +1,33 @@
+   Compiling obscura-host-protocol v0.1.0 (/Volumes/Intel/playground/obscura/m1-public-gate-close-r3-20261004/protocol/browser)
+   Compiling obscura-media v0.1.0 (/Volumes/Intel/playground/obscura/m1-public-gate-close-r3-20261004/crates/obscura-media)
+warning: constant `K_CF_NUMBER_INT_TYPE` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:34:7
+   |
+34 | const K_CF_NUMBER_INT_TYPE: i32 = 9;
+   |       ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `K_CF_STRING_ENCODING_UTF8` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:35:7
+   |
+35 | const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+   |       ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: method `profile_level` is never used
+   --> crates/obscura-media/src/videotoolbox.rs:706:12
+    |
+458 | impl VtSession {
+    | -------------- method in this implementation
+...
+706 |     pub fn profile_level(&self) -> Option<String> {
+    |            ^^^^^^^^^^^^^
+
+warning: function `CFStringGetCString` is never used
+  --> crates/obscura-media/src/videotoolbox.rs:81:8
+   |
+81 |     fn CFStringGetCString(
+   |        ^^^^^^^^^^^^^^^^^^
+
+warning: `obscura-media` (lib) generated 4 warnings
+    Finished `release` profile [optimized] target(s) in 21.76s

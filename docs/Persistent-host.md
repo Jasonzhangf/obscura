@@ -60,15 +60,16 @@ input/media ABI. The next Host slices extend this same owner.
 
 Current commands: attach (observe/agent), detach, status, request_takeover,
 release_control, resume_agent, navigate, evaluate, resize, click, input_text,
-scroll and close_session.
+input (typed gesture/editing events), scroll and close_session.
 One Agent attachment may mutate while control is in the Agent phase; another
 Agent attachment is rejected. Observers may request human control but cannot
 execute diagnostic JavaScript. The granted human holder can click, insert text
 and scroll through the same admission/receipt owner as Agent input.
 Evaluate remains an Agent diagnostic surface, not the final atomic input API:
 page-created timers/network continue after its completion, as before.
-Request IDs correlate replies only; version 4 requires the separate operation
-envelope including document_revision.
+Request IDs correlate replies only; Host10 requires the separate operation
+envelope including document_revision and an operation_id that distinguishes a
+whole user-semantic operation from its per-event sequence.
 Typed SessionStatus returns the requesting attachment's connection-scoped ID
 and mode as well as the shared Session ID and viewport. Reconnect creates a new
 attachment identity; daemon restart creates a new Session identity. Observation
@@ -87,7 +88,7 @@ execution both locally and at admission, including work already queued when
 an autonomous page callback fails. Graceful shutdown waits for accepted work
 before joining the owning thread.
 
-### Local operation and takeover contract (version 4)
+### Local operation and takeover contract (Host10)
 
 Every browser mutation, including diagnostic evaluation and explicit close,
 requires `operation`: session_id, attachment_id, sequence, control_epoch,
@@ -122,8 +123,50 @@ requests cannot change newer ownership. Real click probes cover takeover during
 mousedown and grant only after release/click dispatch. The current supported
 inputs are a primary-button click, committed text (writable input/textarea only,
 4096 Unicode characters maximum), and wheel scrolling (finite CSS coordinates,
-4096 pixels maximum per axis). Coordinate input requires the render feature.
-IME composition, keyboard shortcuts, drag and multi-touch remain unsupported.
+4096 pixels maximum per axis), plus the typed `input` command below. Coordinate
+input requires the render feature.
+
+### Remote editing and gesture lease (Host10)
+
+`input` carries an `InputEnvelope`: an `event_sequence`, the presented frame
+identity, a binding and one typed event. The frame identity validates only
+session/document/viewport fencing; a new frame sequence alone never invalidates
+input, and the display rectangle/transform stays a client-local concern that is
+deliberately absent from the wire. Two bindings exist: `gesture` (a whole
+down/move/up sequence under one `gesture_session_id`) and `editor` (a target-bound
+`edit_session_id`, `target_id`, `focus_revision` and `editor_revision`).
+
+Typed events cover pointer down/move/up/cancel, composition begin/update/commit/
+cancel, replace text, delete range, delete surrounding, set selection, editor
+action and key down/up. `ResultValue::Editing` returns an `EditingReceipt` with
+the same operation/edit-session/target/revision identity, a typed state
+(`pending`, `applied`, `cancelled`, `rejected`, `failed`, `unknown`) and the
+engine-confirmed selection/composition. A transport ACK is not a completed edit;
+the receipt is. `Status` publishes the current `editor_context` and the held
+`input_lease`.
+
+`EditorContext` is engine-assigned and stable for the document lifetime:
+editable kind (`input`, `textarea`, `content_editable`), `editable`/`read_only`,
+`input_type`/`input_mode`/`enter_key_hint`, `multiline`/`password`, focus and
+editor revisions, selection range/direction, composition range, caret rect and
+the required surrounding range. Ranges are UTF-16 code units and the engine
+rejects ranges that split a surrogate pair at that single boundary. Password
+targets never carry plaintext surrounding text or evidence; only selection and
+length metadata remain. Focus changes, blur, document/viewport/epoch change and
+disconnect invalidate the old context.
+
+Editing events execute real page semantics for `input`, `textarea` and
+`contenteditable`: a cancelled `beforeinput` leaves the value unchanged and
+returns the actual result, composition updates are visible remotely, a commit is
+applied once, and a cancel restores the pre-composition state without writing
+into a newly focused field. The Host holds the full gesture/composition lease:
+down-to-up and begin-to-commit/cancel are one operation. New Agent operations are
+fenced while the lease is held, and takeover completes only after the current
+lease reaches its terminal event. Observation never takes a lease or pauses the
+Agent. Disconnect releases the held input and cancels an open composition without
+leaking it into the next target. Unknown submissions are not auto-replayed; a
+retry with the same operation/event identity returns the original receipt, and
+stale attachment/epoch/target/revision writes are explicitly rejected.
 
 Input completion reports `input.state=succeeded` only after dispatch returns.
 Invalid text targets return INPUT_REJECTED before editing. Injection failures
@@ -277,11 +320,13 @@ one ABI revision. The raw Host `FramePacket` stream retains its own
 
 This local marker boundary is separate from the WebRTC protocol version. Typed
 WebRTC signaling and DataChannel messages also deny unknown fields, and
-`WEBRTC_PROTOCOL_VERSION` is exactly `3`; the Hello exchange rejects older v2 or
-other versions. A v3 peer therefore gets the typed `ENCODER_UNAVAILABLE` error
-only after the endpoint has validated the v3 capability and binding. No version
-negotiation, unknown-field tolerance or compatibility fallback is implied by
-the local H.264 socket.
+`WEBRTC_PROTOCOL_VERSION` is exactly `9` and pairs with Host10; the Hello exchange
+rejects other versions, including the earlier Host9/WebRTC8 pair. A WebRTC9 peer
+therefore gets the typed `ENCODER_UNAVAILABLE` error only after the endpoint has
+validated its capability and binding, and carries the same target-bound
+`EditorContext`/`EditingEvent`/`EditingReceipt` ABI over the DataChannel. No
+version negotiation, unknown-field tolerance or compatibility fallback is
+implied by the local H.264 socket.
 
 ```sh
 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo build --release -p obscura-host -p obscura-media --features render

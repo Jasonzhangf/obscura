@@ -1,0 +1,3 @@
+error: the package 'obscura-media' does not contain this feature: render
+help: packages with the missing feature: obscura-host, obscura-browser, obscura-js, obscura-cdp, obscura-mcp, obscura-cli, obscura
+error: command `/Users/fanzhang/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo test --no-run --message-format json-render-diagnostics --package obscura-media --test stream --features render --release --locked` exited with code 101

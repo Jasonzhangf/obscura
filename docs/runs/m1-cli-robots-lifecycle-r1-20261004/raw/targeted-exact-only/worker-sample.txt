@@ -1,0 +1,32 @@
+Analysis of sampling obscura-worker (pid 19249) every 1 millisecond
+Process:         obscura-worker [19249]
+Path:            /Volumes/VOLUME/*/obscura-worker
+Load Address:    0x100194000
+Identifier:      obscura-worker
+Version:         ???
+Code Type:       ARM64
+Parent Process:  obscura [14788]
+Target Type:     live task
+
+Date/Time:       2026-10-04 06:48:57.671 -0700
+Launch Time:     2026-10-04 06:48:57.430 -0700
+OS Version:      macOS 26.6.2 (25G83)
+Report Version:  7
+Analysis Tool:   /usr/bin/sample
+
+Physical footprint:         112K
+Physical footprint (peak):  112K
+Idle exit:                  untracked
+----
+
+Call graph:
+    889 Thread_772748574: Main Thread   DispatchQueue_<multiple>
+      889 _dyld_start  (in dyld) + 0  [0x1066609c0]
+
+Total number in stack (recursive counted multiple, when >=5):
+
+Sort by top of stack, same collapsed (when >= 5):
+        _dyld_start  (in dyld)        889
+
+Binary images description not available
+

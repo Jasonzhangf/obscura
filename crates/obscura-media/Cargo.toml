@@ -11,6 +11,7 @@ webrtc = ["webrtc-probe", "dep:futures-util", "dep:tokio-rustls", "dep:tokio-tun
 
 [dependencies]
 obscura-host-protocol = { path = "../../protocol/browser" }
+libc = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -28,3 +29,7 @@ tokio-tungstenite = { workspace = true, optional = true }
 name = "obscura-webrtc-receiver"
 path = "src/bin/webrtc_receiver.rs"
 required-features = ["webrtc"]
+
+[[example]]
+name = "resident-encoder"
+path = "examples/resident-encoder.rs"
